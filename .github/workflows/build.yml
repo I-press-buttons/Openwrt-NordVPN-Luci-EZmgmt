@@ -311,8 +311,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           NIGHTLY: ${{ needs.changes.outputs.nightly }}
         run: |
-          files=$(find dist -name '*.apk')
-          if [ -z "$files" ]; then echo "::error::no packages were built" >&2; exit 1; fi
+          backend=$(find dist -type f -name 'nordvpn-wireguard-*.apk' -print -quit)
+          luci=$(find dist -type f -name 'luci-app-nordvpn-*.apk' -print -quit)
+          if [ -z "$backend" ] || [ -z "$luci" ]; then
+            echo "::error::both package APKs were not built" >&2
+            exit 1
+          fi
+          # Stable aliases let routers use GitHub's /releases/latest/download/
+          # endpoint while versioned APKs remain available for pinning.
+          cp "$backend" dist/nordvpn-wireguard-latest.apk
+          cp "$luci" dist/luci-app-nordvpn-latest.apk
+          files=$(find dist -type f -name '*.apk')
           echo "$files"
           ver=$(sed -n 's/^PKG_VERSION:=//p' nordvpn-wireguard/Makefile)
           case "$ver" in
@@ -343,7 +352,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          find dist -name '*.apk'
+          backend=$(find dist -type f -name 'nordvpn-wireguard-*.apk' -print -quit)
+          luci=$(find dist -type f -name 'luci-app-nordvpn-*.apk' -print -quit)
+          if [ -z "$backend" ] || [ -z "$luci" ]; then
+            echo "::error::both package APKs were not built" >&2
+            exit 1
+          fi
+          cp "$backend" dist/nordvpn-wireguard-latest.apk
+          cp "$luci" dist/luci-app-nordvpn-latest.apk
+          files=$(find dist -type f -name '*.apk')
+          echo "$files"
           # The annotated tag body is the release notes. Read it from the
           # API: the checkout above is shallow and has no tag object, so
           # --notes-from-tag would silently fall back to the commit message.
@@ -361,5 +379,5 @@ jobs:
             echo "::error::$GITHUB_REF_NAME has an empty annotation body; write the release notes into the tag message." >&2
             exit 1
           fi
-          gh release create "$GITHUB_REF_NAME" $(find dist -name '*.apk') \
+          gh release create "$GITHUB_REF_NAME" $files \
             --title "$GITHUB_REF_NAME" --notes-file notes.md --verify-tag

@@ -201,6 +201,18 @@ Then, on the router:
 apk add --allow-untrusted ./nordvpn-wireguard-*.apk ./luci-app-nordvpn-*.apk
 ```
 
+Each release also includes stable aliases for unattended updates:
+`nordvpn-wireguard-latest.apk` and `luci-app-nordvpn-latest.apk`.
+GitHub's `releases/latest/download/` URLs always redirect to the newest release:
+
+```sh
+wget -O /tmp/nordvpn-wireguard.apk \
+  https://github.com/I-press-buttons/Openwrt-NordVPN-Luci-EZmgmt/releases/latest/download/nordvpn-wireguard-latest.apk
+wget -O /tmp/luci-app-nordvpn.apk \
+  https://github.com/I-press-buttons/Openwrt-NordVPN-Luci-EZmgmt/releases/latest/download/luci-app-nordvpn-latest.apk
+apk add --allow-untrusted /tmp/nordvpn-wireguard.apk /tmp/luci-app-nordvpn.apk
+```
+
 Log out of LuCI and back in, then open **VPN → NordVPN**. Installing only
 `nordvpn-wireguard` gives you a headless CLI/ubus service.
 
