@@ -75,6 +75,7 @@ var callRotateStart = rpc.declare({ object: 'nordvpn', method: 'rotate_start', p
 var callExternalIp = rpc.declare({ object: 'nordvpn', method: 'external_ip', params: [ 'instance' ] });
 var callClients = rpc.declare({ object: 'nordvpn', method: 'clients' });
 var callDisconnect = rpc.declare({ object: 'nordvpn', method: 'disconnect', params: [ 'instance' ] });
+var callDisableAll = rpc.declare({ object: 'nordvpn', method: 'disable_all' });
 var callCreateInstance = rpc.declare({ object: 'nordvpn', method: 'create_instance', params: [ 'instance', 'credential' ] });
 var callDeleteInstance = rpc.declare({ object: 'nordvpn', method: 'delete_instance', params: [ 'instance' ] });
 var callHistory = rpc.declare({ object: 'nordvpn', method: 'history', params: [ 'instance', 'limit' ] });
@@ -189,6 +190,8 @@ var STYLE = '' +
 	'.nv-dev-online{background:#3c8c3c}' +
 	'.nv-dev-offline{background:var(--border-color-medium,#bbb)}' +
 	'.nv-dev-empty{padding:.6em;color:var(--text-color-medium,#666)}' +
+	'.nv-disable-all{display:flex;align-items:center;gap:.7em;flex-wrap:wrap;margin-top:.8em;padding:.6em;border:1px solid var(--error-color,#c0392b);border-radius:.3em}' +
+	'.nv-disable-all .cbi-value-description{color:var(--error-color,#c0392b);font-weight:600}' +
 	'.nv-dot-lo{background:#3c8c3c}' +
 	'.nv-dot-mid{background:#c79100}' +
 	'.nv-dot-hi{background:#c0392b}' +
@@ -319,6 +322,10 @@ return view.extend({
 			E('legend', {}, _('VPN instances')),
 			E('div', { class: 'cbi-section-node' }, [
 				E('div', {}, rows),
+				E('div', { class: 'nv-disable-all' }, [
+					E('div', { class: 'cbi-value-description' }, _('Warning: disabling all VPNs removes their kill switches. LAN traffic will route to the WAN.')),
+					E('button', { class: 'cbi-button cbi-button-negative', click: L.bind(this.disableAll, this) }, _('Disable all VPNs'))
+				]),
 				E('div', { style: 'margin-top:.6em' }, [
 					E('button', { class: 'cbi-button cbi-button-add', click: L.bind(this.showAddInstanceModal, this) },
 						_('Add instance'))
@@ -981,6 +988,49 @@ return view.extend({
 		}, this)).catch(L.bind(function(e) {
 			this.dismiss(n);
 			this.notice(_('Disable failed: %s').format(e), 'error');
+		}, this));
+	},
+
+	disableAll: function(ev) {
+		var btn = ev && ev.currentTarget;
+		if (this._disableAllRunning)
+			return Promise.resolve();
+		this._disableAllRunning = true;
+		if (btn) btn.disabled = true;
+		var n = this.notice(_('Disabling all VPNs…'), 'info');
+		return callDisableAll().then(L.bind(function(res) {
+			this.dismiss(n);
+			var errors = (res && res.errors) || [];
+			if (res && res.error)
+				errors.push({ instance: '', error: res.error });
+			var disabled = (res && res.disabled) || [];
+			disabled.forEach(function(name) {
+				uci.set('nordvpn', name, 'enabled', '0');
+			});
+			if (res && res.ok !== true && !errors.length)
+				errors.push({ instance: '', error: _('backend did not confirm disabling the VPNs') });
+			if (errors.length || !res || res.ok !== true) {
+				var detail = errors.map(function(e) {
+					return (e.instance ? e.instance + ': ' : '') + (e.error || _('unknown error'));
+				}).join('; ');
+				this.notice(_('Some VPNs could not be disabled: %s').format(detail || _('unknown error')), 'error', 8000);
+			}
+			else
+				this.notice(_('All VPNs are disabled. Kill switches are off and LAN traffic routes to the WAN.'), 'info', 6000);
+			// Reload committed UCI when the form is clean. Preserve staged form edits
+			// otherwise; enabled=0 is already merged above for every successful one.
+			var reload = this.dirty ? Promise.resolve() : Promise.resolve().then(function() {
+				uci.unload('nordvpn');
+				return uci.load('nordvpn');
+			});
+			return reload.then(L.bind(this.refreshStatus, this));
+		}, this)).catch(L.bind(function(e) {
+			this.dismiss(n);
+			this.notice(_('Could not disable all VPNs: %s').format(e), 'error', 8000);
+			return this.refreshStatus();
+		}, this)).finally(L.bind(function() {
+			this._disableAllRunning = false;
+			if (btn) btn.disabled = false;
 		}, this));
 	},
 
@@ -2370,7 +2420,7 @@ return view.extend({
 			class: 'cbi-button cbi-button-save',
 			disabled: true,
 			click: L.bind(this.save, this)
-		}, _('Save and apply'));
+		}, _('Save'));
 		this.discardBtn = E('button', {
 			class: 'cbi-button',
 			disabled: true,
@@ -2932,6 +2982,11 @@ return view.extend({
 				this.clearChangeIndicator();
 				var q = p;
 				p = null;
+				// Saving options on a disabled instance must not turn its tunnel back on.
+				if (this.status && this.status.enabled === false) {
+					this.dismiss(q);
+					return { saved_disabled: true };
+				}
 				return this.applySaved(routingOnly, q);
 			}, this))
 			.then(L.bind(function(res) {
@@ -2939,6 +2994,10 @@ return view.extend({
 					this.notice(_('Apply failed: %s').format(res.error), 'error');
 				else if (res && res.routing_only)
 					this.notice(_('Settings applied without reconnecting.'), 'info', 4000);
+				else if (res && res.saved_disabled)
+					this.notice(_('Settings saved. The VPN remains disabled.'), 'info', 4000);
+				else if (res && res.state === 'disabled')
+					this.notice(_('Settings saved. The VPN remains disabled.'), 'info', 4000);
 				else if (res && res.state === 'success' && res.restarted === false)
 					this.notice(_('Settings applied; still connected to %s without reconnecting.').format(res.gateway || ''), 'info', 4000);
 				else if (res && res.state === 'success')
