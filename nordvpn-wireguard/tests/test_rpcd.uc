@@ -27,7 +27,7 @@ let obj = loadfile(RPCD)();
 let m = obj ? obj.nordvpn : null;
 ok('rpcd object present', m != null);
 ok('read methods present', type(m.status.call) == 'function' && type(m.locations.call) == 'function' && type(m.refresh_status.call) == 'function' && type(m.instances.call) == 'function' && type(m.apply_status.call) == 'function');
-ok('write methods present', type(m.set_credentials.call) == 'function' && type(m.apply.call) == 'function' && type(m.apply_start.call) == 'function' && type(m.apply_routing.call) == 'function' && type(m.rotate_now.call) == 'function' && type(m.rotate_start.call) == 'function' && type(m.refresh_locations.call) == 'function' && type(m.disconnect.call) == 'function' && type(m.clear_credentials.call) == 'function');
+ok('write methods present', type(m.set_credentials.call) == 'function' && type(m.apply.call) == 'function' && type(m.apply_start.call) == 'function' && type(m.apply_routing.call) == 'function' && type(m.rotate_now.call) == 'function' && type(m.rotate_start.call) == 'function' && type(m.refresh_locations.call) == 'function' && type(m.disconnect.call) == 'function' && type(m.disable_all.call) == 'function' && type(m.clear_credentials.call) == 'function');
 
 // Build a cache on disk.
 let cache = normalize(json(readfile(fixture)));
@@ -179,6 +179,46 @@ ok('disconnect ok', m.disconnect.call({}).ok == true);
 eq('disconnect flips master switch off', global.MOCK_UCI.nordvpn.main.enabled, '0');
 eq('disconnect keeps the interface down', global.MOCK_UCI.network.nordvpn.auto, '0');
 ok('disconnect releases steering rules', global.MOCK_UCI.network.steerrule == null);
+
+// disable_all covers every instance, keeps saved protection preferences, and
+// continues past an instance whose interface is not app-managed.
+let before_disable_all = global.MOCK_UCI;
+global.MOCK_UCI = { nordvpn: {
+	main: { '.type': 'settings', interface: 'wan', enabled: '1', killswitch: '1',
+		cache_dir: cdir },
+	extra: { '.type': 'instance', interface: 'nv_extra', enabled: '1', killswitch: '1',
+		auto_routing: '1', cache_dir: cdir },
+	guest: { '.type': 'instance', interface: 'nv_guest', enabled: '1', killswitch: '1',
+		auto_routing: '1', cache_dir: cdir }
+}, network: {
+	wan: { '.type': 'interface', proto: 'dhcp', device: 'eth1', auto: '1' },
+	nv_extra: { '.type': 'interface', vpn_type: 'nordvpn', auto: '1', nordvpn_managed_routing: '1' },
+	nv_guest: { '.type': 'interface', vpn_type: 'nordvpn', auto: '1', nordvpn_managed_routing: '1' },
+	extra_rule: { '.type': 'rule', 'in': 'lan', lookup: 'nvx', nordvpn_managed: '1',
+		nordvpn_role: 'steer_lookup', nordvpn_iface: 'nv_extra' },
+	guest_rule: { '.type': 'rule', 'in': 'guest', lookup: 'nvg', nordvpn_managed: '1',
+		nordvpn_role: 'steer_lookup', nordvpn_iface: 'nv_guest' }
+}, firewall: {
+	extra_ks: { '.type': 'rule', name: 'NordVPN kill switch', src: 'lan', dest: 'wan',
+		proto: 'all', target: 'REJECT', nordvpn_managed: '1', nordvpn_role: 'killswitch',
+		nordvpn_iface: 'nv_extra' },
+	guest_ks: { '.type': 'rule', name: 'NordVPN kill switch', src: 'lan', dest: 'wan',
+		proto: 'all', target: 'REJECT', nordvpn_managed: '1', nordvpn_role: 'killswitch',
+		nordvpn_iface: 'nv_guest' }
+} };
+let all_disabled = m.disable_all.call();
+eq('disable_all reports partial failure', all_disabled.ok, false);
+eq('disable_all continues after failure and disables every valid instance', all_disabled.disabled, [ 'extra', 'guest' ]);
+eq('disable_all identifies the invalid instance', all_disabled.errors[0].instance, 'main');
+eq('disable_all turns off valid instance', global.MOCK_UCI.nordvpn.extra.enabled, '0');
+eq('disable_all holds valid tunnel down', global.MOCK_UCI.network.nv_extra.auto, '0');
+eq('disable_all removes active steering rule', global.MOCK_UCI.network.extra_rule, null);
+eq('disable_all preserves killswitch preference', global.MOCK_UCI.nordvpn.extra.killswitch, '1');
+eq('disable_all releases later instance steering too', global.MOCK_UCI.network.guest_rule, null);
+eq('disable_all preserves later killswitch preference', global.MOCK_UCI.nordvpn.guest.killswitch, '1');
+eq('disable_all releases active killswitches', [ global.MOCK_UCI.firewall.extra_ks, global.MOCK_UCI.firewall.guest_ks ], [ null, null ]);
+global.MOCK_UCI = before_disable_all;
+
 ok('clear_credentials ok', m.clear_credentials.call({}).ok == true);
 ok('clear_credentials removes the key', global.MOCK_UCI.network.nordvpn.private_key == null);
 

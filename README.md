@@ -21,7 +21,7 @@ policy-routing rules and firewall zones, and fixing things when a server dies.
 This project does all of that from one LuCI page:
 
 - **Easy setup.** Paste a NordVPN access token, choose countries, press
-  *Save and apply*. There are no config files to edit and no keys to copy
+  *Save*. There are no config files to edit and no keys to copy
   around.
 - **Choose what goes through the VPN.** Send the whole LAN, only some
   networks, only some devices, or only some websites.
@@ -247,7 +247,10 @@ apk del dnsmasq && apk add ./dnsmasq-full-*.apk
 4. Leave **Server** on *Automatic*, or pin a specific server.
 5. Optionally turn on **Automatic rotation** and choose what to route under
    **Traffic routing**.
-6. Click **Save and apply**.
+6. Click **Save**. Routing and policy changes apply without reconnecting;
+   selecting a different server or changing a tunnel setting reconnects.
+   **Disable all VPNs** turns off every tunnel and kill switch, so LAN traffic
+   routes to the WAN.
 
 Changing only what is routed (steered or excluded devices, networks and
 websites, the kill switch, IPv6 blocking, VPN DNS, the routing table) or the

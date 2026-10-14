@@ -101,6 +101,7 @@ jobs:
           node-version: lts/*
       - run: npm install --no-save --no-audit --no-fund --legacy-peer-deps eslint@9 @eslint/js@9 globals@15
       - run: npx eslint luci-app-nordvpn
+      - run: node luci-app-nordvpn/tests/overview.test.js
 
   ucode:
     name: ucode syntax + offline tests

@@ -165,7 +165,7 @@ const DEAD_PID = 1073741824;
 //    apply() fails at the credential check without any network access.
 {
 	global.MOCK_UCI = { nordvpn: { main: { '.type': 'settings',
-		interface: 'nordvpn' } }, network: {} };
+		interface: 'nordvpn', enabled: '1' } }, network: {} };
 	global.MOCK_UBUS = {};
 
 	let res = _apply.run_apply('main');
@@ -297,10 +297,15 @@ const DEAD_PID = 1073741824;
 		if (global.MOCK_UCI.network.peer0)
 			eq(label + ': peer untouched', global.MOCK_UCI.network.peer0.endpoint_host, 'de1.nordvpn.com');
 	};
-	refused('a disabled instance needs a full apply',
-		() => global.MOCK_UCI.nordvpn.main.enabled = '0', 'instance is disabled');
+	seed();
+	global.MOCK_UCI.nordvpn.main.enabled = '0';
+	res = _apply.apply_routing(cursor(), 'main');
+	ok('a disabled instance save does not reconnect', res.ok == true && res.disabled == true);
+	eq('a disabled instance save stays disabled', global.MOCK_UCI.nordvpn.main.enabled, '0');
 	refused('a changed MTU needs a full apply',
 		() => global.MOCK_UCI.nordvpn.main.mtu = '1400', 'MTU changed');
+	refused('a changed pinned server needs a full apply',
+		() => global.MOCK_UCI.nordvpn.main.fixed_server = 'us123.nordvpn.com', 'server changed');
 	refused('a downed interface needs a full apply',
 		() => global.MOCK_UCI.network.nv_media.auto = '0', 'interface is disabled');
 	refused('no peer yet needs a full apply',
@@ -391,6 +396,11 @@ const DEAD_PID = 1073741824;
 		} };
 	};
 	unlink(APPLY_LOCK_FILE);
+	seed({ enabled: '0' });
+	let disabled_save = _apply.apply(cursor(), 'main', 'save', 0);
+	eq('a full save does not enable a disabled instance',
+		[ disabled_save.state, disabled_save.restarted, global.MOCK_UCI.nordvpn.main.enabled ],
+		[ 'disabled', false, '0' ]);
 
 	eq('prefer_current: the connected server goes first',
 		map(_apply.prefer_current([ { hostname: 'a' }, { hostname: 'b' }, { hostname: 'c' } ], 'c'), (r) => r.hostname),

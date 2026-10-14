@@ -455,6 +455,11 @@ function apply_inner(uci, instance, source) {
 		return { state: 'failure', error: 'invalid interface name' };
 	if (!managed_interface(uci, iface))
 		return { state: 'failure', error: 'interface ' + iface + ' is not managed by nordvpn' };
+	// Saving settings must not implicitly turn a deliberately disabled tunnel
+	// back on. Explicit Enable/Reconnect and external apply calls retain their
+	// historical behavior.
+	if (source == 'save' && !s.enabled)
+		return { state: 'disabled', interface: iface, restarted: false };
 	// What the running tunnel is built from, before anything below changes it.
 	let before = tunnel_fingerprint(uci, iface);
 	// The instance's credentials may have changed in the bank or been switched
@@ -559,6 +564,8 @@ function apply_source(source) {
 // History entry for an apply outcome. Pure/testable.
 function apply_event(res, source) {
 	let reason = apply_source(source);
+	if (res && res.state == 'disabled')
+		return { type: 'disabled' };
 	if (res && res.state == 'success')
 		return { type: 'connect', fields: { server: res.gateway, reason } };
 	return { type: 'connect_failed', fields: {
@@ -605,8 +612,13 @@ function reconnect_reason(uci, iface, s) {
 		return 'instance is disabled';
 	if (!validate_wg_key(uci.get('network', iface, 'private_key')))
 		return 'no credentials configured';
-	if (!find_peer(uci, iface))
+	let peer = find_peer(uci, iface);
+	if (!peer)
 		return 'no server applied yet';
+	if (s.fixed_server && s.fixed_server != '' &&
+	    (uci.get('network', peer, 'nordvpn_gateway') ||
+	     uci.get('network', peer, 'endpoint_host') || '') != s.fixed_server)
+		return 'server changed';
 	if (uci.get('network', iface, 'auto') == '0')
 		return 'interface is disabled';
 	if ((uci.get('network', iface, 'mtu') || '') != (s.mtu ? '' + s.mtu : ''))
@@ -647,6 +659,10 @@ function apply_routing(uci, instance) {
 		return { error: 'invalid interface name' };
 	if (!managed_interface(uci, iface))
 		return { error: 'interface ' + iface + ' is not managed by nordvpn' };
+	// A save while disabled only changes stored preferences. Keep its routing
+	// protections released and report the save as handled without reconnecting.
+	if (!s.enabled)
+		return { ok: true, routing_only: true, disabled: true, interface: iface };
 
 	let reason = reconnect_reason(uci, iface, s);
 	if (reason)
@@ -913,24 +929,60 @@ function disconnect(uci, instance) {
 		return { error: 'invalid interface name' };
 	if (!managed_interface(uci, iface))
 		return { error: 'interface ' + iface + ' is not managed by nordvpn' };
-	let at_risk = wan_default_at_risk(uci);
-	uci.set('nordvpn', s.name, 'enabled', '0');
-	uci.commit('nordvpn');
+	// Serialize with apply and rotation so neither can bring the tunnel back up
+	// after this disable has completed.
+	let lock = acquire_tunnel_lock(instance, s, 0);
+	if (!lock)
+		return { error: 'a rotation or apply of this instance is running; retry disable when it finishes' };
+	let res;
+	try {
+		let at_risk = wan_default_at_risk(uci);
+		uci.set('nordvpn', s.name, 'enabled', '0');
+		uci.commit('nordvpn');
 
-	s.enabled = false;
-	let routing = enforce_routing(uci, s);
-	if (commit_routing(uci, routing))
-		uci = cursor();
+		s.enabled = false;
+		let routing = enforce_routing(uci, s);
+		if (commit_routing(uci, routing))
+			uci = cursor();
 
-	if (uci.get('network', iface) != null) {
-		uci.set('network', iface, 'auto', '0');
-		uci.commit('network');
+		if (uci.get('network', iface) != null) {
+			uci.set('network', iface, 'auto', '0');
+			uci.commit('network');
+		}
+		run([ 'ifdown', iface ]);
+		if (at_risk)
+			restore_wan_default_async();
+		record_event(instance, 'disabled');
+		res = { ok: true, interface: iface };
+	} catch (e) {
+		res = { error: '' + e };
 	}
-	run([ 'ifdown', iface ]);
-	if (at_risk)
-		restore_wan_default_async();
-	record_event(instance, 'disabled');
-	return { ok: true, interface: iface };
+	_common.release_lock(lock);
+	return res;
+}
+
+// Disable every configured instance, attempting all of them even if one has
+// a bad interface configuration. `disconnect()` changes only the active
+// enabled state and managed routing objects; kill-switch preferences remain
+// saved so an explicit later enable restores them.
+function disable_all(uci) {
+	let disabled = [], errors = [];
+	for (let name in _common.list_instances(uci)) {
+		let res;
+		try {
+			// A prior disconnect may have committed deletions, invalidating the
+			// cursor's section state; give each instance a fresh view.
+			res = disconnect(cursor(), name);
+		} catch (e) {
+			res = { error: '' + e };
+		}
+		if (res && res.ok)
+			push(disabled, name);
+		else
+			push(errors, { instance: name,
+				error: (res && res.error) ? res.error : 'disable failed' });
+	}
+	return { ok: length(errors) == 0, disabled, errors };
 }
 
 // Remove the key of the bank entry `instance` uses. The entry is shared, so
@@ -1056,5 +1108,5 @@ function delete_instance(uci, name) {
 	return { ok: true, deleted: name, interface: iface };
 }
 
-return { set_credentials, clear_credentials, current_key, current_peer, restore_peer, write_relay, bring_up, verify_handshake, netifd_hint, tunnel_hint, connect_one, tunnel_fingerprint, wan_default_at_risk, prefer_current, keep_running, parse_nft_elements, nft_set_elements, commit_routing, APPLY_SOURCES, apply_source, apply_event, apply, apply_routing, disconnect, create_instance, delete_instance, restore_wan_default, restore_wan_default_async,
+return { set_credentials, clear_credentials, current_key, current_peer, restore_peer, write_relay, bring_up, verify_handshake, netifd_hint, tunnel_hint, connect_one, tunnel_fingerprint, wan_default_at_risk, prefer_current, keep_running, parse_nft_elements, nft_set_elements, commit_routing, APPLY_SOURCES, apply_source, apply_event, apply, apply_routing, disconnect, disable_all, create_instance, delete_instance, restore_wan_default, restore_wan_default_async,
 	write_apply_status, read_apply_status, apply_running, apply_status_report, run_job, run_apply, start_job, start_apply };

@@ -24,6 +24,7 @@ const apply = _apply.apply,
       set_credentials = _apply.set_credentials,
       clear_credentials = _apply.clear_credentials,
       disconnect = _apply.disconnect,
+      disable_all = _apply.disable_all,
       create_instance = _apply.create_instance,
       delete_instance = _apply.delete_instance;
 const _rotate = require('nordvpn.rotate');
@@ -416,6 +417,14 @@ methods.disconnect = {
 		if (!name)
 			return { error: 'no such instance' };
 		return disconnect(uci, name);
+	}
+};
+
+// Disable every configured VPN instance and release its active routing and
+// kill-switch rules so ordinary WAN routing resumes.
+methods.disable_all = {
+	call: function() {
+		return disable_all(cursor());
 	}
 };
 
