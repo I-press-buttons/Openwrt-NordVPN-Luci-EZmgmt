@@ -30,7 +30,6 @@ var context = {
 	Date: Date,
 	JSON: JSON,
 	Array: Array,
-	Object: Object,
 	Math: Math,
 	window: { setTimeout: setTimeout },
 	require: function(name) {
@@ -74,6 +73,50 @@ assert.strictEqual(app.routingOnlyChange({ fixed_server: JSON.stringify('old') }
 	{ fixed_server: JSON.stringify('new') }), false, 'server changes require reconnecting');
 
 async function run() {
+	// Package updater uses text nodes for server errors and disables writes while
+	// a worker is running. Exercise the actual form controls and RPC arguments.
+	var elements = [];
+	context.dom.create = function(tag, attrs, children) {
+		var el = { tag: tag, attrs: attrs || {}, children: children, value: '', style: {},
+			addEventListener: function() {} };
+		elements.push(el);
+		return el;
+	};
+	var updateNotices = [];
+	context.ui.addNotification = function(a, message) { updateNotices.push(message.children); };
+	context.poll.add = function() {};
+	context.dom.content = function(node, value) { node.text = Array.isArray(value) ? value.join('') : value; };
+	calls.update_status = function() { return Promise.resolve({ state: 'idle', installed: '1.8.0-r1' }); };
+	app.buildUpdater();
+	await app.refreshUpdateStatus();
+	assert.strictEqual(app.updateButton.disabled, false);
+	var selector = elements.find(function(e) { return e.tag === 'select'; });
+	var versionInput = elements.find(function(e) { return e.tag === 'input'; });
+	var requested;
+	calls.update_start = function(v) { requested = v; return Promise.resolve({ started: true }); };
+	calls.update_status = function() { return Promise.resolve({ state: 'running', message: 'Downloading' }); };
+	selector.value = 'latest';
+	app.dirty = true;
+	await app.updateButton.attrs.click();
+	assert.strictEqual(requested, undefined, 'unsaved changes prevent updates');
+	app.dirty = false;
+	await app.updateButton.attrs.click();
+	assert.strictEqual(requested, 'latest', 'latest selection reaches the updater');
+	assert.strictEqual(app.updateButton.disabled, true, 'running update disables button');
+	selector.value = 'custom'; versionInput.value = 'v1.8.0-r20261015';
+	await app.updateButton.attrs.click();
+	assert.strictEqual(requested, 'v1.8.0-r20261015', 'custom tag reaches the updater');
+	versionInput.value = '1.8.0; id'; requested = undefined;
+	await app.updateButton.attrs.click();
+	assert.strictEqual(requested, undefined, 'invalid version never reaches RPC');
+	calls.update_status = function() { return Promise.resolve({ state: 'error', error: '<download failed>' }); };
+	await app.refreshUpdateStatus();
+	assert.strictEqual(app.updateButton.disabled, false, 'failed update can be retried');
+	assert(app.updateMessage.text.includes('<download failed>'), 'failure details are rendered as text');
+	calls.update_status = function() { return Promise.resolve({ state: 'success', version: 'v1.8.0' }); };
+	await app.refreshUpdateStatus();
+	assert(app.updateMessage.text.includes('Reload this page'), 'success explains how to load the new UI');
+
 	var notices = [];
 	app.notice = function(message) { notices.push(message); return {}; };
 	app.dismiss = function() {};

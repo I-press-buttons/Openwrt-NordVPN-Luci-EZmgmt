@@ -74,6 +74,7 @@ define Package/nordvpn-wireguard/install
 	$(INSTALL_BIN) ./files/usr/bin/nordvpn-cache-update $(1)/usr/bin/nordvpn-cache-update
 	$(INSTALL_BIN) ./files/usr/bin/nordvpn-cache-query $(1)/usr/bin/nordvpn-cache-query
 	$(INSTALL_BIN) ./files/usr/bin/nordvpn-rotate $(1)/usr/bin/nordvpn-rotate
+	$(INSTALL_BIN) ./files/usr/bin/nordvpn-update $(1)/usr/bin/nordvpn-update
 	$(INSTALL_BIN) ./files/usr/bin/nordvpn-service $(1)/usr/bin/nordvpn-service
 endef
 

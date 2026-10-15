@@ -133,7 +133,8 @@ jobs:
             nordvpn-wireguard/files/usr/bin/nordvpn-cache-update \
             nordvpn-wireguard/files/usr/bin/nordvpn-cache-query \
             nordvpn-wireguard/files/usr/bin/nordvpn-apply \
-            nordvpn-wireguard/files/usr/bin/nordvpn-rotate; do
+            nordvpn-wireguard/files/usr/bin/nordvpn-rotate \
+            nordvpn-wireguard/files/usr/bin/nordvpn-update; do
             echo "ucode -c $f"
             "$UC" -L "$MOCKS/*.uc" -L "$LIB/*.uc" -L "$B/*.so" -c "$f"
           done
