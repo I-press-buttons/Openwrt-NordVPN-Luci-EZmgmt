@@ -188,13 +188,13 @@ Supported: **OpenWrt snapshots** and **OpenWrt 25.12** (both use `apk`).
 ### Prebuilt packages from this fork
 
 A nightly build publishes the day's changes to `master` on the
-[Releases page](https://github.com/I-press-buttons/nordvpn-luci-extras/releases/latest),
+[Releases page](https://github.com/I-press-buttons/Openwrt-NordVPN-Luci-EZmgmt/releases/latest),
 at most once a day and only when something was merged. It is tagged
 `v<version>-r<date>` (for example `v1.7.0-r20260930`), and the packages carry
 the same version, so `apk upgrade` picks up each new nightly. Download both
 architecture-independent `.apk` files from the newest release.
 Pull request builds are available as the `nordvpn-packages` artifact on the
-[Actions page](https://github.com/I-press-buttons/nordvpn-luci-extras/actions).
+[Actions page](https://github.com/I-press-buttons/Openwrt-NordVPN-Luci-EZmgmt/actions).
 Then, on the router:
 
 ```sh
@@ -212,6 +212,27 @@ wget -O /tmp/luci-app-nordvpn.apk \
   https://github.com/I-press-buttons/Openwrt-NordVPN-Luci-EZmgmt/releases/latest/download/luci-app-nordvpn-latest.apk
 apk add --allow-untrusted /tmp/nordvpn-wireguard.apk /tmp/luci-app-nordvpn.apk
 ```
+
+After installing a release containing the updater, run either command as root:
+
+```sh
+nordvpn-update                 # latest GitHub release
+nordvpn-update 1.8.0           # a specific release (v prefix optional)
+nordvpn-update v1.8.0-r20261015 # a specific nightly
+```
+
+Under **VPN → NordVPN → Package updates**, select **Latest release** or
+**Specific version**, enter the version/tag if needed, and click **Update
+packages**. Save or discard pending configuration edits first. Progress and errors
+appear on the page, including when returning to an update already in progress.
+The updater downloads both APKs from the same release before installing either,
+prevents concurrent updates, and removes temporary downloads afterward. A failed
+download leaves installed packages untouched. Specific versions may downgrade;
+the selected release must contain both `-latest.apk` assets. Installation uses
+`apk add --allow-untrusted`, as above, over verified HTTPS; release APKs are
+unsigned. If installation fails, inspect the reported error and installed package
+versions before retrying. After success, rpcd restarts to load the updated backend;
+wait a few seconds and reload the page. VPN configuration is retained by apk.
 
 Log out of LuCI and back in, then open **VPN → NordVPN**. Installing only
 `nordvpn-wireguard` gives you a headless CLI/ubus service.

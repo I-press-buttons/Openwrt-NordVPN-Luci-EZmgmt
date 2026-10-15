@@ -1,0 +1,19 @@
+#!/usr/bin/ucode -S
+// SPDX-License-Identifier: MIT
+'use strict';
+const updater = require('nordvpn.update');
+const common = require('nordvpn.common');
+let args = [ ...ARGV ];
+let worker = args[0] == '--worker';
+if (worker) shift(args);
+if (length(args) > 1 || args[0] == '--help' || args[0] == '-h') {
+	printf('Usage: nordvpn-update [latest|VERSION]\nUpdates both NordVPN packages from GitHub (apk only).\n');
+	exit(length(args) > 1 ? 1 : 0);
+}
+let res = updater.run(args[0], worker);
+printf('%J\n', res);
+if (res.state != 'success') exit(1);
+// Let the UI read the result before rpcd reloads its installed modules.
+// Detached: restarting rpcd must not interrupt the completed APK transaction.
+common.run([ 'sh', '-c', '(sleep 5; /etc/init.d/rpcd restart) </dev/null >/dev/null 2>&1 &' ]);
+exit(0);

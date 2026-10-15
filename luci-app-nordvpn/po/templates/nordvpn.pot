@@ -5,3 +5,71 @@ msgstr "Content-Type: text/plain; charset=UTF-8\n"
 #   ./build/i18n-scan.pl applications/luci-app-nordvpn \
 #       > applications/luci-app-nordvpn/po/templates/nordvpn.pot
 # Do not hand-edit translated .po files; upstream translations use Weblate.
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js
+msgid "Latest release"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js
+msgid "Specific version"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js
+msgid "Loading update status…"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js
+msgid "Save or discard your pending changes before updating."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js
+msgid "Enter a valid release version or tag."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js
+msgid "Could not start update."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js
+msgid "Update packages"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js
+msgid "Package updates"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js
+msgid "Update both NordVPN packages from GitHub. Specific versions can also downgrade. LuCI services restart after installation; reload this page when complete."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js
+msgid "Reload page"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js
+msgid "Update status unavailable."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js
+msgid "Installed backend: "
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js
+msgid "Updating…"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js
+msgid "Installed release: "
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js
+msgid "Update complete. Reload this page."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js
+msgid "Update failed."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js
+msgid "Update status unavailable. If an update is running, wait for LuCI services to restart, then reload this page."
+msgstr ""

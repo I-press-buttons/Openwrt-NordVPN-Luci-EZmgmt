@@ -47,7 +47,14 @@ const read_cache = _cache.read_cache,
       city_relays = _cache.city_relays,
       pool_relays = _cache.pool_relays;
 
+const updater = require('nordvpn.update');
 const methods = {};
+
+methods.update_status = { call: function() { return updater.status(); } };
+methods.update_start = {
+	args: { version: '' },
+	call: function(request) { return updater.start((request.args || {}).version); }
+};
 
 // What started an apply, from the call's `source` argument (null when absent;
 // the backend records that as 'external').

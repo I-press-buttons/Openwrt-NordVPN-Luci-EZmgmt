@@ -29,6 +29,8 @@ var E = function(html, attr, data) {
 var callInstances = rpc.declare({ object: 'nordvpn', method: 'instances' });
 var callLocations = rpc.declare({ object: 'nordvpn', method: 'locations' });
 var callServers = rpc.declare({ object: 'nordvpn', method: 'servers', params: [ 'locations', 'hop_mode', 'server_group' ] });
+var callUpdateStatus = rpc.declare({ object: 'nordvpn', method: 'update_status' });
+var callUpdateStart = rpc.declare({ object: 'nordvpn', method: 'update_start', params: [ 'version' ] });
 var callRefreshStatus = rpc.declare({ object: 'nordvpn', method: 'refresh_status' });
 var callSetCredentials = rpc.declare({ object: 'nordvpn', method: 'set_credentials', params: [ 'token', 'instance', 'credential', 'name' ] });
 var callCredentials = rpc.declare({ object: 'nordvpn', method: 'credentials' });
@@ -264,7 +266,8 @@ return view.extend({
 			this.statusNode,
 			this.historyNode,
 			this.formNode,
-			this.buildActions()
+			this.buildActions(),
+			this.buildUpdater()
 		]);
 
 		// The bound function is kept in a field because poll.remove() matches on
@@ -273,6 +276,57 @@ return view.extend({
 		this._statusPoll = L.bind(this.refreshStatus, this);
 		poll.add(this._statusPoll, STATUS_POLL_S);
 		return container;
+	},
+
+	buildUpdater: function() {
+		var select = E('select', { class: 'cbi-input-select' }, [
+			E('option', { value: 'latest' }, _('Latest release')),
+			E('option', { value: 'custom' }, _('Specific version'))
+		]);
+		var input = E('input', { type: 'text', class: 'cbi-input-text', placeholder: '1.8.0 or v1.8.0-r20261015', style: 'display:none' });
+		select.addEventListener('change', function() { input.style.display = select.value === 'custom' ? '' : 'none'; });
+		this.updateMessage = E('p', {}, _('Loading update status…'));
+		this.updateButton = E('button', { class: 'cbi-button cbi-button-action', click: L.bind(function() {
+			if (this.dirty) {
+				ui.addNotification(null, E('p', {}, _('Save or discard your pending changes before updating.')), 'warning');
+				return;
+			}
+			var version = select.value === 'latest' ? 'latest' : input.value.trim();
+			if (!version || (version !== 'latest' && !/^v?[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9]+)*$/.test(version))) {
+				ui.addNotification(null, E('p', {}, _('Enter a valid release version or tag.')), 'error');
+				return;
+			}
+			this.updateButton.disabled = true;
+			return callUpdateStart(version).then(L.bind(function(res) {
+				if (!res || res.error) throw new Error((res && res.error) || _('Could not start update.'));
+				return this.refreshUpdateStatus();
+			}, this)).catch(L.bind(function(err) {
+				this.updateButton.disabled = false;
+				ui.addNotification(null, E('p', {}, err.message), 'error');
+			}, this));
+		}, this) }, _('Update packages'));
+		this.refreshUpdateStatus();
+		poll.add(L.bind(this.refreshUpdateStatus, this), STATUS_POLL_S);
+		return E('fieldset', { class: 'cbi-section' }, [
+			E('legend', {}, _('Package updates')),
+			E('p', {}, _('Update both NordVPN packages from GitHub. Specific versions can also downgrade. LuCI services restart after installation; reload this page when complete.')),
+			this.updateMessage, select, ' ', input, ' ', this.updateButton,
+			E('button', { class: 'cbi-button', click: function() { window.location.reload(); } }, _('Reload page'))
+		]);
+	},
+
+	refreshUpdateStatus: function() {
+		return callUpdateStatus().then(L.bind(function(res) {
+			if (!res || !res.state) throw new Error(_('Update status unavailable.'));
+			this.updateButton.disabled = res.state === 'running';
+			var message = _('Installed backend: ') + (res.installed || '?') + '. ';
+			if (res.state === 'running') message += res.message || _('Updating…');
+			else if (res.state === 'success') message += _('Installed release: ') + res.version + '. ' + _('Update complete. Reload this page.');
+			else if (res.state === 'error') message += (res.error || _('Update failed.')) + (res.output ? '\n' + res.output : '');
+			dom.content(this.updateMessage, [ message ]);
+		}, this)).catch(L.bind(function() {
+			dom.content(this.updateMessage, [ _('Update status unavailable. If an update is running, wait for LuCI services to restart, then reload this page.') ]);
+		}, this));
 	},
 
 	/* ---- instances ----------------------------------------------------- */
