@@ -305,6 +305,7 @@ jobs:
     outputs:
       number: ${{ steps.pr.outputs.number }}
     steps:
+      - uses: actions/checkout@v4
       - name: Create or find PR to master
         id: pr
         env:
