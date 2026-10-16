@@ -267,7 +267,14 @@ return view.extend({
 			this.historyNode,
 			this.formNode,
 			this.buildActions(),
-			this.buildUpdater()
+			this.buildUpdater(),
+			E('p', { style: 'margin-top:1.5em;text-align:center' }, [
+				E('a', {
+					href: 'https://github.com/I-press-buttons/Openwrt-NordVPN-Luci-EZmgmt/blob/master/docs/OPTIONS.md',
+					target: '_blank',
+					rel: 'noopener noreferrer'
+				}, _('What do these options do? Read the options guide.'))
+			])
 		]);
 
 		// The bound function is kept in a field because poll.remove() matches on
