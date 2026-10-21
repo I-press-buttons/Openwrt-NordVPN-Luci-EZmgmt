@@ -90,6 +90,7 @@ function start_probe(inst, dev, gateway, targets) {
 	probing[inst] = time();
 	uloop.task(
 		function() {
+			_common.drop_inherited_locks();
 			try {
 				return egress_probe(dev, targets);
 			} catch (e) {
@@ -135,6 +136,7 @@ function refresh_step(uci, now) {
 		seeding = now;
 		uloop.task(
 			function() {
+				_common.drop_inherited_locks();
 				try {
 					let c = read_cache(path);
 					return { cached_at: c ? c.cached_at : null, stale: is_stale(c, time()) };
@@ -181,6 +183,7 @@ function refresh_step(uci, now) {
 	refreshing = now;
 	uloop.task(
 		function() {
+			_common.drop_inherited_locks();
 			// Only the outcome crosses the pipe, never the server list.
 			try {
 				let r = fetch_and_build(path);
@@ -222,7 +225,7 @@ function instance_step(uci, inst, now, hm) {
 		mark_attempt(now, inst);
 	} else if (should_rotate(s, last, now, hm)) {
 		mark_attempt(now, inst);
-		uloop.task(function() { rotate(null, inst, 'schedule'); });
+		uloop.task(function() { _common.drop_inherited_locks(); rotate(null, inst, 'schedule'); });
 	}
 
 	// Watchdog timers persist in the per-instance rotate state across daemon
@@ -285,6 +288,7 @@ function instance_step(uci, inst, now, hm) {
 			detail: sprintf('unhealthy for %d s', now - ds) });
 		uloop.task(
 			function() {
+				_common.drop_inherited_locks();
 				try {
 					return rotate(null, inst, 'watchdog');
 				} catch (e) {

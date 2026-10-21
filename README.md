@@ -193,7 +193,8 @@ at most once a day and only when something was merged. It is tagged
 `v<version>-r<date>` (for example `v1.7.0-r20260930`), and the packages carry
 the same version, so `apk upgrade` picks up each new nightly. Download both
 architecture-independent `.apk` files from the newest release.
-Pull request builds are available as the `nordvpn-packages` artifact on the
+To build packages on demand, run the CI workflow manually; its
+`nordvpn-packages` artifact is available on the
 [Actions page](https://github.com/I-press-buttons/Openwrt-NordVPN-Luci-EZmgmt/actions).
 Then, on the router:
 
@@ -745,8 +746,11 @@ sh nordvpn-wireguard/tests/run.sh
 ```
 
 CI (`.github/workflows/build.yml`) runs shell and JSON checks, ESLint on the
-LuCI view, the ucode tests, and a snapshot-SDK build of both packages on every
-pull request and push to `master`. Those runs don't publish anything.
+LuCI view, and the ucode tests on every pull request and push to `master`.
+Package builds run only for changed nightlies, deliberate version tags, or a
+manual workflow run. A manual run with *nightly* unticked builds both packages
+with the snapshot SDK and uploads the `nordvpn-packages` artifact without
+publishing a release.
 
 Releases come from two places:
 

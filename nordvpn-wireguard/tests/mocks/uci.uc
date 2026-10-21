@@ -86,7 +86,11 @@ export function cursor() {
 			s[c][sec][opt] = cur;
 		},
 		save: function() { return true; },
-		commit: function() { return true; },
+		commit: function(config) {
+			if (type(global.MOCK_UCI_COMMIT_HOOK) == 'function')
+				return global.MOCK_UCI_COMMIT_HOOK(config);
+			return true;
+		},
 		changes: function() { return []; },
 		revert: function() { return true; },
 		error: function() { return null; }

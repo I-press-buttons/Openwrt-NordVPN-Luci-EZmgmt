@@ -346,21 +346,19 @@ const DEAD_PID = 1073741824;
 	ok('then the WAN default is no longer at risk', _apply.wan_default_at_risk(cursor()) == false);
 
 	seed();
-	let token = _common.acquire_lock(APPLY_LOCK_FILE, APPLY_MAX_RUNTIME);
+	let token = _common.acquire_advisory(_common.tunnel_lock_path('main'));
 	res = _apply.apply_routing(cursor(), 'main');
-	ok('a running apply is not interleaved', res.needs_reconnect == true &&
-		res.reason == 'apply already running');
-	_common.release_lock(token);
+	ok('a running apply is not interleaved', res.busy == true && index(res.error, 'running') >= 0);
+	_common.release_advisory(token);
 
 	// A rotation job may hold the lock past APPLY_MAX_RUNTIME; while its
 	// worker is alive the lock is not stale and must not be taken over.
 	seed();
-	writefile(APPLY_LOCK_FILE, sprintf('%d %d\n', time(), live_pid));
-	system([ 'touch', '-d', '@' + (time() - APPLY_MAX_RUNTIME - 60), APPLY_LOCK_FILE ]);
+	token = _common.acquire_advisory(_common.tunnel_lock_path('main'));
+	system([ 'touch', '-d', '@' + (time() - APPLY_MAX_RUNTIME - 60), _common.tunnel_lock_path('main') ]);
 	res = _apply.apply_routing(cursor(), 'main');
-	ok('a long rotation job keeps its lock', res.needs_reconnect == true &&
-		res.reason == 'apply already running' && stat(APPLY_LOCK_FILE) != null);
-	unlink(APPLY_LOCK_FILE);
+	ok('a long rotation job keeps its lock', res.busy == true && index(res.error, 'running') >= 0);
+	_common.release_advisory(token);
 
 	seed();
 	global.MOCK_UCI.network.nv_media.vpn_type = null;
@@ -441,16 +439,18 @@ const DEAD_PID = 1073741824;
 
 	// A rotation holding the tunnel lock: the apply does not run alongside it.
 	seed();
-	writefile(_common.tunnel_lock_path('main'), sprintf('%d %d\n', time(), live_pid));
+	let owner = _common.acquire_advisory(_common.tunnel_lock_path('main'));
 	res = _apply.apply(cursor(), 'main', 'save', 0);
-	ok('a running rotation blocks the apply', res.state == 'failure' && index(res.error, 'rotation') >= 0);
+	ok('a running rotation blocks the apply', res.state == 'failure' && res.busy == true);
 	eq('... which leaves the peer alone', global.MOCK_UCI.network.peer0.endpoint_host, 'ee70.nordvpn.com');
 	let _rotate = require('nordvpn.rotate');
 	eq('and an apply (or rotation) holding it blocks a rotation',
 		_rotate.rotate(cursor(), 'main', 'watchdog').reason, 'rotation already running');
-	unlink(_common.tunnel_lock_path('main'));
-	ok('apply releases the tunnel lock', (_apply.apply(cursor(), 'main', 'save', 0).state == 'success') &&
-		stat(_common.tunnel_lock_path('main')) == null);
+	_common.release_advisory(owner);
+	let applied = _apply.apply(cursor(), 'main', 'save', 0);
+	owner = _common.acquire_advisory(_common.tunnel_lock_path('main'));
+	ok('apply releases the tunnel lock', applied.state == 'success' && owner != null);
+	_common.release_advisory(owner);
 
 	// A rotation only changes the server: a table or MTU saved but not
 	// applied yet is left for the apply that also sets up its routing.

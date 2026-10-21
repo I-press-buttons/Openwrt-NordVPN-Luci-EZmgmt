@@ -9,6 +9,7 @@
 'use strict';
 
 import { stat, writefile, chmod } from 'fs';
+import { cursor } from 'uci';
 const _common = require('nordvpn.common');
 const FIXED_ADDRESS = _common.FIXED_ADDRESS,
       load_settings = _common.load_settings,
@@ -21,6 +22,7 @@ const FIXED_ADDRESS = _common.FIXED_ADDRESS,
       run = _common.run;
 // Called through the module so offline tests can stand in for the API.
 const _api = require('nordvpn.api');
+const _mutation = require('nordvpn.mutation');
 const record_event = require('nordvpn.history').record_event;
 
 const PKG = 'nordvpn_credentials';
@@ -151,22 +153,38 @@ function sync_instance(uci, instance) {
 
 // Sync every instance on entry `id` and commit. A live tunnel whose key
 // changed is restarted so netifd loads it. Records one event per instance.
-function sync_users(uci, id) {
-	let changed = false;
+function validate_users(uci, id) {
 	for (let name in users(uci, id)) {
-		let r = sync_instance(uci, name);
-		if (!r)
-			continue;
-		changed = true;
-		uci.commit('network');
-		// Only a tunnel that already had a server needs restarting; a fresh
-		// interface waits for its first apply.
-		let st = load_settings(uci, name);
-		if (r == 'set' && st.enabled && find_peer(uci, st.interface))
-			run([ 'ifup', st.interface ]);
-		record_event(name, r == 'set' ? 'credentials_set' : 'credentials_cleared');
+		let invalid = _mutation.validate_owner(uci, name);
+		if (invalid)
+			return { error: invalid, succeeded: [], errors: [ { instance: name, error: invalid } ] };
 	}
-	return changed;
+	return null;
+}
+
+function sync_users_inner(uci, id) {
+	let changed = false, succeeded = [], errors = [];
+	let affected = users(uci, id);
+	for (let name in affected) {
+		try {
+			let r = sync_instance(uci, name);
+			if (r) {
+				changed = true;
+				uci.commit('network');
+				let st = load_settings(uci, name);
+				if (r == 'set' && st.enabled && find_peer(uci, st.interface))
+					run([ 'ifup', st.interface ]);
+				record_event(name, r == 'set' ? 'credentials_set' : 'credentials_cleared');
+			}
+			push(succeeded, name);
+		} catch (e) {
+			push(errors, { instance: name, error: '' + e });
+			// Discard any uncommitted state from the failed instance.
+			uci = cursor();
+		}
+	}
+	return { ok: length(errors) == 0, changed: changed, succeeded: succeeded, errors: errors,
+		error: length(errors) ? 'credential synchronization failed for one or more instances' : null };
 }
 
 // Resolve which entry a set request targets. `credential` names an existing
@@ -193,7 +211,7 @@ function target(uci, credential, name, instance) {
 // Exchange `token` for the account key and store it in the bank entry chosen
 // by target(), then push it to every instance on that entry. Returns
 // { ok, credential, name } or { error }.
-function set(uci, token, credential, name, instance) {
+function set_inner(uci, res, credential, name, instance) {
 	if (name != null && name != '') {
 		name = validate_name(name);
 		if (!name)
@@ -202,10 +220,10 @@ function set(uci, token, credential, name, instance) {
 	let t = target(uci, credential, name, instance);
 	if (t.error)
 		return t;
-	let res = _api.get_private_key(token);
-	if (res.error)
-		return res;
 
+	let invalid = validate_users(uci, t.id);
+	if (invalid)
+		return invalid;
 	ensure_file();
 	uci.set(PKG, t.id, 'credential');
 	if (t.create || name)
@@ -214,32 +232,34 @@ function set(uci, token, credential, name, instance) {
 		uci.set(PKG, t.id, 'name', DEFAULT_NAME);
 	uci.set(PKG, t.id, 'private_key', res.private_key);
 	uci.commit(PKG);
-	sync_users(uci, t.id);
-	return { ok: true, credential: t.id, name: uci.get(PKG, t.id, 'name') };
+	let synced = sync_users_inner(uci, t.id);
+	return { ...synced, credential: t.id, name: uci.get(PKG, t.id, 'name') };
 }
 
 // Drop the key of bank entry `id` but keep the entry; every instance on it
 // goes down until a new token is stored.
-function clear_key(uci, id) {
+function clear_key_inner(uci, id) {
 	id = validate_instance(id);
 	if (!id || !exists(uci, id))
 		return { error: 'no such credentials' };
+	let invalid = validate_users(uci, id);
+	if (invalid)
+		return invalid;
 	if (uci.get(PKG, id) != null) {
 		uci.delete(PKG, id, 'private_key');
 		uci.commit(PKG);
 	}
-	sync_users(uci, id);
-	return { ok: true, credential: id };
+	return { ...sync_users_inner(uci, id), credential: id };
 }
 
 // Remove bank entry `id`. 'default' cannot go, so it only loses its key; any
 // other entry must not be in use.
-function remove(uci, id) {
+function remove_inner(uci, id) {
 	id = validate_instance(id);
 	if (!id || !exists(uci, id))
 		return { error: 'no such credentials' };
 	if (id == DEFAULT_ID)
-		return clear_key(uci, id);
+		return clear_key_inner(uci, id);
 	let used = users(uci, id);
 	if (length(used))
 		return { error: 'still used by ' + join(', ', used) + '; switch them to other credentials first' };
@@ -256,7 +276,7 @@ function remove(uci, id) {
 // instead re-ran it whenever Default's key was removed, refilling Default
 // from another entry's key and moving that entry's instances onto it.
 // Returns true when it moved any key.
-function migrate(uci) {
+function migrate_inner(uci) {
 	if (uci.get(PKG, STATE, 'migrated') == '1')
 		return false;
 	let changed = false;
@@ -296,8 +316,70 @@ function migrate(uci) {
 	return changed;
 }
 
+// Public bank operations take sorted ownership before opening a fresh cursor.
+// Credentials fan out as one coordinated operation: a busy user means no
+// bank/interface writes, and the response names that user.
+function set(uci, token, credential, name, instance) {
+	if (name != null && name != '' && !validate_name(name))
+		return { error: 'invalid name' };
+	let initial = target(cursor(), credential, name, instance);
+	if (initial.error)
+		return initial;
+	let res = _api.get_private_key(token);
+	if (res.error)
+		return res;
+	return _mutation.all(function(fresh) {
+		migrate_inner(fresh);
+		if (instance) {
+			let invalid = _mutation.validate_owner(fresh, instance);
+			if (invalid)
+				return { error: invalid };
+		}
+		return set_inner(fresh, res, credential, name, instance);
+	});
+}
+
+function clear_key(uci, id) {
+	return _mutation.all(function(fresh) {
+		migrate_inner(fresh);
+		return clear_key_inner(fresh, id);
+	});
+}
+
+function clear_instance(uci, instance) {
+	instance = validate_instance(instance) || 'main';
+	return _mutation.all(function(fresh) {
+		let invalid = _mutation.validate_owner(fresh, instance);
+		if (invalid)
+			return { error: invalid };
+		migrate_inner(fresh);
+		return { ...clear_key_inner(fresh, instance_credential(fresh, instance)),
+			interface: load_settings(fresh, instance).interface };
+	});
+}
+
+function remove(uci, id) {
+	return _mutation.all(function(fresh) {
+		migrate_inner(fresh);
+		return remove_inner(fresh, id);
+	});
+}
+
+function sync_users(uci, id) {
+	return _mutation.all(function(fresh) {
+		return validate_users(fresh, id) || sync_users_inner(fresh, id);
+	});
+}
+
+function migrate(uci) {
+	// Read-only fast path; migrate_inner rechecks under ownership before writes.
+	if (uci.get(PKG, STATE, 'migrated') == '1')
+		return false;
+	return _mutation.all(function(fresh) { return migrate_inner(fresh); });
+}
+
 return {
 	PKG, DEFAULT_ID, DEFAULT_NAME,
 	validate_name, make_id, list, instance_credential, exists,
-	sync_instance, sync_users, set, clear_key, remove, migrate
+	sync_instance, sync_users, set, clear_key, clear_instance, remove, migrate
 };
