@@ -133,6 +133,9 @@ ok('apply returns a state object', m.apply.call().state != null);
 {
 	unlink(_common.APPLY_STATUS_FILE);
 	eq('apply_status idle without a job file', m.apply_status.call({}).state, 'idle');
+	eq('apply_status accepts optional exact ID', m.apply_status.args.id, '');
+	eq('unknown exact ID reports missing rather than idle',
+		m.apply_status.call({ args: { id: 'absent' } }).state, 'missing');
 	eq('apply_start rejects an unknown instance',
 		m.apply_start.call({ args: { instance: 'nope' } }).error, 'no such instance');
 

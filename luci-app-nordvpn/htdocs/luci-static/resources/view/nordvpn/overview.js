@@ -65,7 +65,7 @@ var callUciCommit = rpc.declare({
 // therefore starts the job and watches it; the synchronous `apply` stays in the
 // backend for the CLI only.
 var callApplyStart = rpc.declare({ object: 'nordvpn', method: 'apply_start', params: [ 'instance', 'source' ] });
-var callApplyStatus = rpc.declare({ object: 'nordvpn', method: 'apply_status' });
+var callApplyStatus = rpc.declare({ object: 'nordvpn', method: 'apply_status', params: [ 'id' ] });
 // Routing-only apply: reconciles the steering/exception rules without touching
 // the tunnel. Quick (no handshake wait), so it is a plain call.
 var callApplyRouting = rpc.declare({ object: 'nordvpn', method: 'apply_routing', params: [ 'instance' ] });
@@ -932,12 +932,14 @@ return view.extend({
 
 	// Runs one backend job (`kind` 'apply' or 'rotate') through `start` and
 	// resolves with its result. The backend runs one job at a time and reports
-	// it through apply_status, so only a record of this very job (kind and
-	// instance) is taken as its outcome.
+	// it through apply_status. New backends return an immutable ID; older
+	// backends remain compatible through kind/instance matching.
 	runJob: function(start, instance, kind) {
 		var deadline = Date.now() + APPLY_TIMEOUT_MS;
+		var jobId = null;
 		var mine = function(st) {
-			return !!st && (st.kind || 'apply') === kind && st.instance === instance;
+			return !!st && (jobId ? st.id === jobId :
+				(st.kind || 'apply') === kind && st.instance === instance);
 		};
 		// A rotation may outlast an apply by far (max_retries candidates); the
 		// job record states its own ceiling.
@@ -948,19 +950,11 @@ return view.extend({
 		this.pauseStatusPoll();
 		return start(instance).then(L.bind(function(res) {
 			if (!res || !res.error) {
+				jobId = res && res.apply && res.apply.id;
 				extend(res && res.apply);
-				return this.waitForApply(deadline, mine);
+				return this.waitForApply(deadline, mine, jobId);
 			}
-			// A refused start is usually "one is already running" — from the other
-			// button or another tab. Matching on the message would be brittle, so
-			// simply ask what the job queue is doing: if this very job is running,
-			// that is the one the user wanted anyway.
-			return callApplyStatus().then(L.bind(function(st) {
-				if (!(st && st.state === 'running' && mine(st)))
-					return { error: res.error };
-				extend(st);
-				return this.waitForApply(deadline, mine);
-			}, this), function() { return { error: res.error }; });
+			return { error: res.error };
 		}, this)).then(L.bind(function(result) {
 			this.resumeStatusPoll();
 			return result;
@@ -976,22 +970,22 @@ return view.extend({
 	// finished job is turned into an `error` result rather than an optimistic
 	// success: a banner claiming a tunnel that never came up is worse than an
 	// honest "no idea". `mine` tells this job's record from another one's.
-	waitForApply: function(deadline, mine) {
+	waitForApply: function(deadline, mine, jobId) {
 		var since = Date.now();
 		return new Promise(function(resolve, reject) {
 			var probe = function() {
-				callApplyStatus().then(function(st) {
+				callApplyStatus(jobId || '').then(function(st) {
 					var state = st && st.state;
-					if ((state === 'done' || state === 'failed') && !mine(st))
+					if ((state === 'done' || state === 'failed' || state === 'running') && !mine(st))
 						// Another job ran after ours, so our own result is gone.
 						return resolve({ error: _('another operation replaced this one; check the recent events') });
 					if (state === 'done' || state === 'failed')
 						return resolve((st && st.result) ||
-							{ error: _('the operation finished without reporting a result') });
+							{ error: (st && st.error) || _('the operation finished without reporting a result') });
 					if (state !== 'running')
 						// 'idle' after a successful start means the job record is
 						// gone — an rpcd restart, or the backend died mid-apply.
-						return resolve({ error: _('the operation stopped reporting progress') });
+						return resolve({ error: (st && st.error) || _('the operation stopped reporting progress') });
 					if (Date.now() >= deadline)
 						return resolve({ error: _('the operation is still running after %d seconds — check the system log')
 							.format(Math.round((Date.now() - since) / 1000)) });
@@ -1006,7 +1000,7 @@ return view.extend({
 					window.setTimeout(probe, APPLY_POLL_MS);
 				});
 			};
-			// The start call already returned; nothing can be finished yet.
+			// The worker may already be finished when the start call returns.
 			window.setTimeout(probe, APPLY_POLL_MS);
 		});
 	},

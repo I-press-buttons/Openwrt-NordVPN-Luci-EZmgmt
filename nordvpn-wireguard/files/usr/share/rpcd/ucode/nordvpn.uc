@@ -399,8 +399,9 @@ methods.apply_routing = {
 
 // Apply progress/outcome for the UI.
 methods.apply_status = {
+	args: { id: '' },
 	call: function(request) {
-		return _apply.apply_status_report() || { state: 'idle' };
+		return _apply.apply_status_report(null, (request.args || {}).id) || { state: 'idle' };
 	}
 };
 
