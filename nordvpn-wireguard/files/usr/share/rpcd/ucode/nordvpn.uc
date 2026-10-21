@@ -343,7 +343,6 @@ methods.set_credentials = {
 			return { error: 'invalid token format' };
 		let uci = cursor();
 		if ((a.credential != null && a.credential != '') || (a.name != null && a.name != '')) {
-			_creds.migrate(uci);
 			return _creds.set(uci, a.token, a.credential, a.name, null);
 		}
 		let name = req_instance(uci, request);
@@ -362,7 +361,7 @@ methods.apply = {
 		let name = req_instance(uci, request);
 		if (!name)
 			return { error: 'no such instance' };
-		return apply(uci, name, req_source(request));
+		return apply(uci, name, req_source(request), 0);
 	}
 };
 
@@ -450,7 +449,6 @@ methods.remove_credentials = {
 	call: function(request) {
 		let a = request.args || {};
 		let uci = cursor();
-		_creds.migrate(uci);
 		return _creds.remove(uci, a.credential);
 	}
 };
@@ -461,7 +459,6 @@ methods.clear_credentials = {
 		let uci = cursor();
 		let a = request.args || {};
 		if (a.credential != null && a.credential != '') {
-			_creds.migrate(uci);
 			return _creds.clear_key(uci, a.credential);
 		}
 		let name = req_instance(uci, request);
@@ -506,7 +503,7 @@ methods.rotate_now = {
 		let name = req_instance(uci, request);
 		if (!name)
 			return { error: 'no such instance' };
-		return rotate(uci, name, 'manual');
+		return rotate(uci, name, 'manual', 0);
 	}
 };
 

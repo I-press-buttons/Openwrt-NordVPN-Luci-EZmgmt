@@ -4,6 +4,32 @@
 # dedicated /etc/config/nordvpn owned by nordvpn-wireguard. Safe to run more
 # than once; it never disconnects a working tunnel.
 
+# Serialize first-boot/upgrade UCI writes with runtime mutators too. Keep the
+# shell migration body in one protected child; this flag is only a recursion
+# guard. ucode's advisory descriptors close on exec while the parent owns them.
+if [ "$1" != '--coordinated' ]; then
+	exec ucode -e '
+		import { cursor } from "uci";
+		const m = require("nordvpn.mutation");
+		const c = require("nordvpn.common");
+		let result = m.all(function() {
+			let r = c.run(["/bin/sh", "/etc/uci-defaults/90-nordvpn-migrate", "--coordinated"]);
+			if (r.stdout) print(r.stdout);
+			return { ok: r.code == 0, error: "legacy config migration failed" };
+		});
+		if (!result || !result.ok) {
+			warn("nordvpn: " + (result ? result.error : "migration failed") + "\n");
+			exit(1);
+		}
+		// A separate phase owns the freshly migrated instance list.
+		let migrated = require("nordvpn.credentials").migrate(cursor());
+		if (type(migrated) == "object" && migrated.error) {
+			warn("nordvpn: " + migrated.error + "\n");
+			exit(1);
+		}
+	'
+fi
+
 . /lib/functions.sh
 
 pkg=nordvpn
@@ -132,6 +158,7 @@ fi
 # Move per-interface keys into the shared credential bank
 # (/etc/config/nordvpn_credentials): main's key becomes 'Default', any
 # instance with a different key gets its own entry. Idempotent.
-ucode -e 'require("nordvpn.credentials").migrate(require("uci").cursor());' 2>/dev/null
+# The coordinator wrapper performs this as a second phase after releasing
+# the shell scope; recursively acquiring its descriptors would return busy.
 
 exit 0

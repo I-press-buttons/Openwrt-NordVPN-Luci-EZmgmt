@@ -10,6 +10,7 @@ import { rand, srand } from 'math';
 import { readfile } from 'fs';
 import { cursor } from 'uci';
 const _common = require('nordvpn.common');
+const _mutation = require('nordvpn.mutation');
 const load_settings = _common.load_settings,
       cache_file_path = _common.cache_file_path,
       iso_ts = _common.iso_ts,
@@ -22,10 +23,8 @@ const _select = require('nordvpn.select');
 const selection_candidates = _select.selection_candidates,
       order_candidates = _select.order_candidates;
 const _apply = require('nordvpn.apply');
-const bring_up = _apply.bring_up,
-      current_key = _apply.current_key,
+const current_key = _apply.current_key,
       current_peer = _apply.current_peer,
-      restore_peer = _apply.restore_peer,
       connect_one = _apply.connect_one,
       verify_handshake = _apply.verify_handshake,
       tunnel_hint = _apply.tunnel_hint,
@@ -146,8 +145,9 @@ function still_enabled(instance) {
 	return cursor().get('nordvpn', validate_instance(instance) || 'main', 'enabled') == '1';
 }
 
-function rotate_inner(uci, instance) {
+function rotate_inner(uci, instance, lock_wait) {
 	let s = load_settings(uci, instance);
+	s.mutation_wait = lock_wait;
 	if (s.fixed_server && s.fixed_server != '')
 		return { skipped: true, reason: 'fixed server configured' };
 	if (!s.enabled)
@@ -199,9 +199,7 @@ function rotate_inner(uci, instance) {
 	if (!still_enabled(instance))
 		return { skipped: true, reason: 'instance was disabled' };
 	if (saved) {
-		restore_peer(uci, iface, saved);
-		uci.commit('network');
-		bring_up(iface);
+		_apply.restore_connection(iface, saved, lock_wait);
 	}
 	return { error: hint || 'no working server found', restored: saved != null };
 }
@@ -223,27 +221,32 @@ function rotation_event(res, reason) {
 
 // Public entry point: serialize with any other rotation, and with a full
 // apply, of the same instance via the per-instance tunnel lock. `reason` only
-// labels the history entry. The lock ages out after the longest this
-// instance's rotation can take, so a slow but healthy one (many candidates, a
-// long verify_timeout) is never run over. The WAN default route is only
+// labels the history entry. Advisory ownership lasts through verification
+// and rollback, regardless of wall-clock time. The WAN default route is only
 // re-checked when a tunnel can route through the main table (see
 // nordvpn.apply.wan_default_at_risk); otherwise the check is six seconds of
 // sleeping for nothing.
-function rotate(uci, instance, reason) {
-	uci = uci || cursor();
-	let lock = acquire_lock(_common.tunnel_lock_path(instance),
-		_common.rotation_max_runtime(load_settings(uci, instance)));
-	if (!lock)
-		return { skipped: true, reason: 'rotation already running' };
+function rotate(uci, instance, reason, lock_wait) {
+	instance = _common.validate_instance(instance) || 'main';
+	let owner = _mutation.acquire([ instance ]);
+	if (owner.busy)
+		return { ...owner, skipped: true, reason: 'rotation already running' };
+	uci = cursor();
 
 	let at_risk = wan_default_at_risk(uci);
 	let res;
 	try {
-		res = rotate_inner(uci, instance);
+		let invalid = _mutation.configuration(function(fresh) {
+			let s = load_settings(fresh, instance);
+			return (!s.enabled || s.fixed_server) ? null : _mutation.validate_owner(fresh, instance);
+		});
+		res = invalid ? { error: invalid } : rotate_inner(cursor(), instance, (type(lock_wait) == 'int') ? lock_wait : 60);
 	} catch (e) {
-		res = { error: 'rotation error: ' + e };
+		res = { busy: index('' + e, 'busy') >= 0, error: 'rotation error: ' + e };
 	}
-	release_lock(lock);
+	_mutation.release(owner.locks);
+	if (res.busy)
+		return res;
 	if (at_risk)
 		restore_wan_default();
 	let ev = rotation_event(res, reason || 'manual');
