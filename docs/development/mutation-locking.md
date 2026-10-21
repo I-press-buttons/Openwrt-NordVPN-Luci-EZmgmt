@@ -80,9 +80,10 @@ external UCI writers transactional. Reapply after external settings changes.
 
 The updater's launch-to-worker token handoff, cache refresh, history and
 rotation-state metadata retain their existing independent lock slots and
-formats. Background job identity/status races and cache publication are
-separate refactors. Mutation ownership still prevents workers with inconsistent
-job status from rewriting the same tunnel concurrently.
+formats. Apply/rotation background jobs use a separate execution slot and
+conditional status transitions, documented in [background-jobs.md](background-jobs.md).
+Mutation ownership still protects synchronous operations and scheduled workers
+that do not participate in the background job slot.
 
 Before upgrading from token-based tunnel locks, stop the scheduler and allow
 existing apply/rotation workers to exit (or reboot after package installation).

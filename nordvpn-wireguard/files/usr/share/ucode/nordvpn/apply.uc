@@ -5,14 +5,13 @@
 'use strict';
 
 import { srand } from 'math';
-import { readfile, unlink, stat } from 'fs';
+import { readfile } from 'fs';
 import { cursor } from 'uci';
 const _common = require('nordvpn.common');
 const FIXED_ADDRESS = _common.FIXED_ADDRESS,
       DEFAULT_PORT = _common.DEFAULT_PORT,
       DEFAULT_KEEPALIVE = _common.DEFAULT_KEEPALIVE,
       APPLY_STATUS_FILE = _common.APPLY_STATUS_FILE,
-      APPLY_LOCK_FILE = _common.APPLY_LOCK_FILE,
       APPLY_MAX_RUNTIME = _common.APPLY_MAX_RUNTIME,
       load_settings = _common.load_settings,
       cache_file_path = _common.cache_file_path,
@@ -727,222 +726,58 @@ function apply_routing_inner(uci, instance) {
 	return res;
 }
 
-// ── Asynchronous jobs (worker + status file) ─────────────────────────
-// apply() is slow by nature: it reads the multi-megabyte server cache and then
-// waits verify_timeout seconds per candidate for a handshake — NordVPN
-// publishes dead endpoints, so two silent candidates alone cost 16 s at the
-// default. rpcd serves ubus calls one at a time, so running that inside the
-// call starved everything else, including the `uci confirm` the browser sends
-// to keep its own changes: the router hit the rollback timer and reverted
-// /etc/config/nordvpn underneath the user. The UI therefore spawns
-// /usr/bin/nordvpn-apply and polls the status file written here, exactly like
-// the cache refresh does with nordvpn.cache's fetch status. A manual rotation
-// is slower still (up to max_retries candidates) and runs the same way, as a
-// job of kind 'rotate' (see nordvpn.rotate.run_job). One job runs at a time.
-// The synchronous apply() and rotate() stay as-is for scripts and the CLI.
+// ── Asynchronous tunnel jobs ─────────────────────────────────────────
+// Keep the tunnel slot separate from cache/updater work and future probes.
+const _jobs = require('nordvpn.jobs');
+const tunnel_jobs = _jobs.create(APPLY_STATUS_FILE);
 
-// Worker command per job kind; the instance name is appended.
-const JOB_WORKERS = {
-	apply: '/usr/bin/nordvpn-apply ',
-	rotate: '/usr/bin/nordvpn-rotate --job '
-};
+function write_apply_status(status) { return tunnel_jobs.write(status); }
+function read_apply_status() { return tunnel_jobs.read(); }
+function apply_running(st, now) { return tunnel_jobs.active(st, now); }
+// Optional exact-ID lookup; the one-argument form is the legacy test clock.
+function apply_status_report(now, id) { return tunnel_jobs.status(id, now); }
 
-// Stamp `updated_at` and atomically write the apply-status file.
-function write_apply_status(status) {
-	if (type(status) != 'object')
-		return false;
-	status.updated_at = iso_ts();
-	return _common.atomic_write(APPLY_STATUS_FILE, sprintf('%J', status));
-}
-
-// Parsed apply-status object or null.
-function read_apply_status() {
-	let raw = readfile(APPLY_STATUS_FILE);
-	if (!raw)
-		return null;
-	try {
-		let st = json(raw);
-		// Anything but an object would make every status poll throw.
-		return (type(st) == 'object') ? st : null;
-	} catch (e) {
-		return null;
-	}
-}
-
-// Own pid (see nordvpn.common.self_pid()). Recorded with a 'running' record
-// so a dead worker is detectable; null when /proc is unavailable, in which
-// case only the runtime ceiling applies.
-function self_pid() {
-	return _common.self_pid();
-}
-
-// Runtime ceiling of a job: an apply's is fixed, a rotation's follows the
-// instance's max_retries and verify_timeout.
 function job_max_runtime(kind, instance) {
-	if (kind != 'rotate')
-		return APPLY_MAX_RUNTIME;
-	return _common.rotation_max_runtime(load_settings(cursor(), instance));
+	return kind == 'rotate'
+		? _common.rotation_max_runtime(load_settings(cursor(), instance)) : APPLY_MAX_RUNTIME;
 }
 
-// The ceiling a record states, within [APPLY_MAX_RUNTIME, JOB_MAX_RUNTIME_CAP];
-// the apply ceiling for anything else, including records of older versions.
-function job_ceiling(st) {
-	let m = (type(st) == 'object') ? st.max_runtime : null;
-	return (type(m) == 'int' && m >= APPLY_MAX_RUNTIME && m <= _common.JOB_MAX_RUNTIME_CAP)
-		? m : APPLY_MAX_RUNTIME;
-}
-
-// Is this record a believable 'running' one? A worker can die mid-apply (a
-// reboot, the OOM killer, a stray `killall ucode`) and what it left behind
-// must not wedge the instance forever: an apply whose process is gone, or one
-// past the runtime ceiling, is not running whatever the file says. `now` is
-// injectable so the recovery rules stay testable.
-function apply_running(st, now) {
-	if (type(st) != 'object' || st.state != 'running')
-		return false;
-	now = now || time();
-	let started = (type(st.started_at_epoch) == 'int') ? st.started_at_epoch : 0;
-	// No start stamp, or one older than a whole job could take: abandoned.
-	// A stamp in the future is just as implausible — routers have no RTC and
-	// the clock jumps the moment NTP lands, which must not freeze the record.
-	if (!started || (now - started) > job_ceiling(st) || started > (now + 60))
-		return false;
-	if (type(st.pid) == 'int' && st.pid > 0 && !stat('/proc/' + st.pid))
-		return false;
-	return true;
-}
-
-// The record the UI polls. A 'running' record whose worker is gone is turned
-// into a terminal 'failed' — and rewritten as such — so the page shows an
-// error instead of spinning forever and the next job start is allowed.
-function apply_status_report(now) {
-	let st = read_apply_status();
-	if (!st)
-		return null;
-	if (st.state == 'running' && !apply_running(st, now)) {
-		st.state = 'failed';
-		st.stale = true;
-		st.pid = null;
-		st.finished_at = iso_ts(now);
-		st.error = (st.kind == 'rotate') ? 'the rotation worker stopped unexpectedly'
-			: 'the apply worker stopped unexpectedly';
-		write_apply_status(st);
-	}
-	return st;
-}
-
-// Did a job end the way the user asked for? A rotation that was skipped (a
-// pinned server, nothing else to rotate to) finished as a no-op, not a fault.
-function job_succeeded(kind, res) {
-	if (kind == 'rotate')
-		return !!(res && (res.ok || res.skipped));
-	return !!(res && res.state == 'success');
-}
-
-// Run one job of `kind` for one instance and record the outcome: the whole
-// body of the detached worker. `work(name)` does the job and returns its
-// result. The lock is what actually prevents two overlapping jobs (the status
-// file is only what the UI reads), and its own stale reclamation is the
-// second recovery path for a killed worker.
-function run_job(instance, kind, work) {
+// Detached workers must claim the ID supplied by their launcher. Manual CLI
+// invocations reserve their own job, then use exactly the same lifecycle.
+function run_job(instance, kind, work, id, context) {
 	let name = validate_instance(instance) || 'main';
-	let busy = (kind == 'apply') ? 'apply already running' : 'an apply or rotation is already running';
-	let max = job_max_runtime(kind, name);
-	let lock = _common.acquire_lock(APPLY_LOCK_FILE, max);
-	if (!lock) {
-		// The lock ages out on its own, but the status record knows sooner: a
-		// 'running' record whose worker is gone means this lock is orphaned, and
-		// honouring it would block the user's retry for minutes. Reclaim it only
-		// on that evidence — a missing or terminal record is exactly what a
-		// worker that took the lock a millisecond ago also looks like, and
-		// stealing the lock from it would run two jobs at once.
-		let st = read_apply_status();
-		if (!st || st.state != 'running' || apply_running(st))
-			// Leave the status file alone: it belongs to the running job.
-			return { skipped: true, reason: busy };
-		unlink(APPLY_LOCK_FILE);
-		lock = _common.acquire_lock(APPLY_LOCK_FILE, max);
-		if (!lock)
-			return { skipped: true, reason: busy };
-		_common.log('reclaimed the job lock of a worker that never finished');
+	if (!id) {
+		let reservation = tunnel_jobs.reserve(name, kind, context, job_max_runtime(kind, name));
+		if (!reservation.started)
+			return reservation.error && !reservation.busy ? { error: reservation.error } :
+				{ skipped: true, reason: kind == 'apply' ? 'apply already running' : 'an apply or rotation is already running' };
+		id = reservation.apply.id;
 	}
-
-	let started = time();
-	let base = { kind: kind, instance: name, started_at: iso_ts(started),
-		started_at_epoch: started, max_runtime: max };
-	write_apply_status({ ...base, state: 'running', pid: self_pid(),
-		finished_at: null, result: null, error: null });
-
-	let res;
-	try {
-		res = work(name);
-	} catch (e) {
-		// A throw must not leave the record on 'running' — the UI would wait out
-		// the whole ceiling for a job that is already over.
-		res = (kind == 'apply') ? { state: 'failure', error: 'apply error: ' + e }
-			: { error: kind + ' error: ' + e };
-	}
-	_common.release_lock(lock);
-
-	let finished = time();
-	write_apply_status({ ...base, pid: null,
-		state: job_succeeded(kind, res) ? 'done' : 'failed',
-		finished_at: iso_ts(finished), finished_at_epoch: finished,
-		result: res, error: (res && res.error) ? res.error : null });
-	return res;
+	return tunnel_jobs.run(id, name, kind, work);
 }
 
-// Apply one instance as a job (the nordvpn-apply worker).
-function run_apply(instance, source) {
-	return run_job(instance, 'apply', function(name) { return apply(cursor(), name, source); });
+function run_apply(instance, source, id) {
+	return run_job(instance, 'apply', function(name, context) {
+		return apply(cursor(), name, context.source);
+	}, id, { source: apply_source(source) });
 }
 
-// Spawn the detached worker for one job and pre-record the 'running' state, so
-// a poll landing between the spawn and the worker's own first write reads
-// 'running' rather than the previous run's result. `echo $!` hands back the
-// worker's pid, which makes a worker that dies on the spot recoverable on the
-// next poll instead of only after the runtime ceiling. `arg` is an optional
-// extra worker argument (the apply source), taken only from a fixed list.
 function start_job(instance, kind, arg) {
 	let name = validate_instance(instance);
-	if (!name)
-		return { error: 'invalid instance name' };
-	if (!JOB_WORKERS[kind])
-		return { error: 'unknown job' };
-
-	let st = apply_status_report();
-	if (apply_running(st)) {
-		// The very job asked for is already in flight: that is the one the
-		// caller wants. Any other must finish first — waiting on it would
-		// report its outcome as the caller's.
-		if ((st.kind || 'apply') == kind && st.instance == name)
-			return { already_running: true, apply: st };
-		return { busy: true, error: sprintf('%s of instance %s is still running; try again when it finishes',
-			(st.kind == 'rotate') ? 'a rotation' : 'an apply', st.instance) };
-	}
-
-	// `name` is restricted to [A-Za-z0-9_] and `arg` to a fixed list, so
-	// neither can break out of the sh -c string; quoting them here would only
-	// fight the outer sh_quote().
-	let r = run([ 'sh', '-c', JOB_WORKERS[kind] + name + (arg ? ' ' + arg : '') +
-		' >/dev/null 2>&1 & echo $!' ]);
-	if (r.code != 0)
-		return { error: 'could not start the ' + kind + ' worker' };
-
-	let out = trim(r.stdout || '');
-	let started = time();
-	let rec = { kind: kind, instance: name, state: 'running',
-		pid: _common.full_match(out, /^[0-9]+$/) ? int(out) : null,
-		started_at: iso_ts(started), started_at_epoch: started,
-		max_runtime: job_max_runtime(kind, name),
-		finished_at: null, result: null, error: null };
-	// The worker writes its own 'running' record before it does any work and
-	// cannot have finished yet, so this write cannot clobber a real result.
-	write_apply_status(rec);
-	return { started: true, instance: name, apply: rec };
+	if (!name) return { error: 'invalid instance name' };
+	if (kind != 'apply' && kind != 'rotate') return { error: 'unknown job' };
+	let source = kind == 'apply' ? apply_source(arg) : null;
+	return tunnel_jobs.start(name, kind, { source: source }, job_max_runtime(kind, name), function(st) {
+		// Instance, source and kernel-generated UUID contain no shell syntax.
+		let command = kind == 'apply' ? '/usr/bin/nordvpn-apply ' : '/usr/bin/nordvpn-rotate --job ';
+		command += name + (source ? ' ' + source : '') + ' --job-id ' + st.id;
+		let r = run([ 'sh', '-c', command + ' >/dev/null 2>&1 & echo $!' ]);
+		let out = trim(r.stdout || '');
+		return r.code == 0 && _common.full_match(out, /^[0-9]+$/) && int(out) > 0
+			? { pid: int(out) } : { error: 'could not start the ' + kind + ' worker' };
+	});
 }
 
-// start_job() for an apply.
 function start_apply(instance, source) {
 	return start_job(instance, 'apply', apply_source(source));
 }

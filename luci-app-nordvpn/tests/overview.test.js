@@ -73,6 +73,36 @@ assert.strictEqual(app.routingOnlyChange({ fixed_server: JSON.stringify('old') }
 	{ fixed_server: JSON.stringify('new') }), false, 'server changes require reconnecting');
 
 async function run() {
+	// Watch the returned job ID even if a newer identical operation starts.
+	var originalTimer = context.window.setTimeout;
+	context.window.setTimeout = function(fn) { fn(); };
+	app.pauseStatusPoll = function() {};
+	app.resumeStatusPoll = function() {};
+	var watched = [];
+	calls.apply_status = function(id) {
+		watched.push(id);
+		return Promise.resolve({ id: 'mine', kind: 'apply', instance: 'main', state: 'done', result: { state: 'success', gateway: 'mine-server' } });
+	};
+	var exact = await app.runJob(function() {
+		return Promise.resolve({ started: true, apply: { id: 'mine' } });
+	}, 'main', 'apply');
+	assert.strictEqual(exact.gateway, 'mine-server', 'the watcher retrieves its own terminal outcome');
+	assert.deepStrictEqual(watched, ['mine'], 'polls pass the exact ID returned by start');
+	calls.apply_status = function() {
+		return Promise.resolve({ id: 'newer', kind: 'apply', instance: 'main', state: 'done', result: { state: 'success' } });
+	};
+	var replaced = await app.runJob(function() { return Promise.resolve({ apply: { id: 'mine' } }); }, 'main', 'apply');
+	assert(replaced.error, 'a newer same-kind and same-instance result is rejected');
+	calls.apply_status = function(id) {
+		assert.strictEqual(id, '', 'older backends are polled without an ID');
+		return Promise.resolve({ kind: 'apply', instance: 'main', state: 'done', result: { state: 'success' } });
+	};
+	var legacy = await app.runJob(function() { return Promise.resolve({ apply: { kind: 'apply', instance: 'main' } }); }, 'main', 'apply');
+	assert.strictEqual(legacy.state, 'success', 'no-ID backend remains compatible');
+	calls.apply_status = function(id) { return Promise.resolve({ id: id, state: 'missing', error: 'job status is unavailable or expired' }); };
+	var missing = await app.runJob(function() { return Promise.resolve({ apply: { id: 'expired' } }); }, 'main', 'apply');
+	assert.strictEqual(missing.error, 'job status is unavailable or expired', 'expired own job does not become another success');
+	context.window.setTimeout = originalTimer;
 	// Package updater uses text nodes for server errors and disables writes while
 	// a worker is running. Exercise the actual form controls and RPC arguments.
 	var elements = [];

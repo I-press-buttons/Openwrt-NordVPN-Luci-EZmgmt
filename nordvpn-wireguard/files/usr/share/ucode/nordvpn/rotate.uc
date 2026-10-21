@@ -258,10 +258,10 @@ function rotate(uci, instance, reason, lock_wait) {
 // A manual rotation as an asynchronous job (the `nordvpn-rotate --job` worker
 // the UI starts through rpcd's rotate_start): the outcome lands in the job
 // status file the page polls, like an apply's. See nordvpn.apply.run_job().
-function run_job(instance) {
+function run_job(instance, id) {
 	return _apply.run_job(instance, 'rotate', function(name) {
 		return rotate(cursor(), name, 'manual');
-	});
+	}, id);
 }
 
 return { shuffle, current_key, plan_candidates, read_state, record, last_attempt_ts, mark_attempt, rotation_event, rotate, run_job };

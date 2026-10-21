@@ -18,7 +18,10 @@ let job = length(args) > 0 && args[0] == '--job';
 if (job)
 	shift(args);
 let instance = (length(args) > 0 ? validate_instance(args[0]) : null) || 'main';
-let res = job ? _rotate.run_job(instance) : _rotate.rotate(null, instance, 'manual');
+let job_index = index(args, '--job-id');
+let job_id = job_index >= 0 ? args[job_index + 1] : null;
+if (job_index >= 0 && !job_id) exit(1);
+let res = job ? _rotate.run_job(instance, job_id) : _rotate.rotate(null, instance, 'manual');
 
 if (res.ok) {
 	printf('nordvpn-rotate: connected to %s\n', res.server);
