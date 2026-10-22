@@ -148,7 +148,7 @@ write_cache(cache, cpath);
 		network: { nordvpn: { '.type': 'interface', private_key: KEY } } };
 	eq('status disconnected (iface down)', status(cursor()).state, 'disconnected');
 
-	global.MOCK_UBUS = { 'network.interface.nordvpn~status': { up: true, l3_device: 'nordvpn' } };
+	global.MOCK_UBUS = { 'network.interface~dump': { interface: [ { interface: 'nordvpn', up: true, l3_device: 'nordvpn' } ] } };
 	eq('status connecting (up, no handshake)', status(cursor()).state, 'connecting');
 
 	// status() runs on every daemon tick once the watchdog is on. A ubus
@@ -1690,11 +1690,11 @@ write_cache(cache, cpath);
 
 	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nordvpn' } },
 		network: { nordvpn: { '.type': 'interface', private_key: KEY } } };
-	global.MOCK_UBUS = { 'network.interface.nordvpn~status': { up: true, l3_device: 'nordvpn', uptime: 4242 } };
+	global.MOCK_UBUS = { 'network.interface~dump': { interface: [ { interface: 'nordvpn', up: true, l3_device: 'nordvpn', uptime: 4242 } ] } };
 	let st = status(cursor());
 	eq('status: uptime from netifd', st.uptime, 4242);
 	eq('status: tunnel device', st.device, 'nordvpn');
-	global.MOCK_UBUS = { 'network.interface.nordvpn~status': { up: false, l3_device: 'nordvpn', uptime: 4242 } };
+	global.MOCK_UBUS = { 'network.interface~dump': { interface: [ { interface: 'nordvpn', up: false, l3_device: 'nordvpn', uptime: 4242 } ] } };
 	st = status(cursor());
 	eq('status: no uptime while down', [ st.uptime, st.transfer ], [ null, null ]);
 	global.MOCK_UBUS = {};

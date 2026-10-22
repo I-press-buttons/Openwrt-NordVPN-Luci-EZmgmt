@@ -28,9 +28,9 @@ function device_generation(iface) {
 // Deliberately excludes private/public keys and credentials. Ordinary WG
 // handshakes do not change this context. The mutation journal covers reconnects
 // even when every configuration field and the gateway remain identical.
-function context(uci, name, version) {
+function context(uci, name, version, settings) {
 	if (!c.validate_instance(name) || uci.get('nordvpn', name) == null) return null;
-	let s = c.load_settings(uci, name), iface = s.interface, peer = null;
+	let s = settings || c.load_settings(uci, name), iface = s.interface, peer = null;
 	uci.foreach('network', 'wireguard_' + iface, function(sec) {
 		if (sec.interface == iface) { peer = sec; return false; }
 	});

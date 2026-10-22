@@ -18,7 +18,8 @@ const validate_token = _common.validate_token,
       load_settings = _common.load_settings,
       list_instances = _common.list_instances,
       cache_file_path = _common.cache_file_path;
-const status = require('nordvpn.status').status;
+const _status = require('nordvpn.status');
+const status = _status.status;
 const _apply = require('nordvpn.apply');
 const apply = _apply.apply,
       set_credentials = _apply.set_credentials,
@@ -76,9 +77,10 @@ function req_instance(uci, request) {
 
 // The page polls this for every instance every few seconds, so the settings
 // and the per-instance state file are each read once per instance.
-function build_status(uci, name) {
-	let s = load_settings(uci, name);
-	let st = status(uci, name, s);
+function build_status(uci, name, s, snapshot, generations) {
+	s = s || load_settings(uci, name);
+	snapshot = snapshot || _status.collect_runtime([ s ]);
+	let st = status(uci, name, s, snapshot);
 	let state = read_state(name);
 	if (state && state.last_success)
 		st.rotation.last_success = state.last_success;
@@ -87,9 +89,9 @@ function build_status(uci, name) {
 	st.state = effective_state(s, st.state, state, st.gateway);
 	st.egress = egress_report(s, state, st.gateway);
 	let last = (state && type(state.last_attempt) == 'int') ? state.last_attempt : 0;
-	st.rotation.next_run = next_rotation(s, last, time());
-	st.routing = detect_routing(uci, s, true);
-	st.probe_generation = probes.context(uci, name, probe_state.version(probe_state.load(), name)).generation;
+	st.rotation.next_run = next_rotation(s, last, snapshot.at);
+	st.routing = detect_routing(uci, s, true, snapshot);
+	st.probe_generation = probes.context(uci, name, probe_state.version(generations || probe_state.load(), name), s).generation;
 	return st;
 }
 
@@ -110,8 +112,10 @@ methods.instances = {
 	call: function() {
 		let uci = cursor();
 		let out = [];
-		for (let name in list_instances(uci))
-			push(out, build_status(uci, name));
+		let settings = map(list_instances(uci), (name) => load_settings(uci, name));
+		let snapshot = _status.collect_runtime(settings), generations = probe_state.load();
+		for (let s in settings)
+			push(out, build_status(uci, s.name, s, snapshot, generations));
 		return { instances: out };
 	}
 };
@@ -124,9 +128,11 @@ methods.overview = {
 	call: function() {
 		let uci = cursor();
 		let out = [];
-		for (let name in list_instances(uci)) {
-			let s = load_settings(uci, name);
-			let st = status(uci, name, s);
+		let settings = map(list_instances(uci), (name) => load_settings(uci, name));
+		let snapshot = _status.collect_runtime(settings);
+		for (let s in settings) {
+			let name = s.name;
+			let st = status(uci, name, s, snapshot);
 			push(out, {
 				instance: st.instance,
 				state: effective_state(s, st.state, read_state(name), st.gateway),

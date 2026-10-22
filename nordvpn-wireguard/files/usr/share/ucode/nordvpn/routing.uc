@@ -629,7 +629,7 @@ function dev_mtu(dev) {
 // the endpoint — NOT the tunnel). Found via the WAN firewall zone's networks so
 // an active auto-routing default through the tunnel does not mislead us. Returns
 // the smallest MTU across WAN devices, or null when it cannot be determined.
-function wan_l3_mtu_probe(uci) {
+function wan_l3_mtu_probe(uci, snapshot) {
 	let wannets = {};
 	uci.foreach('firewall', 'zone', function(sec) {
 		if (sec[MARK] == '1')
@@ -638,18 +638,15 @@ function wan_l3_mtu_probe(uci) {
 			for (let n in as_list(sec.network))
 				wannets[n] = 1;
 	});
-	let d = run([ 'ubus', 'call', 'network.interface', 'dump' ]);
-	if (d.code != 0)
-		return null;
-	let data;
-	try {
-		data = json(d.stdout);
-	} catch (e) {
-		return null;
+	let interfaces = snapshot ? (snapshot.netifd || []) : null;
+	if (interfaces == null) {
+		let d = run([ 'ubus', 'call', 'network.interface', 'dump' ]);
+		if (d.code != 0) return null;
+		try { interfaces = json(d.stdout)?.interface; } catch (e) { return null; }
 	}
 	let best = null;
-	for (let ifc in ((data ? data.interface : null) || [])) {
-		if (!ifc.up || !ifc.l3_device || !wannets[ifc.interface])
+	for (let ifc in (interfaces || [])) {
+		if (type(ifc) != 'object' || !ifc.up || !ifc.l3_device || !wannets[ifc.interface])
 			continue;
 		// Never count a WireGuard tunnel as the WAN uplink: it is the path
 		// WireGuard's UDP rides ON, not the uplink itself. Counting it creates
@@ -664,8 +661,8 @@ function wan_l3_mtu_probe(uci) {
 	return best;
 }
 
-function wan_l3_mtu(uci) {
-	return memo('wan_mtu', function() { return wan_l3_mtu_probe(uci); });
+function wan_l3_mtu(uci, snapshot) {
+	return memo('wan_mtu', function() { return wan_l3_mtu_probe(uci, snapshot); });
 }
 
 // Recommended WireGuard interface MTU for a given WAN MTU: subtract 80 (60 bytes
@@ -948,7 +945,7 @@ function device_zones(uci, macs) {
 //        'auto'    — route everything (auto_routing);
 //        'steered' — route the configured source networks via the instance table;
 //        'none'    — tunnel only, no managed routing.
-function detect(uci, s, runtime) {
+function detect(uci, s, runtime, snapshot) {
 	let iface = s.interface;
 	let zone = find_zone_of(uci, iface);
 	let peer = find_peer(uci, iface);
@@ -975,7 +972,7 @@ function detect(uci, s, runtime) {
 	// panel into the hands-off view, so the table can be used for steered mode.
 	let manual = user_routes > 0;
 
-	let wanmtu = runtime ? wan_l3_mtu(uci) : null;
+	let wanmtu = runtime ? wan_l3_mtu(uci, snapshot) : null;
 	return {
 		mode: manual ? 'manual' : (auto ? 'auto' : (steering ? 'steered' : 'none')),
 		all_lan_owner: owner,
