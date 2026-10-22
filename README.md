@@ -485,7 +485,10 @@ and secrets are never returned.
 ubus call nordvpn status            # runtime state, location, handshake age
 ubus call nordvpn instances         # status of every configured VPN instance
 ubus call nordvpn overview          # lightweight per-instance summary (Status page card)
-ubus call nordvpn external_ip       # NordVPN's view: protected, public IP, city, ISP
+ubus call nordvpn external_ip_status '{"instance":"main"}' # read cached protection/freshness (no HTTP)
+ubus call nordvpn external_ip_start '{"instance":"main"}'  # start/deduplicate background check (write access)
+ubus call nordvpn external_ip_status '{"instance":"main","id":"<returned-id>"}' # poll that exact check
+ubus call nordvpn external_ip       # legacy synchronous compatibility endpoint (may block rpcd for 8–16 seconds)
 ubus call nordvpn history '{"instance":"main"}'  # recent events, newest first
 ubus call nordvpn disconnect        # take the tunnel down, pause rotation
 ubus call nordvpn credentials       # credential bank: names, status, which instances use each
@@ -501,6 +504,11 @@ ubus call nordvpn rotate_now        # one-shot rotation (waits for the result)
 ubus call nordvpn rotate_start      # the same in the background; poll apply_status
 ubus call nordvpn refresh_locations # start an async server-list refresh
 ```
+
+LuCI uses the asynchronous protection check. Only `state: fresh` carries a current
+provider verdict; pending, stale and failed checks remain visible. Read-only users
+can inspect cached observations. See [probe API and validation](docs/development/async-probes.md)
+for expiry, retry limits and the retained synchronous endpoint's limitations.
 
 `status`, `apply`, `apply_routing`, `rotate_now`, `rotate_start` and
 `set_credentials` accept an `instance` argument (default `main`).

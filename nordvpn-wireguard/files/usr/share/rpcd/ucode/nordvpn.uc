@@ -38,6 +38,8 @@ const read_events = require('nordvpn.history').read_events;
 const parse_insights = require('nordvpn.api').parse_insights;
 const list_clients = require('nordvpn.clients').clients;
 const detect_routing = require('nordvpn.routing').detect;
+const probes = require('nordvpn.probes');
+const probe_state = require('nordvpn.probe_state').store;
 const _creds = require('nordvpn.credentials');
 const _cache = require('nordvpn.cache');
 const read_cache = _cache.read_cache,
@@ -87,6 +89,7 @@ function build_status(uci, name) {
 	let last = (state && type(state.last_attempt) == 'int') ? state.last_attempt : 0;
 	st.rotation.next_run = next_rotation(s, last, time());
 	st.routing = detect_routing(uci, s, true);
+	st.probe_generation = probes.context(uci, name, probe_state.version(probe_state.load(), name)).generation;
 	return st;
 }
 
@@ -328,6 +331,23 @@ methods.external_ip = {
 			res.lan_path = lan ? { protected: lan.protected, ip: lan.ip, isp: lan.isp } : null;
 		}
 		return res;
+	}
+};
+
+// Additive asynchronous API. These handlers never make remote requests.
+// The legacy external_ip above remains synchronous for existing callers.
+methods.external_ip_status = {
+	args: { instance: '', id: '' },
+	call: function(request) {
+		let name = req_instance(cursor(), request);
+		return name ? probes.service.status(name, ((request || {}).args || {}).id) : { error: 'no such instance' };
+	}
+};
+methods.external_ip_start = {
+	args: { instance: '' },
+	call: function(request) {
+		let name = req_instance(cursor(), request);
+		return name ? probes.service.start(name) : { error: 'no such instance' };
 	}
 };
 
