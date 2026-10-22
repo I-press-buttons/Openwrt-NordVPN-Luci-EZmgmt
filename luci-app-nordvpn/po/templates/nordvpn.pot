@@ -85,3 +85,23 @@ msgstr ""
 #: htdocs/luci-static/resources/view/nordvpn/overview.js
 msgid "Retry"
 msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js
+msgid "Selected: %s"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js
+msgid "Current: %s"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js
+msgid "%d–%d of %d matches"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js
+msgid "Previous"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js
+msgid "Show more"
+msgstr ""

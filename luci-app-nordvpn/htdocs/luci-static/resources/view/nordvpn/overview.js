@@ -123,6 +123,29 @@ var HISTORY_LIMIT = 25;
 // A probe target: a dotted-quad IPv4 literal (the backend accepts nothing else).
 var IPV4_RE = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
 
+// One collator per view module, reused only when a server dataset changes.
+// Older browsers without numeric collation use a deterministic natural order.
+var srvCompareName = (function() {
+	try {
+		var collator = new Intl.Collator(undefined, { numeric: true });
+		if (collator.compare('2', '10') < 0)
+			return collator.compare;
+	} catch (e) {}
+	return function(a, b) {
+		var aa = a.toLowerCase().match(/\d+|\D+/g) || [], bb = b.toLowerCase().match(/\d+|\D+/g) || [];
+		for (var i = 0; i < Math.min(aa.length, bb.length); i++) {
+			var x = aa[i], y = bb[i];
+			if (/^\d+$/.test(x) && /^\d+$/.test(y)) {
+				x = x.replace(/^0+(?=\d)/, ''); y = y.replace(/^0+(?=\d)/, '');
+				if (x.length !== y.length) return x.length - y.length;
+			}
+			if (x !== y) return x < y ? -1 : 1;
+		}
+		return aa.length - bb.length;
+	};
+})();
+var SRV_PAGE_SIZE = 50;
+
 var STYLE = '' +
 	'.nv-status-main{display:flex;flex-wrap:wrap;align-items:baseline;gap:.75em;font-size:1.05em}' +
 	'.nv-state{font-weight:700}' +
@@ -203,6 +226,8 @@ var STYLE = '' +
 	'.nv-srv-tag{flex:none;font-size:.8em;padding:0 .4em;border:1px solid currentColor;border-radius:3px;color:var(--text-color-medium,#888)}' +
 	'.nv-srv-grp{font-weight:600;padding:.35em .5em .15em;color:var(--text-color-medium,#888)}' +
 	'.nv-pool-row.nv-srv-quick{font-weight:600}' +
+	'.nv-srv-action{border:0;background:transparent;font:inherit;color:inherit;text-align:left;width:100%}' +
+	'.nv-srv-summary{padding:.3em .5em;overflow-wrap:anywhere}' +
 	// Plain flex rows (no LuCI .table classes), so the theme's own responsive
 	// table stacking can never apply; wraps naturally down to ~340 px.
 	'.nv-inst-row{display:flex;align-items:center;gap:.8em;padding:.55em 0;border-bottom:1px solid var(--border-color-medium,#ccc);cursor:pointer}' +
@@ -1185,6 +1210,7 @@ return view.extend({
 	/* ---- form sections ------------------------------------------------ */
 
 	buildFormSections: function() {
+		this.srvCancelFilter();
 		this._formGeneration = (this._formGeneration || 0) + 1;
 		this._serversReq = (this._serversReq || 0) + 1;
 		this.ensureConnectionState();
@@ -1290,8 +1316,8 @@ return view.extend({
 		var draft = this.ensureConnectionState().draft;
 		// Widget fields mirror the draft; fetched server data never owns edits.
 		this._serverChosen = draft.fixed_server;
-		this._serverData = null;
 		this._srvOpen = false;
+		this.srvReplaceData(null);
 		this._srvFilter = '';
 		this.srvTrigger = E('button', { type: 'button', class: 'cbi-button nv-pool-trigger nv-srv-trigger',
 			click: L.bind(function(ev) { ev.preventDefault(); ev.stopPropagation(); this.srvTogglePanel(); }, this) },
@@ -2624,7 +2650,7 @@ return view.extend({
 			return req === this._serversReq && instance === this.instance && form === this._formGeneration;
 		}, this);
 		if (this.srvError) dom.content(this.srvError, '');
-		this._serverData = null;
+		this.srvReplaceData(null);
 		this.srvTrigger.disabled = !codes.length && !this._serverChosen;
 		this.srvRenderTrigger();
 		if (!codes.length) return Promise.resolve();
@@ -2633,10 +2659,8 @@ return view.extend({
 				return;
 			if (!res || res.error || !Array.isArray(res.relays))
 				throw new Error((res && res.error) || _('Server list unavailable.'));
-			this._serverData = { relays: res.relays.slice() };
+			this.srvReplaceData(res.relays);
 			this.srvRenderTrigger();
-			if (this._srvOpen)
-				this.srvRenderPanel();
 		}, this)).catch(L.bind(function(err) {
 			if (!active() || !this.srvError) return;
 			dom.content(this.srvError, [ _('Could not read server list: %s').format(err), ' ',
@@ -2655,21 +2679,54 @@ return view.extend({
 		return (this.status && this.status.gateway) || '';
 	},
 
-	srvRelayByHost: function(host) {
-		var found = null;
-		((this._serverData && this._serverData.relays) || []).forEach(function(r) {
-			if (r.hostname === host) found = r;
+	srvBuildIndex: function(relays) {
+		var names = this._ccNames || {}, groups = [], byCode = Object.create(null), byHost = Object.create(null), best = null;
+		function compare(a, b) {
+			var al = typeof a.load === 'number' ? a.load : 999, bl = typeof b.load === 'number' ? b.load : 999;
+			return al - bl || srvCompareName(a.name || a.hostname || '', b.name || b.hostname || '') ||
+				srvCompareName(a.hostname || '', b.hostname || '');
+		}
+		relays.forEach(L.bind(function(value) {
+			var r = Object.freeze(Object.assign({}, value));
+			byHost[r.hostname] = r;
+			if (typeof r.load === 'number' && !r.dedicated && (!best || compare(r, best) < 0)) best = r;
+			var code = r.country_code || '', name = names[code] || code.toUpperCase();
+			var g = byCode[code];
+			if (!g) {
+				g = byCode[code] = { name: name, flag: this.countryFlag(code), rows: [] };
+				groups.push(g);
+			}
+			g.rows.push(Object.freeze({ relay: r,
+				search: (name + ' / ' + (r.city || '') + ' / ' + (r.name || '') + ' / ' + (r.hostname || '')).toLowerCase() }));
+		}, this));
+		groups.sort(function(a, b) { return srvCompareName(a.name, b.name); });
+		groups.forEach(function(g) {
+			g.rows.sort(function(a, b) { return compare(a.relay, b.relay); });
+			Object.freeze(g.rows); Object.freeze(g);
 		});
-		return found;
+		return Object.freeze({ byHost: Object.freeze(byHost), groups: Object.freeze(groups), lowest: best });
+	},
+
+	srvCancelFilter: function() {
+		if (this._srvFilterTimer != null) clearTimeout(this._srvFilterTimer);
+		this._srvFilterTimer = null;
+	},
+
+	srvReplaceData: function(relays) {
+		this.srvCancelFilter();
+		this._srvDataGeneration = (this._srvDataGeneration || 0) + 1;
+		this._serverData = relays ? { relays: relays.slice() } : null;
+		this._serverIndex = relays ? this.srvBuildIndex(relays) : null;
+		this._srvOffset = 0;
+		if (this._srvOpen) this.srvRenderList();
+	},
+
+	srvRelayByHost: function(host) {
+		return (this._serverIndex && this._serverIndex.byHost[host]) || null;
 	},
 
 	srvLowestLoad: function() {
-		var best = null;
-		((this._serverData && this._serverData.relays) || []).forEach(function(r) {
-			if (typeof r.load !== 'number' || r.dedicated) return;
-			if (!best || r.load < best.load) best = r;
-		});
-		return best;
+		return (this._serverIndex && this._serverIndex.lowest) || null;
 	},
 
 	// The trigger shows the current pin richly (load dot / flag / city / name),
@@ -2705,7 +2762,7 @@ return view.extend({
 	srvTogglePanel: function() {
 		if (this._srvOpen)
 			return this.srvClosePanel();
-		this._srvFilter = '';
+		this._srvOffset = 0;
 		this._srvOpen = true;
 		if (this.srvTrigger) this.srvTrigger.classList.add('hidden');
 		this.srvPanel.classList.remove('hidden');
@@ -2713,9 +2770,13 @@ return view.extend({
 	},
 
 	srvClosePanel: function() {
+		this.srvCancelFilter();
 		this._srvOpen = false;
 		if (this.srvPanel) this.srvPanel.classList.add('hidden');
-		if (this.srvTrigger) this.srvTrigger.classList.remove('hidden');
+		if (this.srvTrigger) {
+			this.srvTrigger.classList.remove('hidden');
+			if (this.srvTrigger.focus) this.srvTrigger.focus();
+		}
 	},
 
 	srvSetChosen: function(host) {
@@ -2726,108 +2787,99 @@ return view.extend({
 		this.srvClosePanel();
 	},
 
-	// Panel: header + filter, quick "Automatic" and "Lowest load" rows, then
-	// servers grouped by country and sorted by load (lowest first).
+	// Keep the filter DOM stable during data refreshes and page changes.
 	srvRenderPanel: function() {
 		var panel = this.srvPanel;
-		if (!panel)
-			return;
-		dom.content(panel, '');
-		panel.appendChild(E('div', { class: 'nv-pool-head' }, [
-			E('span', {}, _('Pick a server')),
-			E('button', { type: 'button', class: 'nv-pool-x', title: _('Close'),
-				click: L.bind(function(ev) { ev.stopPropagation(); this.srvClosePanel(); }, this) }, '✕')
-		]));
-		var filt = E('input', { type: 'text', class: 'cbi-input-text nv-pool-filter',
-			placeholder: _('Filter servers') + '…', value: this._srvFilter });
+		if (!panel) return;
+		this.srvCancelFilter();
+		var filt = this._srvFilterEl = E('input', { type: 'text', class: 'cbi-input-text nv-pool-filter',
+			'aria-label': _('Filter servers'), placeholder: _('Filter servers') + '…', value: this._srvFilter || '' });
 		filt.addEventListener('input', L.bind(function() {
 			this._srvFilter = filt.value;
-			this.srvRenderList();
+			this._srvOffset = 0;
+			this.srvCancelFilter();
+			var generation = this._srvDataGeneration, panel = this.srvPanel;
+			this._srvFilterTimer = setTimeout(L.bind(function() {
+				this._srvFilterTimer = null;
+				if (this._srvOpen && generation === this._srvDataGeneration && panel === this.srvPanel)
+					this.srvRenderList();
+			}, this), 100);
 		}, this));
 		filt.addEventListener('click', function(ev) { ev.stopPropagation(); });
-		panel.appendChild(filt);
+		panel.addEventListener('keydown', this._srvEscapeHandler || (this._srvEscapeHandler = L.bind(function(ev) {
+			if (ev.key === 'Escape') { ev.stopPropagation(); this.srvClosePanel(); }
+		}, this)));
 		this._srvListEl = E('div', {});
-		panel.appendChild(this._srvListEl);
+		dom.content(panel, [ E('div', { class: 'nv-pool-head' }, [ E('span', {}, _('Pick a server')),
+			E('button', { type: 'button', class: 'nv-pool-x', title: _('Close'),
+				click: L.bind(function(ev) { ev.stopPropagation(); this.srvClosePanel(); }, this) }, '✕') ]), filt, this._srvListEl ]);
 		this.srvRenderList();
-		setTimeout(function() { try { filt.focus(); } catch (e) {} }, 0);
+		filt.focus();
 	},
 
-	srvRenderList: function() {
+	srvRenderList: function(focusPage) {
 		var el = this._srvListEl;
-		if (!el)
-			return;
-		dom.content(el, '');
-		var names = this._ccNames || {};
-		var chosen = this._serverChosen;
-		var current = this.srvCurrentGateway();
-		var f = (this._srvFilter || '').toLowerCase();
-
-		el.appendChild(E('div', { class: 'nv-pool-row nv-srv-quick',
-			click: L.bind(function(ev) { ev.stopPropagation(); this.srvSetChosen(''); }, this) }, [
-				E('span', { class: 'box' }, chosen ? '' : '☑'),
-				E('span', { class: 'grow' }, _('Automatic (rotation picks)'))
-			]));
+		if (!el) return;
+		var names = this._ccNames || {}, chosen = this._serverChosen, current = this.srvCurrentGateway();
+		var f = (this._srvFilter || '').toLowerCase(), groups = (this._serverIndex && this._serverIndex.groups) || [];
+		var kids = [], firstRow = null, offset = this._srvOffset || 0, total = 0, shown = 0;
+		var active = document.activeElement;
+		var focusKey = active && el.contains && el.contains(active) ? active.getAttribute('data-server-key') : null;
+		var action = L.bind(function(host, attrs, children) {
+			return E('button', Object.assign({ type: 'button', class: 'nv-pool-row nv-srv-action', 'data-server-key': 'relay:' + host,
+				click: L.bind(function(ev) { ev.stopPropagation(); this.srvSetChosen(host); }, this) }, attrs), children);
+		}, this);
+		kids.push(action('', { class: 'nv-pool-row nv-srv-action nv-srv-quick', 'data-server-key': 'automatic' }, [
+			E('span', { class: 'box' }, chosen ? '' : '☑'), E('span', { class: 'grow' }, _('Automatic (rotation picks)')) ]));
 		var best = this.srvLowestLoad();
-		if (best) {
-			var bn = names[best.country_code] || (best.country_code || '').toUpperCase();
-			el.appendChild(E('div', { class: 'nv-pool-row nv-srv-quick',
-				click: L.bind(function(ev) { ev.stopPropagation(); this.srvSetChosen(best.hostname); }, this) }, [
-					E('span', { class: 'box' }, '⚡'),
-					E('span', { class: 'grow' }, _('Lowest load') + ' · ' + (best.city || bn) +
-						(best.load != null ? ' (%d%%)'.format(best.load) : '')),
-					E('span', { class: 'nv-dot ' + this.srvLoadClass(best.load) })
-				]));
-		}
-		el.appendChild(E('div', { class: 'nv-pool-sep' }));
-
-		var groups = [], byCode = {};
-		((this._serverData && this._serverData.relays) || []).forEach(L.bind(function(r) {
-			var cname = names[r.country_code] || (r.country_code || '').toUpperCase();
-			var hay = (cname + ' / ' + (r.city || '') + ' / ' + (r.name || r.hostname)).toLowerCase();
-			if (f && r.hostname !== chosen && hay.indexOf(f) < 0)
-				return;
-			var g = byCode[r.country_code];
-			if (!g) {
-				g = { name: cname, flag: this.countryFlag(r.country_code), rows: [] };
-				byCode[r.country_code] = g;
-				groups.push(g);
-			}
-			g.rows.push(r);
-		}, this));
+		kids.push(action(best ? best.hostname : '', { class: 'nv-pool-row nv-srv-action nv-srv-quick', 'data-server-key': 'lowest', disabled: best ? null : '' }, [
+			E('span', { class: 'box' }, '⚡'), E('span', { class: 'grow' }, _('Lowest load') + (best ? ' · ' +
+				(best.city || names[best.country_code] || best.country_code || '') + ' (%d%%)'.format(best.load) : '')) ]));
+		// Fixed text summaries keep off-page and filtered-out pins/current gateways visible.
+		if (chosen) kids.push(E('div', { class: 'nv-srv-summary' }, _('Selected: %s').format(chosen) +
+			(this.srvRelayByHost(chosen) ? '' : ' ' + _('(not in the set)'))));
+		if (current) kids.push(E('div', { class: 'nv-srv-summary' }, _('Current: %s').format(current)));
+		kids.push(E('div', { class: 'nv-pool-sep' }));
 		groups.forEach(L.bind(function(g) {
-			// Numeric-aware tiebreak on purpose: a plain string compare puts
-			// de#1027 before de#95, which reads as broken when a whole page of
-			// servers shares the same load — and at low load that is most of
-			// them.
-			g.rows.sort(function(a, b) {
-				var al = typeof a.load === 'number' ? a.load : 999;
-				var bl = typeof b.load === 'number' ? b.load : 999;
-				if (al !== bl)
-					return al - bl;
-				return (a.name || a.hostname || '').localeCompare(
-					b.name || b.hostname || '', undefined, { numeric: true });
-			});
-			el.appendChild(E('div', { class: 'nv-srv-grp' }, (g.flag ? g.flag + ' ' : '') +
-				'%s (%d)'.format(g.name, g.rows.length)));
-			g.rows.forEach(L.bind(function(r) {
-				var isCur = current && r.hostname === current;
-				var isPin = r.hostname === chosen;
-				el.appendChild(E('div', { class: 'nv-pool-row' + (isPin ? ' is-in' : ''),
-					click: L.bind(function(ev) { ev.stopPropagation(); this.srvSetChosen(r.hostname); }, this) }, [
-						E('span', { class: 'nv-dot ' + this.srvLoadClass(r.load) }),
-						E('span', { class: 'grow' }, '%s / %s'.format(r.city || '?', r.name || r.hostname)),
-						r.p2p ? E('span', { class: 'nv-srv-tag' }, _('P2P')) : '',
-						r.dedicated ? E('span', { class: 'nv-srv-tag', title: _('Only works for the account this Dedicated IP is assigned to') }, _('Dedicated IP')) : '',
-						isCur ? E('span', { class: 'nv-srv-cur' }, '● ' + _('current')) : '',
-						E('span', { class: 'nv-srv-load' }, r.load != null ? '%d%%'.format(r.load) : '')
-					]));
+			var header = false;
+			g.rows.forEach(L.bind(function(entry) {
+				if (f && entry.search.indexOf(f) < 0) return;
+				var position = total++;
+				if (position < offset || shown >= SRV_PAGE_SIZE) return;
+				if (!header) { kids.push(E('div', { class: 'nv-srv-grp' }, (g.flag ? g.flag + ' ' : '') + g.name)); header = true; }
+				var r = entry.relay, isPin = r.hostname === chosen;
+				var row = action(r.hostname, { class: 'nv-pool-row nv-srv-action nv-srv-relay' + (isPin ? ' is-in' : ''),
+					'aria-pressed': isPin ? 'true' : 'false' }, [
+					E('span', { class: 'nv-dot ' + this.srvLoadClass(r.load) }),
+					E('span', { class: 'grow' }, '%s / %s'.format(r.city || '?', r.name || r.hostname)),
+					r.p2p ? E('span', { class: 'nv-srv-tag' }, _('P2P')) : '',
+					r.dedicated ? E('span', { class: 'nv-srv-tag', title: _('Only works for the account this Dedicated IP is assigned to') }, _('Dedicated IP')) : '',
+					current && r.hostname === current ? E('span', { class: 'nv-srv-cur' }, '● ' + _('current')) : '',
+					E('span', { class: 'nv-srv-load' }, r.load != null ? '%d%%'.format(r.load) : '') ]);
+				kids.push(row); if (!firstRow) firstRow = row; shown++;
 			}, this));
 		}, this));
-
-		if (chosen && !this.srvRelayByHost(chosen))
-			el.appendChild(E('div', { class: 'nv-pool-row is-in' }, chosen + ' ' + _('(not in the set)')));
-		else if (!groups.length)
-			el.appendChild(E('div', { class: 'nv-pool-row is-in' }, _('No matches')));
+		this._srvMatchCount = total;
+		kids.push(E('div', { class: 'nv-srv-summary', role: 'status' }, _('%d–%d of %d matches').format(total ? offset + 1 : 0, offset + shown, total)));
+		if (!total) kids.push(E('div', { class: 'nv-srv-summary' }, _('No matches')));
+		var page = L.bind(function(delta) {
+			// A click before the debounce expires belongs to the newly typed filter.
+			var pendingFilter = this._srvFilterTimer != null;
+			this.srvCancelFilter();
+			this._srvOffset = pendingFilter ? 0 : Math.max(0, offset + delta * SRV_PAGE_SIZE);
+			this.srvRenderList(true);
+		}, this);
+		if (offset) kids.push(E('button', { type: 'button', class: 'cbi-button nv-srv-prev', 'data-server-key': 'previous', click: function(ev) { ev.stopPropagation(); page(-1); } }, _('Previous')));
+		if (offset + shown < total) kids.push(E('button', { type: 'button', class: 'cbi-button nv-srv-more', 'data-server-key': 'more', click: function(ev) { ev.stopPropagation(); page(1); } }, _('Show more')));
+		// Build the whole page off-DOM, then replace it in one batch.
+		dom.content(el, kids);
+		if (focusPage && firstRow) firstRow.focus();
+		else if (focusKey) {
+			var replacement = Array.prototype.find.call(el.querySelectorAll('[data-server-key]'), function(node) {
+				return node.getAttribute('data-server-key') === focusKey;
+			});
+			(replacement && !replacement.disabled ? replacement : this._srvFilterEl).focus();
+		}
 	},
 
 	onHopChange: function() {
@@ -2926,6 +2978,7 @@ return view.extend({
 	},
 
 	discard: function() {
+		this.srvCancelFilter();
 		// Invalidate synchronously: an already pending response cannot restore
 		// an edit while the config load below is still outstanding.
 		this._serversReq = (this._serversReq || 0) + 1;
