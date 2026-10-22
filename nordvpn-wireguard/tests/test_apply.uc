@@ -15,6 +15,7 @@ import { readfile, writefile, unlink, mkdir } from 'fs';
 import { cursor } from 'uci';
 const _common = require('nordvpn.common');
 const _apply = require('nordvpn.apply');
+require('routing_adapter').install(_apply.routing_adapters);
 const _history = require('nordvpn.history');
 const APPLY_STATUS_FILE = _common.APPLY_STATUS_FILE,
       APPLY_LOCK_FILE = _common.APPLY_STATUS_FILE + '.execution.lock',
@@ -376,9 +377,8 @@ const DEAD_PID = 1073741824;
 // 7b. Saving anything but the location keeps the connected server: a full
 //     apply tries it first and, when nothing the tunnel is built from
 //     changed and its handshake is fresh, does not restart it at all. Off
-//     the router `wg` is missing (a handshake reads as fresh, as in
-//     verify_handshake) and `ifup` fails, so a restart shows up as a failed
-//     connect. The tunnel lock keeps applies and rotations apart.
+//     the router an explicit adapter supplies a fresh handshake and failed
+//     ifup, so a restart shows up as a failed connect. The tunnel lock keeps applies and rotations apart.
 {
 	let _cache = require('nordvpn.cache');
 	let cdir = '/tmp/nvtest_apply_' + time();
@@ -437,7 +437,7 @@ const DEAD_PID = 1073741824;
 	seed({ mtu: '1400' });
 	res = _apply.apply(cursor(), 'main', 'save', 0);
 	ok('save: an MTU change restarts the tunnel', res.restarted !== false && res.state != 'success');
-	eq('save: ... and writes the MTU', global.MOCK_UCI.network.nordvpn.mtu, '1400');
+	eq('save: failed activation restores the previous MTU', global.MOCK_UCI.network.nordvpn.mtu, null);
 
 	seed({ locations: [ 'us' ] });
 	res = _apply.apply(cursor(), 'main', 'save', 0);

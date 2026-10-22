@@ -32,6 +32,17 @@ const selection_candidates = _select.selection_candidates,
       order_candidates = _select.order_candidates;
 const _routing = require('nordvpn.routing');
 const enforce_routing = _routing.enforce;
+const _transaction = require('nordvpn.routing_transaction');
+const routing_adapters = _transaction.adapters;
+function routing_plan(uci, s, edit) {
+	return _transaction.plan(uci, function(desired, tables) {
+		if (edit) edit(desired);
+		let result = enforce_routing(desired, s, { rt_tables: tables });
+		for (let note in result.notes)
+			if (match(note, /not installed|not locked|DNS is already locked|domain steering needs|excluded domains need/)) die(note);
+		return result;
+	});
+}
 const _history = require('nordvpn.history');
 const record_event = _history.record_event;
 const _creds = require('nordvpn.credentials');
@@ -161,17 +172,12 @@ function write_relay(uci, iface, relay, s, opts) {
 // Bring the managed interface up. iface is whitelist-validated, so the argv is
 // injection-safe (no shell).
 function bring_up(iface) {
-	return run([ 'ifup', iface ]).code == 0;
+	return routing_adapters.run([ 'timeout', '15', 'ifup', iface ]).code == 0;
 }
 
-// Newest WireGuard handshake age (seconds) for the interface. Returns -1 when
-// the wg binary is absent (off-device: exit 127 from the shell), null when
-// there is no handshake — including when the device does not exist, which is
-// a failed connection, not a pass.
+// Newest WireGuard handshake age, or null for missing tools/device/handshake.
 function handshake_age(iface) {
-	let res = run([ 'wg', 'show', iface, 'latest-handshakes' ], true);
-	if (res.code == 127)
-		return -1;
+	let res = routing_adapters.run([ 'timeout', '5', 'wg', 'show', iface, 'latest-handshakes' ], true);
 	if (res.code != 0)
 		return null;
 	let best = 0;
@@ -189,16 +195,13 @@ function handshake_age(iface) {
 	return age < 0 ? 0 : age;
 }
 
-// Wait up to `seconds` for a fresh handshake. True when connected — or when wg
-// is unavailable (off-device), so the apply logic is not blocked in tests.
+// Wait up to `seconds` for a fresh handshake. Missing wg is a failure.
 // Sleeps in-process: spawning `sleep` through a shell every second only adds
 // two process starts per second of waiting.
 function verify_handshake(iface, seconds) {
 	for (let i = 0; i < seconds; i++) {
 		sleep(1000);
 		let age = handshake_age(iface);
-		if (age == -1)
-			return true;
 		if (age != null && age < 180)
 			return true;
 	}
@@ -260,59 +263,41 @@ function nft_set_elements(names) {
 	return out;
 }
 
-// Put elements saved by nft_set_elements() back after a firewall reload.
-function nft_restore_elements(saved) {
-	for (let name, ips in saved)
-		for (let i = 0; i < length(ips); i += 256)
-			run([ 'nft', 'add', 'element', 'inet', 'fw4', name,
-				'{ ' + join(', ', slice(ips, i, i + 256)) + ' }' ], true);
-}
-
-// Commit and reload whatever an enforce_routing() pass changed. The firewall
-// goes first so the domain nft set exists before dnsmasq is told to fill it;
-// a firewall reload also empties that set, so dnsmasq is reloaded then too.
-// dnsmasq's reload regenerates its config and restarts it only when that
-// changed; otherwise it just gets a SIGHUP, which flushes its cache so the
-// clients' next lookups repopulate the set. A restart would interrupt DNS and
-// DHCP for every client, VPN or not. Steering/prohibit rules are plain netifd
-// config; a reload makes netifd apply the delta (unchanged interfaces are left
-// alone). True when anything was committed.
+// Execute a detached plan under mutation.configuration(); returns structured
+// outcome, including the original failure and any scoped restoration failures.
 function commit_routing(uci, routing) {
-	if (routing.changed_firewall) {
-		// Addresses dnsmasq resolved for steered and excluded domains survive
-		// the reload, so their connections keep their path (see enforce()).
-		let saved = nft_set_elements(routing.keep_sets || []);
-		uci.commit('firewall');
-		run([ '/etc/init.d/firewall', 'reload' ]);
-		nft_restore_elements(saved);
-	}
-	if (routing.changed_network) {
-		uci.commit('network');
-		run([ 'ubus', 'call', 'network', 'reload' ]);
-	}
-	if (routing.changed_dhcp)
-		uci.commit('dhcp');
-	if (routing.changed_dhcp || (routing.changed_firewall && routing.domains_active))
-		run([ '/etc/init.d/dnsmasq', 'reload' ]);
-	return !!(routing.changed_firewall || routing.changed_network || routing.changed_dhcp);
+	return _transaction.execute(uci, routing);
 }
 
 const TUNNEL_LOCK_WAIT = 60;
 
-function connect_one(uci, iface, relay, s, opts) {
-	return _mutation.configuration(function(fresh) {
-		if (!write_relay(fresh, iface, relay, s, opts))
-			return false;
-		fresh.commit('network');
-		return bring_up(iface);
-	}, s.mutation_wait || 0);
+function activation(iface, up) {
+	let st = _transaction.interface_state(iface);
+	if (!st) die('could not snapshot runtime state for ' + iface);
+	return { stage: (up ? 'ifup:' : 'ifdown:') + iface, up: !!up, previous_up: !!st.up,
+		argv: [ up ? 'ifup' : 'ifdown', iface ], restore_argv: [ st.up ? 'ifup' : 'ifdown', iface ] };
 }
-
+function connection_plan(uci, iface, edit, up) {
+	let p = _transaction.plan(uci, function(desired) { edit(desired); return { interface: iface }; });
+	p.reloads = []; // ifup/ifdown applies this interface; no global netifd reload.
+	p.activation = activation(iface, up);
+	return p;
+}
+function connect_one_result(uci, iface, relay, s, opts) {
+	let result = _mutation.configuration(function(fresh) {
+		let p = connection_plan(fresh, iface, function(desired) {
+			if (!write_relay(desired, iface, relay, s, opts)) die('invalid relay');
+		}, true);
+		return commit_routing(fresh, p);
+	}, s.mutation_wait || 0);
+	return result;
+}
+// Compatibility for local scripts; application/rotation consume full outcomes.
+function connect_one(uci, iface, relay, s, opts) { return connect_one_result(uci, iface, relay, s, opts).ok; }
 function restore_connection(iface, saved, wait) {
 	return _mutation.configuration(function(fresh) {
-		restore_peer(fresh, iface, saved);
-		fresh.commit('network');
-		return bring_up(iface);
+		return commit_routing(fresh, connection_plan(fresh, iface,
+			function(desired) { restore_peer(desired, iface, saved); }, true));
 	}, wait || 0);
 }
 
@@ -439,19 +424,19 @@ function restore_wan_default_async() {
 // committed; there is no ifup, so no connection through the tunnel drops.
 // null when the tunnel has to be (re)started.
 function keep_running_inner(uci, iface, relay, s, before) {
-	if (!write_relay(uci, iface, relay, s))
-		return null;
-	if (tunnel_fingerprint(uci, iface) != before)
-		return null;
+	let compatible = false;
+	let p = _transaction.plan(uci, function(desired) {
+		compatible = write_relay(desired, iface, relay, s) && tunnel_fingerprint(desired, iface) == before;
+		return { interface: iface };
+	});
+	if (!compatible) return null;
 	let age = handshake_age(iface);
-	if (age == null || age >= 180)
-		return null;
-	uci.commit('network');
-	return {
-		state: 'success', interface: iface, gateway: relay.hostname,
-		endpoint: relay.hostname + ':' + (relay.port || DEFAULT_PORT),
-		restarted: false
-	};
+	if (age == null || age >= 180) return null;
+	p.reloads = []; // only metadata stamps changed; keep the established tunnel.
+	let result = commit_routing(uci, p);
+	if (!result.ok) return { ...result, state: 'failure' };
+	return { ...result, state: 'success', interface: iface, gateway: relay.hostname,
+		endpoint: relay.hostname + ':' + (relay.port || DEFAULT_PORT), restarted: false };
 }
 
 function keep_running(uci, iface, relay, s, before) {
@@ -489,30 +474,27 @@ function apply_inner(uci, instance, source, lock_wait) {
 		let before = tunnel_fingerprint(uci, iface);
 		// The instance's credentials may have changed in the bank or been switched
 		// to another entry since the last apply: bring the interface key in line.
-		if (_creds.sync_instance(uci, instance))
-			uci.commit('network');
-		if (!validate_wg_key(uci.get('network', iface, 'private_key')))
-			return { state: 'failure', error: 'no credentials configured' };
 
+		if (!validate_wg_key(uci.get(_creds.PKG, _creds.instance_credential(uci, instance), 'private_key')))
+			return { state: 'failure', error: 'no credentials configured' };
 		if (!cache)
 			return { state: 'failure', error: 'server list not available; refresh the cache first' };
 
-		// Applying implies the user wants the instance on — undo a disable, both
-		// in the config and in the already-loaded settings the enforcement uses.
-		if (!s.enabled) {
-			uci.set('nordvpn', s.name, 'enabled', '1');
-			uci.commit('nordvpn');
-			s.enabled = true;
-		}
+		let enable = !s.enabled;
+		s.enabled = true;
+		let routing = routing_plan(uci, s, function(desired) {
+			let key = validate_wg_key(uci.get(_creds.PKG, _creds.instance_credential(uci, instance), 'private_key'));
+			if (!key) die('no credentials configured');
+			if (desired.get('network', iface, 'private_key') != key) {
+				desired.set('network', iface, 'private_key', key);
+				desired.set('network', iface, 'addresses', [ FIXED_ADDRESS ]);
+				desired.delete('network', iface, 'nordvpn_token');
+			}
+			if (enable) desired.set('nordvpn', s.name, 'enabled', '1');
+		});
+		let applied = commit_routing(uci, routing);
+		if (!applied.ok) return { ...applied, state: 'failure' };
 
-		// Reconcile the managed routing/firewall objects with the settings. Only
-		// stamped objects are ever touched; a detected manual scheme is left alone.
-		let routing = enforce_routing(uci, s);
-		if (commit_routing(uci, routing)) {
-			// Committing deletions invalidates the cursor's section iteration
-			// state (find_peer silently missed sections) — start fresh.
-			uci = cursor();
-		}
 		for (let note in routing.notes)
 			_common.log('routing: ' + note);
 
@@ -537,7 +519,9 @@ function apply_inner(uci, instance, source, lock_wait) {
 			if (kept)
 				return kept;
 		}
-		let up = connect_one(uci, iface, relay, s);
+		let connection = connect_one_result(uci, iface, relay, s);
+		if (!connection.ok) return { ...connection, state: 'failure', interface: iface };
+		let up = true;
 		let ok = up && verify_handshake(iface, s.verify_timeout);
 		return {
 			state: ok ? 'success' : (up ? 'partial_failure' : 'failure'),
@@ -563,8 +547,8 @@ function apply_inner(uci, instance, source, lock_wait) {
 		tries = 4;
 	for (let i = 0; i < tries; i++) {
 		let relay = list[i];
-		if (!connect_one(uci, iface, relay, s))
-			continue;
+		let connection = connect_one_result(uci, iface, relay, s);
+		if (!connection.ok) return { ...connection, state: 'failure', interface: iface };
 		if (verify_handshake(iface, s.verify_timeout))
 			return {
 				state: 'success', interface: iface, gateway: relay.hostname,
@@ -574,11 +558,10 @@ function apply_inner(uci, instance, source, lock_wait) {
 	}
 
 	let hint = tunnel_hint(iface);
-	if (saved) {
-		restore_connection(iface, saved, lock_wait);
-	}
-	return { state: 'failure', restored: saved != null,
-		error: hint || 'could not reach any server for the current selection; restored the previous connection' };
+	let restored = saved ? restore_connection(iface, saved, lock_wait) : null;
+	return { state: 'failure', restored: !!restored?.ok, rollback: restored,
+		error: (hint || 'could not reach any server for the current selection') +
+			(restored ? (restored.ok ? '; restored the previous connection' : '; restoration failed: ' + restored.error) : '') };
 }
 
 // What started an apply, recorded as the history entry's `reason`: the UI's
@@ -709,19 +692,17 @@ function apply_routing_inner(uci, instance) {
 
 	let res;
 	try {
-		let routing = enforce_routing(uci, s);
-		// After enforce(), which registered a new table in rt_tables: netifd
-		// resolves the name when it reloads.
-		if (set_iface_table(uci, iface, s.routing_table))
-			routing.changed_network = true;
-		if (commit_routing(uci, routing) && routing.changed_network &&
+		let routing = routing_plan(uci, s, function(desired) { set_iface_table(desired, iface, s.routing_table); });
+		let applied = commit_routing(uci, routing);
+		if (!applied.ok) return { ...applied, routing_only: true, interface: iface };
+		if (applied.changed && index(routing.reloads, 'network') >= 0 &&
 		    (at_risk || wan_default_at_risk(cursor())))
 			restore_wan_default_async();
 		for (let note in routing.notes)
 			_common.log('routing: ' + note);
-		res = { ok: true, routing_only: true, interface: iface, notes: routing.notes };
+		res = { ...applied, routing_only: true, interface: iface, notes: routing.notes };
 	} catch (e) {
-		res = { error: 'routing update failed: ' + e };
+		res = { ok: false, changed: false, stage: 'plan', error: 'routing plan failed: ' + e };
 	}
 	return res;
 }
@@ -796,23 +777,19 @@ function disconnect_inner(uci, instance) {
 	let res;
 	try {
 		let at_risk = wan_default_at_risk(uci);
-		uci.set('nordvpn', s.name, 'enabled', '0');
-		uci.commit('nordvpn');
-
 		s.enabled = false;
-		let routing = enforce_routing(uci, s);
-		if (commit_routing(uci, routing))
-			uci = cursor();
+		let routing = routing_plan(uci, s, function(desired) {
+			desired.set('nordvpn', s.name, 'enabled', '0');
+			if (desired.get('network', iface) != null) desired.set('network', iface, 'auto', '0');
+		});
+		routing.activation = activation(iface, false);
+		let applied = commit_routing(uci, routing);
+		if (!applied.ok) return { ...applied, interface: iface };
 
-		if (uci.get('network', iface) != null) {
-			uci.set('network', iface, 'auto', '0');
-			uci.commit('network');
-		}
-		run([ 'ifdown', iface ]);
 		if (at_risk)
 			restore_wan_default_async();
 		record_event(instance, 'disabled');
-		res = { ok: true, interface: iface };
+		res = { ...applied, interface: iface };
 	} catch (e) {
 		res = { error: '' + e };
 	}
@@ -852,19 +829,26 @@ function create_instance_inner(uci, name, credential) {
 	if (!_creds.exists(uci, cred))
 		return { error: 'no such credentials' };
 
-	uci.set('nordvpn', name, 'instance');
-	uci.set('nordvpn', name, 'interface', iface);
-	uci.set('nordvpn', name, 'enabled', '1');
-	if (cred != _creds.DEFAULT_ID)
-		uci.set('nordvpn', name, 'credential', cred);
-	uci.commit('nordvpn');
-
-	let key = _creds.sync_instance(uci, name) == 'set';
-	if (key) {
-		uci.commit('network');
-		record_event(name, 'credentials_set');
-	}
-	return { ok: true, instance: name, interface: iface, credential: cred, configured: key };
+	let key = validate_wg_key(uci.get(_creds.PKG, cred, 'private_key'));
+	let p = _transaction.plan(uci, function(desired) {
+		desired.set('nordvpn', name, 'instance');
+		desired.set('nordvpn', name, 'interface', iface);
+		desired.set('nordvpn', name, 'enabled', '1');
+		if (cred != _creds.DEFAULT_ID) desired.set('nordvpn', name, 'credential', cred);
+		if (key) {
+			desired.set('network', iface, 'interface');
+			desired.set('network', iface, 'proto', 'wireguard');
+			desired.set('network', iface, 'vpn_type', 'nordvpn');
+			desired.set('network', iface, 'private_key', key);
+			desired.set('network', iface, 'addresses', [ FIXED_ADDRESS ]);
+		}
+		return { interface: iface };
+	});
+	p.reloads = [];
+	let applied = commit_routing(uci, p);
+	if (!applied.ok) return applied;
+	if (key) record_event(name, 'credentials_set');
+	return { ...applied, instance: name, interface: iface, credential: cred, configured: !!key };
 }
 
 // Tear down a VPN instance: stamped routing/firewall objects, the netifd
@@ -894,42 +878,26 @@ function delete_instance_inner(uci, name) {
 	s.bypass_devices = [];
 	s.bypass_domains = [];
 	s.bypass_ips = [];
-	let routing = enforce_routing(uci, s);
-	if (commit_routing(uci, routing))
-		uci = cursor(); // see apply(): committed deletions break iteration
-
-	// The instance section goes either way, but a foreign interface it merely
-	// pointed at (wan, a user tunnel) is never taken down or stripped.
-	if (managed_interface(uci, iface)) {
-		run([ 'ifdown', iface ]);
-		let peer = find_peer(uci, iface);
-		if (peer)
-			uci.delete('network', peer);
-		if (uci.get('network', iface) != null)
-			uci.delete('network', iface);
-		uci.commit('network');
-	}
-
-	if (name == 'main') {
-		let all = uci.get_all('nordvpn', 'main');
-		for (let k in all) {
-			if (substr(k, 0, 1) == '.' || k == 'config_version')
-				continue;
-			uci.delete('nordvpn', 'main', k);
+	let managed = managed_interface(uci, iface);
+	let routing = _transaction.plan(uci, function(desired, tables) {
+		let result = enforce_routing(desired, s, { rt_tables: tables });
+		if (managed) {
+			let peer = find_peer(desired, iface);
+			if (peer) desired.delete('network', peer);
+			desired.delete('network', iface);
 		}
-		uci.commit('nordvpn');
-		if (at_risk)
-			restore_wan_default_async();
-		_history.clear_events(name);
-		return { ok: true, reset: name, interface: iface };
-	}
-
-	uci.delete('nordvpn', name);
-	uci.commit('nordvpn');
-	if (at_risk)
-		restore_wan_default_async();
+		if (name == 'main') {
+			for (let k in desired.get_all('nordvpn', name))
+				if (substr(k, 0, 1) != '.' && k != 'config_version') desired.delete('nordvpn', name, k);
+		} else desired.delete('nordvpn', name);
+		return result;
+	});
+	if (managed) { routing.activation = activation(iface, false); routing.activation.before_configuration = true; }
+	let applied = commit_routing(uci, routing);
+	if (!applied.ok) return applied;
+	if (at_risk) restore_wan_default_async();
 	_history.clear_events(name);
-	return { ok: true, deleted: name, interface: iface };
+	return { ...applied, ...(name == 'main' ? { reset: name } : { deleted: name }), interface: iface };
 }
 
 // All short entry points acquire ownership before reading configuration.
@@ -1017,5 +985,5 @@ function disable_all(uci) {
 	return { ok: length(errors) == 0, disabled, errors };
 }
 
-return { set_credentials, clear_credentials, current_key, current_peer, restore_peer, restore_connection, write_relay, bring_up, verify_handshake, netifd_hint, tunnel_hint, connect_one, tunnel_fingerprint, wan_default_at_risk, prefer_current, keep_running, parse_nft_elements, nft_set_elements, commit_routing, APPLY_SOURCES, apply_source, apply_event, apply, apply_routing, disconnect, disable_all, create_instance, delete_instance, restore_wan_default, restore_wan_default_async,
+return { routing_adapters, routing_plan, set_credentials, clear_credentials, current_key, current_peer, restore_peer, restore_connection, write_relay, bring_up, verify_handshake, netifd_hint, tunnel_hint, connect_one, connect_one_result, tunnel_fingerprint, wan_default_at_risk, prefer_current, keep_running, parse_nft_elements, nft_set_elements, commit_routing, APPLY_SOURCES, apply_source, apply_event, apply, apply_routing, disconnect, disable_all, create_instance, delete_instance, restore_wan_default, restore_wan_default_async,
 	write_apply_status, read_apply_status, apply_running, apply_status_report, run_job, run_apply, start_job, start_apply };

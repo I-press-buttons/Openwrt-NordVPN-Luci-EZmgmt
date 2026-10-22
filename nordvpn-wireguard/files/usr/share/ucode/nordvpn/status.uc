@@ -6,6 +6,7 @@
 
 import { connect } from 'ubus';
 const _common = require('nordvpn.common');
+const routing_confirmation = require('nordvpn.routing_transaction').confirmation;
 const load_settings = _common.load_settings,
       validate_wg_key = _common.validate_wg_key,
       validate_interface = _common.validate_interface,
@@ -98,6 +99,7 @@ function status(uci, instance, settings) {
 	let endpoint_port = peer ? uci.get('network', peer, 'endpoint_port') : null;
 
 	let result = {
+		routing_application: routing_confirmation(uci, s.name),
 		instance: s.name,
 		configured: has_key,
 		// Administrative master switch, distinct from the runtime state: a

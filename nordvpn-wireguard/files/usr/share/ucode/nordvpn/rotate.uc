@@ -25,7 +25,7 @@ const selection_candidates = _select.selection_candidates,
 const _apply = require('nordvpn.apply');
 const current_key = _apply.current_key,
       current_peer = _apply.current_peer,
-      connect_one = _apply.connect_one,
+      connect_one = _apply.connect_one_result,
       verify_handshake = _apply.verify_handshake,
       tunnel_hint = _apply.tunnel_hint,
       wan_default_at_risk = _apply.wan_default_at_risk,
@@ -181,8 +181,8 @@ function rotate_inner(uci, instance, lock_wait) {
 			return { skipped: true, reason: 'instance was disabled' };
 		// Only the server changes: a routing table or MTU saved but not yet
 		// applied waits for the apply that also sets up its routing.
-		if (!connect_one(uci, iface, relay, s, { keep_iface: true }))
-			continue;
+		let connection = connect_one(uci, iface, relay, s, { keep_iface: true });
+		if (!connection.ok) return connection;
 		// Verify the tunnel by its WireGuard handshake, not by a ping routed
 		// through it: NordVPN publishes dead endpoints, and a routed ping can
 		// fail on a perfectly good server, which made rotation cycle servers.
@@ -198,10 +198,10 @@ function rotate_inner(uci, instance, lock_wait) {
 	let hint = tunnel_hint(iface);
 	if (!still_enabled(instance))
 		return { skipped: true, reason: 'instance was disabled' };
-	if (saved) {
-		_apply.restore_connection(iface, saved, lock_wait);
-	}
-	return { error: hint || 'no working server found', restored: saved != null };
+	let restored = saved ? _apply.restore_connection(iface, saved, lock_wait) : null;
+	return { error: (hint || 'no working server found') +
+		(restored && !restored.ok ? '; restoration failed: ' + restored.error : ''),
+		restored: !!restored?.ok, rollback: restored };
 }
 
 // History entry for a finished rotation, or null when there is nothing worth

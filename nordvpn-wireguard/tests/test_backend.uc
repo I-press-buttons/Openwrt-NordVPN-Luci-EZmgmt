@@ -17,6 +17,7 @@ const candidates = _select.candidates, by_hostname = _select.by_hostname, pick =
 const parse_credentials = require('nordvpn.api').parse_credentials;
 const write_relay = require('nordvpn.apply').write_relay;
 const _apply = require('nordvpn.apply');
+require('routing_adapter').install(_apply.routing_adapters);
 const _cmn = require('nordvpn.common');
 const load_settings = _cmn.load_settings, list_instances = _cmn.list_instances;
 const status = require('nordvpn.status').status;
