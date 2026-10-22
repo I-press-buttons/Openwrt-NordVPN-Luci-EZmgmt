@@ -244,6 +244,8 @@ return view.extend({
 		this.locations = data[2] || { available: false };
 		this.credentials = (data[4] && data[4].credentials) || [];
 		this.dirty = false;
+		this._otherDirty = false;
+		this._connectionState = null;
 		this.refs = {};
 
 		this.instancesNode = E('div');
@@ -394,6 +396,8 @@ return view.extend({
 		if (this.dirty && !window.confirm(_('Discard unsaved changes?')))
 			return;
 		this.instance = name;
+		this._connectionState = null;
+		this._otherDirty = false;
 		this.dirty = false;
 		if (this.saveBtn) this.saveBtn.disabled = true;
 		if (this.discardBtn) this.discardBtn.disabled = true;
@@ -485,12 +489,17 @@ return view.extend({
 				: _('Instance "%s" deleted.').format(name), 'info', 4000);
 			uci.unload('nordvpn');
 			return uci.load('nordvpn').then(L.bind(function() {
-				if (this.instance === name)
+				if (this.instance === name) {
 					this.instance = 'main';
+					this._connectionState = null;
+					this._otherDirty = false;
+					this.dirty = false;
+				}
 				return this.refreshStatus().then(L.bind(function() {
 					this.status = this.statusOf(this.instance) || {};
 					this.updateStatusBand();
-					dom.content(this.formNode, this.buildFormSections());
+					if (!this.dirty && !this._saving)
+						dom.content(this.formNode, this.buildFormSections());
 				}, this));
 			}, this));
 		}, this)).catch(L.bind(function(e) {
@@ -903,7 +912,7 @@ return view.extend({
 			// unsaved edits), rebuild it — the panel's shape depends on the mode,
 			// so it must not go stale until a manual page refresh.
 			var mode = (this.status.routing || {}).mode;
-			if (!this.dirty && this._routingMode != null && mode !== this._routingMode)
+			if (!this.dirty && !this._saving && this._routingMode != null && mode !== this._routingMode)
 				dom.content(this.formNode, this.buildFormSections());
 			this._routingMode = mode;
 		}, this)).catch(function() {});
@@ -1131,6 +1140,9 @@ return view.extend({
 	/* ---- form sections ------------------------------------------------ */
 
 	buildFormSections: function() {
+		this._formGeneration = (this._formGeneration || 0) + 1;
+		this._serversReq = (this._serversReq || 0) + 1;
+		this.ensureConnectionState();
 		this.refs = {};
 		// Building the form fires the same change paths as user input; the
 		// guard keeps programmatic construction from marking the form dirty.
@@ -1139,6 +1151,8 @@ return view.extend({
 		// the selected instance, so they are rebuilt with it.
 		dom.content(this.credNode, this.buildCredentials());
 		var sections = [ this.buildConnection(), this.buildRoutingSection(), this.buildRotation(), this.buildAdvanced() ];
+		this.srvRenderTrigger();
+		this.updateRotationAvailability();
 		this._building = false;
 		return sections;
 	},
@@ -1228,10 +1242,10 @@ return view.extend({
 	},
 
 	buildConnection: function() {
-		// Server pin picker (custom panel, load-aware). _serverChosen is the
-		// source of truth: a hostname, or '' for automatic (rotation picks).
-		this._serversReq = 0;
-		this._serverChosen = '';
+		var draft = this.ensureConnectionState().draft;
+		// Widget fields mirror the draft; fetched server data never owns edits.
+		this._serverChosen = draft.fixed_server;
+		this._serverData = null;
 		this._srvOpen = false;
 		this._srvFilter = '';
 		this.srvTrigger = E('button', { type: 'button', class: 'cbi-button nv-pool-trigger nv-srv-trigger',
@@ -1239,7 +1253,8 @@ return view.extend({
 			_('Automatic server'));
 		this.srvPanel = E('div', { class: 'nv-pool-panel hidden',
 			click: function(ev) { ev.stopPropagation(); } });
-		this.srvWrap = E('span', { class: 'nv-pool-wrap' }, [ this.srvTrigger, this.srvPanel ]);
+		this.srvError = E('div', { class: 'cbi-value-description', role: 'alert' });
+		this.srvWrap = E('span', { class: 'nv-pool-wrap' }, [ this.srvTrigger, this.srvPanel, this.srvError ]);
 		if (!this._srvOutsideBound) {
 			this._srvOutsideBound = true;
 			document.addEventListener('click', L.bind(function(ev) {
@@ -1248,7 +1263,7 @@ return view.extend({
 			}, this));
 		}
 
-		var hop = uci.get('nordvpn', this.instance, 'hop_mode') || 'single';
+		var hop = draft.hop_mode;
 		this.hopValue = (hop === 'multihop' || hop === 'onion') ? hop : 'single';
 		this.hopButtons = {};
 		var seg = E('div', { class: 'nv-seg' }, [
@@ -1264,7 +1279,7 @@ return view.extend({
 
 		// Server group (single hop only): P2P-optimised servers.
 		this.p2pBox = E('input', { type: 'checkbox', change: L.bind(this.onHopChange, this) });
-		this.p2pBox.checked = (uci.get('nordvpn', this.instance, 'server_group') === 'p2p');
+		this.p2pBox.checked = (draft.server_group === 'p2p');
 		this.p2pRow = this.row(_('Server type'), [
 			E('label', { class: 'nv-check' }, [ this.p2pBox, _('P2P servers only') ])
 		], _('Limits this instance to NordVPN servers optimised for peer-to-peer (file sharing). Single hop only.'));
@@ -1276,21 +1291,7 @@ return view.extend({
 		// configs see their choice here. Codes no longer in the server list
 		// are kept and shown dashed, never silently dropped.
 		this.poolEntries = [];
-		var locRaw = uci.get('nordvpn', this.instance, 'locations');
-		if (typeof locRaw === 'string')
-			locRaw = [ locRaw ];
-		var seed = Array.isArray(locRaw) ? locRaw.slice() : [];
-		if (!seed.length) {
-			// A legacy city implies its country, so seed the city alone (not both)
-			// or the whole country when no city was pinned. Seeding both would
-			// double-count and render the city hidden under the country chip.
-			var legacyCity = uci.get('nordvpn', this.instance, 'city_code') || '';
-			var legacyCc = uci.get('nordvpn', this.instance, 'country_code') || '';
-			if (legacyCity)
-				seed.push(legacyCity);
-			else if (legacyCc)
-				seed.push(legacyCc);
-		}
+		var seed = draft.locations;
 		seed.forEach(L.bind(function(code) {
 			var e = this.poolResolve(code);
 			if (e)
@@ -2019,7 +2020,7 @@ return view.extend({
 	},
 
 	_poolCommit: function() {
-		this.markDirty();
+		this.markConnectionDirty();
 		this.rebuildPoolWidget();
 		this.refreshServerList();
 	},
@@ -2572,26 +2573,30 @@ return view.extend({
 		if (!this.srvTrigger)
 			return;
 		var codes = (this.poolEntries || []).map(function(e) { return e.code; });
-		var req = ++this._serversReq;
+		var req = this._serversReq = (this._serversReq || 0) + 1;
+		var instance = this.instance, form = this._formGeneration;
+		var active = L.bind(function() {
+			return req === this._serversReq && instance === this.instance && form === this._formGeneration;
+		}, this);
+		if (this.srvError) dom.content(this.srvError, '');
 		this._serverData = null;
-		this.srvTrigger.disabled = !codes.length;
-		if (!codes.length) {
-			this.srvRenderTrigger();
-			return;
-		}
-		callServers(codes, this.hopMode(), this.serverGroup()).then(L.bind(function(res) {
-			if (req !== this._serversReq)
-				return; // a newer rebuild superseded this response
-			this._serverData = { relays: ((res && res.relays) || []).slice() };
-			// Restoring the persisted pin is not a user edit.
-			this._serverChosen = uci.get('nordvpn', this.instance, 'fixed_server') || '';
+		this.srvTrigger.disabled = !codes.length && !this._serverChosen;
+		this.srvRenderTrigger();
+		if (!codes.length) return Promise.resolve();
+		return callServers(codes, this.hopMode(), this.serverGroup()).then(L.bind(function(res) {
+			if (!active())
+				return;
+			if (!res || res.error || !Array.isArray(res.relays))
+				throw new Error((res && res.error) || _('Server list unavailable.'));
+			this._serverData = { relays: res.relays.slice() };
 			this.srvRenderTrigger();
 			if (this._srvOpen)
 				this.srvRenderPanel();
-			this._building = true;
-			this.updateRotationAvailability();
-			this._building = false;
-		}, this)).catch(function() {});
+		}, this)).catch(L.bind(function(err) {
+			if (!active() || !this.srvError) return;
+			dom.content(this.srvError, [ _('Could not read server list: %s').format(err), ' ',
+				E('button', { type: 'button', class: 'cbi-button', click: L.bind(this.refreshServerList, this) }, _('Retry')) ]);
+		}, this));
 	},
 
 	srvLoadClass: function(load) {
@@ -2670,7 +2675,7 @@ return view.extend({
 
 	srvSetChosen: function(host) {
 		this._serverChosen = host || '';
-		this.markDirty();
+		this.markConnectionDirty();
 		this.updateRotationAvailability();
 		this.srvRenderTrigger();
 		this.srvClosePanel();
@@ -2781,7 +2786,7 @@ return view.extend({
 	},
 
 	onHopChange: function() {
-		this.markDirty();
+		this.markConnectionDirty();
 		this.updateHopButtons();
 		this.rebuildPoolWidget();
 		this.refreshServerList();
@@ -2791,8 +2796,10 @@ return view.extend({
 		var fixed = this._serverChosen;
 		if (this.rotEnable) {
 			this.rotEnable.disabled = !!fixed;
-			if (fixed)
+			if (fixed && this.rotEnable.checked) {
 				this.rotEnable.checked = false;
+				this.markDirty();
+			}
 		}
 		if (this.rotFixedNote)
 			this.rotFixedNote.classList.toggle('hidden', !fixed);
@@ -2804,7 +2811,10 @@ return view.extend({
 		// The watchdog never fires with a pinned server either.
 		if (this.wdRow)
 			this.wdRow.classList.toggle('hidden', !!fixed);
+		var building = this._building;
+		this._building = true;
 		this.onRotationToggle();
+		this._building = building;
 	},
 
 	onRotationToggle: function() {
@@ -2819,20 +2829,69 @@ return view.extend({
 
 	/* ---- dirty / save / discard --------------------------------------- */
 
+	// Persisted values and editable values have separate lifetimes. Keep the
+	// existing picker fields as widget adapters, never as RPC response targets.
+	ensureConnectionState: function() {
+		if (this._connectionState && this._connectionState.instance === this.instance)
+			return this._connectionState;
+		var loc = uci.get('nordvpn', this.instance, 'locations') || [];
+		if (typeof loc === 'string') loc = [ loc ];
+		if (!Array.isArray(loc)) loc = [];
+		if (!loc.length) {
+			var legacy = uci.get('nordvpn', this.instance, 'city_code') || uci.get('nordvpn', this.instance, 'country_code');
+			if (legacy) loc = [ legacy ];
+		}
+		var baseline = {
+			fixed_server: uci.get('nordvpn', this.instance, 'fixed_server') || '',
+			locations: loc.slice(),
+			hop_mode: uci.get('nordvpn', this.instance, 'hop_mode') || 'single',
+			server_group: uci.get('nordvpn', this.instance, 'server_group') || ''
+		};
+		this._connectionState = { instance: this.instance, baseline: baseline,
+			draft: JSON.parse(JSON.stringify(baseline)) };
+		return this._connectionState;
+	},
+
+	markConnectionDirty: function() {
+		if (this._building) return;
+		var state = this.ensureConnectionState();
+		state.draft = { fixed_server: this._serverChosen || '',
+			locations: (this.poolEntries || []).map(function(e) { return e.code; }),
+			hop_mode: this.hopMode(), server_group: this.serverGroup() };
+		this._editGeneration = (this._editGeneration || 0) + 1;
+		this.updateDirty();
+	},
+
+	updateDirty: function() {
+		var state = this._connectionState;
+		var comparable = function(value) {
+			return JSON.stringify([ value.fixed_server, value.locations.slice().sort(), value.hop_mode, value.server_group ]);
+		};
+		this.dirty = !!this._otherDirty || !!(state && comparable(state.draft) !== comparable(state.baseline));
+		if (this.saveBtn) this.saveBtn.disabled = !!this._saving || !this.dirty;
+		if (this.discardBtn) this.discardBtn.disabled = !!this._saving || !this.dirty;
+	},
+
 	markDirty: function() {
-		if (this._building)
-			return;
-		this.dirty = true;
-		if (this.saveBtn) this.saveBtn.disabled = false;
-		if (this.discardBtn) this.discardBtn.disabled = false;
+		if (this._building) return;
+		this._otherDirty = true;
+		this._otherEditGeneration = (this._otherEditGeneration || 0) + 1;
+		this._editGeneration = (this._editGeneration || 0) + 1;
+		this.updateDirty();
 	},
 
 	discard: function() {
+		// Invalidate synchronously: an already pending response cannot restore
+		// an edit while the config load below is still outstanding.
+		this._serversReq = (this._serversReq || 0) + 1;
+		this._formGeneration = (this._formGeneration || 0) + 1;
+		var instance = this.instance, generation = this._formGeneration, edits = this._editGeneration;
 		return uci.load('nordvpn').then(L.bind(function() {
+			if (instance !== this.instance || generation !== this._formGeneration || edits !== this._editGeneration) return;
+			this._connectionState = null;
+			this._otherDirty = false;
 			dom.content(this.formNode, this.buildFormSections());
-			this.dirty = false;
-			if (this.saveBtn) this.saveBtn.disabled = true;
-			if (this.discardBtn) this.discardBtn.disabled = true;
+			this.updateDirty();
 		}, this));
 	},
 
@@ -3007,11 +3066,12 @@ return view.extend({
 	// update first when the change allows it; the backend still refuses (and
 	// this falls back to a full apply) when the tunnel is not up with matching
 	// interface settings, e.g. the instance was disabled.
-	applySaved: function(routingOnly, p) {
+	applySaved: function(routingOnly, p, instance) {
+		instance = instance || this.instance;
 		if (!routingOnly) {
 			this.dismiss(p);
 			p = this.notice(_('Applying and reconnecting…'), 'info');
-			return this.applyAsync(this.instance, 'save').then(L.bind(function(res) {
+			return this.applyAsync(instance, 'save').then(L.bind(function(res) {
 				this.dismiss(p);
 				return res;
 			}, this), L.bind(function(e) {
@@ -3021,11 +3081,11 @@ return view.extend({
 		}
 		this.dismiss(p);
 		p = this.notice(_('Applying routing changes…'), 'info');
-		return callApplyRouting(this.instance).then(L.bind(function(res) {
+		return callApplyRouting(instance).then(L.bind(function(res) {
 			if (res && res.needs_reconnect)
-				return this.applySaved(false, p);
+				return this.applySaved(false, p, instance);
 			this.dismiss(p);
-			return this.operationResult(res || { error: _('no response') });
+			return this.operationResult(res || { error: _('no response') }, instance);
 		}, this), L.bind(function(e) {
 			this.dismiss(p);
 			throw e;
@@ -3033,6 +3093,7 @@ return view.extend({
 	},
 
 	save: function() {
+		if (this._saving) return Promise.resolve();
 		// Require at least one location valid for the current hop mode; entries
 		// carried over from another mode (count null) do not count.
 		var validCount = (this.poolEntries || []).filter(function(e) { return e.count != null; }).length;
@@ -3045,9 +3106,21 @@ return view.extend({
 			this.notice(_('Internet check target "%s" is not an IPv4 address.').format(badTarget), 'error');
 			return Promise.resolve();
 		}
+		var instance = this.instance, state = this.ensureConnectionState();
+		var form = this._formGeneration, edits = this._editGeneration, otherEdits = this._otherEditGeneration;
+		var savedDraft = JSON.parse(JSON.stringify(state.draft));
+		var previous = JSON.parse(JSON.stringify(uci.get('nordvpn', instance) || {}));
+		var previousCache = uci.get('nordvpn', 'main', 'cache_dir');
+		var committed = false, disabled = this.status && this.status.enabled === false;
+		var active = L.bind(function() {
+			return this.instance === instance && this._formGeneration === form && this._connectionState === state;
+		}, this);
 		var before = this.optionSnapshot();
 		this.collectIntoUci();
+		var staged = JSON.parse(JSON.stringify(uci.get('nordvpn', instance) || {}));
+		var stagedCache = uci.get('nordvpn', 'main', 'cache_dir');
 		var routingOnly = this.routingOnlyChange(before, this.optionSnapshot());
+		this._saving = true;
 		this.saveBtn.disabled = true;
 		this.discardBtn.disabled = true;
 		var p = this.notice(_('Saving configuration…'), 'info');
@@ -3055,16 +3128,21 @@ return view.extend({
 		return uci.save()
 			.then(function() { return callUciCommit('nordvpn'); })
 			.then(L.bind(function() {
-				this.dirty = false;
+				committed = true;
+				if (active()) {
+					state.baseline = savedDraft;
+					if (otherEdits === this._otherEditGeneration) this._otherDirty = false;
+					this.updateDirty();
+				}
 				this.clearChangeIndicator();
 				var q = p;
 				p = null;
 				// Saving options on a disabled instance must not turn its tunnel back on.
-				if (this.status && this.status.enabled === false) {
+				if (disabled) {
 					this.dismiss(q);
 					return { saved_disabled: true };
 				}
-				return this.applySaved(routingOnly, q);
+				return this.applySaved(routingOnly, q, instance);
 			}, this))
 			.then(L.bind(function(res) {
 				if (res && res.error)
@@ -3086,13 +3164,37 @@ return view.extend({
 				// Rebuild the form, not just the status band: a saved change may
 				// have flipped the detected routing mode (e.g. clearing the table
 				// leaves manual), and the panel's shape depends on it.
+				if (!active()) return;
 				return this.refreshStatus().then(L.bind(function() {
-					dom.content(this.formNode, this.buildFormSections());
+					if (active() && !this.dirty && edits === this._editGeneration)
+						dom.content(this.formNode, this.buildFormSections());
 				}, this));
 			}, this))
 			.catch(L.bind(function(e) {
 				this.dismiss(p);
+				if (!committed) {
+					// Undo only this save's staging, and only while the value is
+					// still ours. Other actions may have loaded, changed or deleted
+					// the instance while this request was pending.
+					var equal = function(a, b) { return JSON.stringify(a) === JSON.stringify(b); };
+					var current = uci.get('nordvpn', instance);
+					if (current) {
+						Object.keys(previous).concat(Object.keys(staged)).forEach(function(k) {
+							if (k.charAt(0) === '.' || equal(previous[k], staged[k]) || !equal(current[k], staged[k])) return;
+							if (previous[k] == null) uci.unset('nordvpn', instance, k);
+							else uci.set('nordvpn', instance, k, previous[k]);
+						});
+					}
+					if (uci.get('nordvpn', 'main') && !equal(previousCache, stagedCache) &&
+					    equal(uci.get('nordvpn', 'main', 'cache_dir'), stagedCache)) {
+						if (previousCache == null) uci.unset('nordvpn', 'main', 'cache_dir');
+						else uci.set('nordvpn', 'main', 'cache_dir', previousCache);
+					}
+				}
 				this.notice(_('Save failed: %s').format(e), 'error');
+			}, this)).finally(L.bind(function() {
+				this._saving = false;
+				this.updateDirty();
 			}, this));
 	},
 
@@ -3194,7 +3296,7 @@ return view.extend({
 		return this.refreshCredentials().then(L.bind(function() {
 			return this.refreshStatus();
 		}, this)).then(L.bind(function() {
-			if (!this.dirty)
+			if (!this.dirty && !this._saving)
 				dom.content(this.formNode, this.buildFormSections());
 		}, this));
 	},
