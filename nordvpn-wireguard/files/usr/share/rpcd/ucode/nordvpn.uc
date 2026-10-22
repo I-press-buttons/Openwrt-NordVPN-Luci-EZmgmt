@@ -287,8 +287,9 @@ methods.clients = {
 
 // A refresh whose worker died reads as an error, not as forever 'running'.
 methods.refresh_status = {
-	call: function() {
-		return fetch_status_report() || { state: 'idle' };
+	args: { id: '' },
+	call: function(request) {
+		return fetch_status_report(null, ((request || {}).args || {}).id) || { state: 'idle' };
 	}
 };
 
@@ -407,12 +408,15 @@ methods.apply_status = {
 
 methods.refresh_locations = {
 	call: function() {
-		let running = fetch_status_report();
-		if (running && running.state == 'running')
-			return { job: running.started_at, already_running: true };
-		// Detached one-shot worker; fixed command, no user input, no shell injection.
-		system('/usr/bin/nordvpn-cache-update >/dev/null 2>&1 &');
-		return { job: '' + time(), started: true };
+		let path = cache_file_path(load_settings(cursor()));
+		let result = _cache.spawn_refresh(path, function(st) {
+			let r = _common.run([ 'sh', '-c', '/usr/bin/nordvpn-cache-update --job-id ' +
+				st.id + ' >/dev/null 2>&1 & echo $!' ]);
+			let out = trim(r.stdout || '');
+			return r.code == 0 && _common.full_match(out, /^[0-9]+$/) && int(out) > 0
+				? { pid: int(out) } : { error: 'could not start the server list worker' };
+		});
+		return { ...result, job: result.apply ? result.apply.id : null };
 	}
 };
 

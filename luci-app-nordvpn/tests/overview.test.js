@@ -190,6 +190,40 @@ async function run() {
 	assert(notices.some(function(s) { return s.indexOf('Some VPNs could not be disabled: other: busy') === 0; }),
 		'partial errors are reported');
 
+	// Refresh errors remain visible alongside the usable previous list and age.
+	var cacheText = '';
+	context.dom.content = function(node, children) { cacheText = Array.isArray(children) ? children.join('') : children; };
+	context.poll.remove = function() {};
+	app.cacheRow = {};
+	app._cacheJob = 'my-refresh';
+	app.rebuildPoolWidget = function() {};
+	app.refreshServerList = function() {};
+	calls.refresh_status = function(id) {
+		assert.strictEqual(id, 'my-refresh', 'cache polls use reserved refresh identity');
+		return Promise.resolve({ id: id, state: 'error', message: 'disk full' });
+	};
+	calls.locations = function() { return Promise.resolve({ available: true, state: 'stale', cache_info: { created: 'yesterday' } }); };
+	var cacheButton = { disabled: true };
+	await app.pollCacheOnce(cacheButton);
+	assert(cacheText.includes('disk full') && cacheText.includes('yesterday') && cacheText.includes('stale'),
+		'failed refresh displays error with previous cache availability and age');
+	assert.strictEqual(cacheButton.disabled, false, 'terminal refresh failure enables retry');
+	calls.refresh_status = function() { return Promise.resolve({ id: 'other-refresh', state: 'done' }); };
+	cacheButton.disabled = true;
+	await app.pollCacheOnce(cacheButton);
+	assert.strictEqual(cacheButton.disabled, true, 'another refresh completion cannot finish this watcher');
+	calls.refresh_status = function() { return Promise.resolve({ id: 'my-refresh', state: 'missing', error: 'status lost' }); };
+	calls.locations = function() { return Promise.reject(new Error('RPC unavailable')); };
+	await app.pollCacheOnce(cacheButton);
+	assert(cacheText.includes('status lost') && cacheText.includes('RPC unavailable') && cacheText.includes('yesterday'),
+		'missing status and a failed locations RPC remain visible with previous cache age');
+	calls.refresh_status = function() { return Promise.resolve({ state: 'idle' }); };
+	await app.pollCacheOnce(cacheButton);
+	assert(cacheText.includes('refresh completion is unavailable'), 'idle after start cannot claim refresh success');
+	calls.refresh_locations = function() { return Promise.resolve({ error: 'status storage unavailable' }); };
+	await app.refreshCache({ target: cacheButton });
+	assert(cacheText.includes('status storage unavailable') && cacheText.includes('yesterday'), 'start failure preserves previous cache context');
+
 	notices.length = 0;
 	app.status = { enabled: false };
 	app.poolEntries = [{ count: 1 }];

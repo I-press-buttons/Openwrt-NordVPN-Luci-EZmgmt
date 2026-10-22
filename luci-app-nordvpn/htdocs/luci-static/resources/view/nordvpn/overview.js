@@ -31,7 +31,7 @@ var callLocations = rpc.declare({ object: 'nordvpn', method: 'locations' });
 var callServers = rpc.declare({ object: 'nordvpn', method: 'servers', params: [ 'locations', 'hop_mode', 'server_group' ] });
 var callUpdateStatus = rpc.declare({ object: 'nordvpn', method: 'update_status' });
 var callUpdateStart = rpc.declare({ object: 'nordvpn', method: 'update_start', params: [ 'version' ] });
-var callRefreshStatus = rpc.declare({ object: 'nordvpn', method: 'refresh_status' });
+var callRefreshStatus = rpc.declare({ object: 'nordvpn', method: 'refresh_status', params: [ 'id' ] });
 var callSetCredentials = rpc.declare({ object: 'nordvpn', method: 'set_credentials', params: [ 'token', 'instance', 'credential', 'name' ] });
 var callCredentials = rpc.declare({ object: 'nordvpn', method: 'credentials' });
 var callRemoveCredentials = rpc.declare({ object: 'nordvpn', method: 'remove_credentials', params: [ 'credential' ] });
@@ -3205,29 +3205,43 @@ return view.extend({
 		var btn = ev.target;
 		btn.disabled = true;
 		dom.content(this.cacheRow, _('Refreshing…'));
-		return callRefreshLocations().then(L.bind(function() {
+		return callRefreshLocations().then(L.bind(function(result) {
+			if (result && result.error) throw new Error(result.error);
+			this._cacheJob = result && result.job;
 			this._cachePoll = L.bind(this.pollCacheOnce, this, btn);
 			poll.add(this._cachePoll, 2);
 		}, this)).catch(L.bind(function(e) {
 			btn.disabled = false;
+			dom.content(this.cacheRow, [ _('Refresh failed: %s').format(e), ' · ', this.cacheSummary() ]);
 			this.notice(_('Refresh failed: %s').format(e), 'error');
 		}, this));
 	},
 
 	pollCacheOnce: function(btn) {
-		return callRefreshStatus().then(L.bind(function(st) {
+		return callRefreshStatus(this._cacheJob || '').then(L.bind(function(st) {
+			if (this._cacheJob && st && st.id && st.id !== this._cacheJob) return;
 			var state = st ? st.state : 'idle';
 			if (state === 'running') {
-				dom.content(this.cacheRow, [ _('Loading… %d servers so far').format((st && st.gateways) || 0) ]);
+				dom.content(this.cacheRow, [ _('Loading… %d servers so far').format((st && st.gateways) || 0), ' · ', this.cacheSummary() ]);
 				return;
 			}
 			poll.remove(this._cachePoll);
 			btn.disabled = false;
+			var error = state !== 'done';
+			var message = error ? _('Refresh failed: %s').format((st && (st.message || st.error)) || _('refresh completion is unavailable')) : '';
+			// Render the terminal result immediately: a failed locations read
+			// must not hide it or remove the previous usable-cache context.
+			dom.content(this.cacheRow, [ message ? message + ' · ' : '', this.cacheSummary() ]);
+			if (error) this.notice(message, 'error');
 			return callLocations().then(L.bind(function(loc) {
 				this.locations = loc || { available: false };
-				dom.content(this.cacheRow, [ this.cacheSummary() ]);
+				dom.content(this.cacheRow, [ message ? message + ' · ' : '', this.cacheSummary() ]);
 				this.rebuildPoolWidget();
 				this.refreshServerList();
+			}, this)).catch(L.bind(function(e) {
+				var readError = _('Could not read server list: %s').format(e);
+				dom.content(this.cacheRow, [ message ? message + ' · ' : '', readError, ' · ', this.cacheSummary() ]);
+				this.notice(readError, 'error');
 			}, this));
 		}, this));
 	},

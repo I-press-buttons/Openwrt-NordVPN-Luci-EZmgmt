@@ -643,36 +643,6 @@ function log(msg) {
 
 // ── Filesystem helpers ───────────────────────────────────────────────
 
-// Write data to `path` atomically: create a unique temp file in the same
-// directory, write it, then rename over the target so readers never observe a
-// half-written file. Returns true on success.
-function atomic_write(path, data) {
-	let fh = null;
-	let tmp = null;
-	let n = 0;
-	while (n < 1000) {
-		tmp = path + '.tmp.' + time() + '.' + n;
-		fh = open(tmp, 'wx'); // exclusive create; retry on collision
-		if (fh)
-			break;
-		n++;
-	}
-	if (!fh)
-		return false;
-
-	let ok = fh.write(data);
-	fh.close();
-	if (ok == null) {
-		unlink(tmp);
-		return false;
-	}
-	if (!rename(tmp, path)) {
-		unlink(tmp);
-		return false;
-	}
-	return true;
-}
-
 // Own pid — the first field of /proc/self/stat — or null when /proc is
 // unavailable. Read every time rather than cached: a uloop.task child is a
 // fork and must not report its parent's pid.
@@ -682,6 +652,33 @@ function self_pid() {
 		return null;
 	let first = split(trim(raw), ' ')[0];
 	return full_match(first, /^[0-9]+$/) ? int(first) : null;
+}
+
+// Write data to `path` atomically: create a unique temp file in the same
+// directory, write it, then rename over the target so readers never observe a
+// half-written file. Returns true on success.
+function atomic_write(path, data, adapters) {
+	// Explicit adapters support failure injection without treating missing
+	// production filesystem support as success.
+	let a = adapters || {}, create = a.open || open;
+	let replace = a.rename || rename, remove = a.unlink || unlink;
+	let fh = null, tmp = null;
+	try {
+		for (let n = 0; n < 100; n++) {
+			tmp = path + '.tmp.' + self_pid() + '.' + n;
+			fh = create(tmp, 'wxe', 0600);
+			if (fh) break;
+		}
+		if (!fh) return false;
+		let complete = fh.write(data) == length(data);
+		let closed = fh.close();
+		fh = null;
+		if (complete && closed && replace(tmp, path)) return true;
+	} catch (e) {
+		if (fh) { try { fh.close(); } catch (ignored) {} }
+	}
+	if (tmp) { try { remove(tmp); } catch (ignored) {} }
+	return false;
 }
 
 // Is the lock file at `path` abandoned? Either older than `max_age` seconds,

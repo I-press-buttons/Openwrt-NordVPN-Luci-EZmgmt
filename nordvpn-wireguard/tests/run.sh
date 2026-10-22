@@ -36,5 +36,7 @@ done
 UCODE="$UCODE" UCODE_EXTRA_L="$UCODE_EXTRA_L" python3 "$here/test_mutation_process.py" || status=1
 UCODE="$UCODE" UCODE_EXTRA_L="$UCODE_EXTRA_L" python3 "$here/test_jobs_process.py" || status=1
 
+UCODE="$UCODE" UCODE_EXTRA_L="$UCODE_EXTRA_L" python3 "$here/test_cache_process.py" || status=1
+
 [ "$status" = 0 ] && echo "ALL TESTS PASSED" || echo "TESTS FAILED"
 exit "$status"
