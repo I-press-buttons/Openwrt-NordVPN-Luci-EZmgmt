@@ -65,10 +65,60 @@ IDs/names fail explicitly. This is scoped compensation, not an atomic operation
 across UCI packages, files and kernel state. Non-cooperating external writers can
 still race libuci commits; all package writers should honor the shared lock.
 
-The affected instance's previous domain-set elements are captured before a
-firewall reload, including sets needed only for rollback. Successful execution
-restores only the existing eligibility list from enforcement. Whole-firewall
-preservation for unchanged sets belonging to other instances remains plan 3.
+## Global domain-set preservation
+
+The transaction inventories every generated IPv4 steering and bypass set from
+the before/after firewall, DHCP and instance snapshots. Both stamped sections,
+the owning instance identity, interface, role and firewall definition must agree
+before membership can be retained. Domain names are normalized, deduplicated
+and sorted. Unchanged sets and domain additions retain existing addresses across
+all instances; any domain removal invalidates the whole set. Addresses cannot be
+attributed to individual domains in the current union set, so selectively keeping
+addresses after a removal would risk resurrecting the removed membership.
+Removed sets, disabled/deleted owners and reused names with changed ownership
+never receive old membership. The legacy `enforce().keep_sets` hint remains
+available but does not determine global preservation.
+
+Immediately after commits and before firewall reload, one checked JSON snapshot
+of the running fw4 table captures all previous managed sets, including those
+needed only for rollback. A successful inventory proves an individual set is
+absent; if the fw4 table is missing, a checked table inventory must establish
+that absence. Missing runtime sets can be recreated and refilled; command,
+permission, malformed-output and unsupported-element errors stop before reload.
+The snapshot has a three-second command deadline, a 2 MiB output cap and a
+65,536-address total cap; checking an absent table can take a further three
+seconds. Restoration uses at most 256 addresses per command, a one-second command
+deadline and a ten-second budget for the whole restoration pass. Exceeding a
+bound fails explicitly through the normal result and compensation contract.
+
+Forward restoration targets only eligible sets present in the new generated
+configuration. Compensation uses the previous definitions and captured elements
+for every previous managed set. A failed capture after early teardown does not
+trigger an uncaptured firewall reload during compensation. DHCP changes still
+require dnsmasq reload. A firewall-only reload skips DNS reload when every active
+domain set was preserved; otherwise DNS refill is requested across all active
+instances, including missing runtime sets belonging to another instance. Runtime
+verification checks the other active sets and generated DNS memberships too.
+
+Before the destructive global reload, affected other instances receive pending
+confirmation records. A worker interruption or incomplete compensation therefore
+cannot leave their previous success visible in a fresh status request. After
+complete success or complete compensation their exact previous confirmation
+records are restored: an unconfirmed instance remains unconfirmed, and a stale
+preference generation is never advanced. Publication failures remain visible and
+leave the affected instance unconfirmed. No keys, snapshots or captured elements
+are published in these records or normal status responses.
+
+The generated sets hold IPv4 addresses without per-domain provenance or DNS TTL
+metadata. Preserved addresses keep the current set's existing retention behavior;
+restoration does not invent TTL expiration. Sets invalidated by removal, newly
+created sets and missing runtime sets refill as clients query the router's
+dnsmasq; reloading DNS does not proactively resolve every configured domain.
+Cached client answers and external resolvers can delay refill. Timed elements,
+prefix/range elements and unsupported set types fail explicitly instead of being
+silently copied with altered semantics. Firewall reload, element insertion and
+DNS reload are separate operations: traffic continuity is not atomic, and a
+transient path change remains possible during that interval.
 
 ## Runtime checks and durable uncertainty
 
@@ -112,6 +162,15 @@ fixtures for policy rules, prohibit rules, metadata-only changes, equivalent
 retained rules and wrong-instance firewall marks. Legacy semantic fixtures use
 an explicit offline adapter. LuCI tests cover structured failures and warnings
 surviving a fresh view.
+
+`test_domain_preservation.uc` covers two instances with independent steering and
+bypass sets, device-only changes, additions/removals, disable/delete, ownership
+swaps, exact restored names, absent runtime sets/table, bounded batches,
+capture/reload/restore/compensation failures and other-instance confirmation
+through fresh cursors. It first reproduced the global preservation failure
+against the previous implementation. Live unaffected flows, TTL/refill timing,
+the JSON nft output on supported firmware and reload continuity remain pending
+device validation; the offline results are not performance measurements.
 
 No OpenWrt router was available. Before release, test supported firmware with
 multiple tunnels, down/disabled interfaces, kill switches, domain steering and

@@ -1185,11 +1185,9 @@ function enforce(uci, s, opts) {
 			proto: 'all', target: 'MARK', set_xmark: mark };
 	}, 'ipset', 'firewall'))
 		cf = true;
-	// A firewall reload empties the dnsmasq-filled sets, and connections to
-	// those addresses would switch path mid-flow until a client looks the
-	// name up again. Sets whose domains were all kept are restored after the
-	// reload (see nordvpn.apply.commit_routing); a set that lost a domain is
-	// left to refill, so the removed domain's addresses leave it.
+	// Retain this per-instance hint for compatibility. The transaction executor
+	// independently inventories before/after snapshots for every instance at
+	// the global reload boundary; it does not rely on this local list.
 	let keep_sets = [];
 	if (no_domain_removed(set_domains(uci, iface, 'domain_dns'), steer_doms))
 		push(keep_sets, setname);

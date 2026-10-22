@@ -12,6 +12,10 @@ function install(adapters) {
 	adapters.pause = function() {};
 	adapters.run = function(argv) {
 		let cmd = argv[0] == 'timeout' ? slice(argv, 2) : argv;
+		// Runtime sets are empty in the legacy semantic fixtures. A successful
+		// JSON inventory explicitly establishes that state, rather than relying
+		// on missing production tools or unparsable output being tolerated.
+		if (cmd[0] == 'nft' && cmd[1] == '-j') return { code: 0, stdout: '{"nftables":[]}' };
 		if (cmd[0] == 'wg') return { code: 0, stdout: 'key\t' + time() + '\n' };
 		// Existing connection-selection fixtures explicitly simulate failed
 		// bring-up, and a currently healthy peer for the no-restart path.
