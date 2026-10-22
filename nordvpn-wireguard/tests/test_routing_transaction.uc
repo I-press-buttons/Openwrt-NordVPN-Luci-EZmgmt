@@ -107,15 +107,22 @@ fail_at = [ 'reload:firewall#1' ]; r = tx.execute(reorder_cursor, p);
 ok('anonymous precedence restoration failure is reported separately', !r.ok && !r.rollback.ok && index(join(';', r.rollback.errors), 'reorder firewall') >= 0);
 for (let fault in [ 'nft:list#1', 'nft:add#1', 'nft:add#2' ]) {
 	reset();
-	global.MOCK_UCI.firewall.domain = { '.type': 'ipset', name: 'nv_nv_media_dom', nordvpn_managed: '1', nordvpn_iface: 'nv_media' };
-	p = multipackage(); p.keep_sets = [ 'nv_nv_media_dom' ];
+	global.MOCK_UCI.firewall.domain = { '.type': 'ipset', name: 'nv_nv_media_dom', family: 'ipv4', nordvpn_role: 'domain_set', nordvpn_managed: '1', nordvpn_iface: 'nv_media' };
+	global.MOCK_UCI.dhcp.domain = { '.type': 'ipset', name: [ 'nv_nv_media_dom' ], domain: [ 'example.com' ],
+		nordvpn_set: 'nv_nv_media_dom', table: 'fw4', table_family: 'inet', family: '4',
+		nordvpn_role: 'domain_dns', nordvpn_managed: '1', nordvpn_iface: 'nv_media' };
+	p = tx.plan(cursor(), function(c) {
+		c.set('firewall', 'managed', 'name', 'new'); c.set('network', 'nv_media', 'ip4table', '101');
+		c.set('dhcp', 'dns', 'noresolv', '1'); return { interface: 'nv_media' };
+	});
 	let base_run = tx.adapters.run;
 	tx.adapters.run = function(argv) {
 		let result = base_run(argv), a = argv[0] == 'timeout' ? slice(argv, 2) : argv;
-		if (result.code == 0 && a[0] == 'nft' && a[1] == 'list') result.stdout = 'elements = { 1.2.3.4 }';
+		if (result.code == 0 && a[0] == 'nft' && a[1] == '-j') result.stdout = sprintf('%J', { nftables: [
+			{ set: { family: 'inet', table: 'fw4', name: 'nv_nv_media_dom', type: 'ipv4_addr', elem: [ '1.2.3.4' ] } } ] });
 		return result;
 	};
-	fail_at = fault == 'nft:add#2' ? [ 'reload:network#1', fault ] : [ fault ];
+	fail_at = fault == 'nft:add#2' ? [ 'reload:network#1', fault ] : fault == 'nft:list#1' ? [ 'nft:-j#*' ] : [ fault ];
 	r = tx.execute(cursor(), p);
 	ok('nft capture/restoration fault ' + fault + ' never succeeds', !r.ok && (fault == 'nft:list#1' ? r.stage == 'capture:elements' : fault == 'nft:add#1' ? r.stage == 'restore:elements' : !r.rollback.ok));
 }
@@ -212,6 +219,12 @@ runtime.after.dhcp.domain = { '.type': 'ipset', nordvpn_managed: '1', nordvpn_if
 ok('missing domain membership cannot be called installed DNS policy', !tx.verify_runtime(runtime, runtime.after, tables));
 writefile(dnsfile, 'no-resolv\nserver=103.86.96.100\nnftset=/example.com/4#inet#fw4#nv_nv_media_dom\n');
 ok('running dnsmasq config confirms requested domain-to-set membership', tx.verify_runtime(runtime, runtime.after, tables));
+runtime.domain_preservation = { after: { nv_other_byp: { active: true, valid: true } } };
+runtime.after.dhcp.other = { '.type': 'ipset', nordvpn_managed: '1', nordvpn_iface: 'other', nordvpn_set: 'nv_other_byp',
+	name: [ 'nv_other_byp' ], domain: [ 'other.example' ] };
+ok('global DNS refill must confirm another active instance membership too', !tx.verify_runtime(runtime, runtime.after, tables));
+writefile(dnsfile, 'no-resolv\nserver=103.86.96.100\nnftset=/example.com/4#inet#fw4#nv_nv_media_dom\nnftset=/other.example/4#inet#fw4#nv_other_byp\n');
+ok('global DNS verification accepts complete multi-instance memberships', tx.verify_runtime(runtime, runtime.after, tables));
 unlink(dnsfile);
 tx.adapters.run = function(argv) {
 	let a = argv[0] == 'timeout' ? slice(argv, 2) : argv;

@@ -92,6 +92,57 @@ function detached(data) {
 	};
 	return c;
 }
+function list(v) { return type(v) == 'array' ? v : (v == null ? [] : [ v ]); }
+// Inventory the global reload boundary, never just the instance being edited.
+// A set name alone is not ownership: both stamped sections and the instance
+// identity must agree. Ambiguous/unsupported objects cannot retain membership.
+function domain_sets(data) {
+	let owners = {}, sets = {}, c = detached(data);
+	for (let name in common.list_instances(c)) {
+		let s = common.load_settings(c, name);
+		if (owners[s.interface]) owners[s.interface] = { ambiguous: true };
+		else owners[s.interface] = { name, active: s.enabled };
+	}
+	for (let sid, sec in data.firewall) {
+		let iface = common.validate_interface(sec.nordvpn_iface), role = sec.nordvpn_role;
+		if (sec['.type'] != 'ipset' || sec.nordvpn_managed != '1' || !iface ||
+		    index([ 'domain_set', 'bypass_set' ], role) < 0 || sec.family != 'ipv4') continue;
+		let name = 'nv_' + iface + (role == 'domain_set' ? '_dom' : '_byp');
+		if (sec.name != name) continue;
+		if (sets[name]) { sets[name].ambiguous = true; continue; }
+		let owner = owners[iface], domains = [], dns_count = 0, valid = true;
+		for (let did, dns in data.dhcp) {
+			if (dns['.type'] != 'ipset' || dns.nordvpn_managed != '1' || dns.nordvpn_iface != iface ||
+			    dns.nordvpn_role != (role == 'domain_set' ? 'domain_dns' : 'bypass_dns')) continue;
+			dns_count++;
+			if (dns.nordvpn_set != name || !equal(list(dns.name), [ name ]) || dns.table != 'fw4' || dns.table_family != 'inet' || dns.family != '4') valid = false;
+			for (let d in list(dns.domain)) {
+				let normalized = common.validate_domain(d);
+				if (!normalized) valid = false;
+				else if (index(domains, normalized) < 0) push(domains, normalized);
+			}
+		}
+		sort(domains);
+		sets[name] = { iface, role, owner: owner?.name, active: !!owner?.active && !owner.ambiguous,
+			domains, valid: valid && dns_count == 1 && length(domains) > 0, definition: options(sec) };
+	}
+	return sets;
+}
+function preservation(before, after) {
+	let old = domain_sets(before), next = domain_sets(after), keep = [];
+	for (let n in sort(keys(next))) {
+		let a = next[n], b = old[n];
+		if (!b || !a.active || !b.active || !a.valid || !b.valid || a.ambiguous || b.ambiguous ||
+		    a.owner != b.owner || a.iface != b.iface || a.role != b.role || !equal(a.definition, b.definition)) continue;
+		if (!length(filter(b.domains, (d) => index(a.domains, d) < 0))) push(keep, n);
+	}
+	return { before: old, after: next, keep };
+}
+function needs_refill(sets, retained) {
+	for (let n, sec in sets)
+		if (sec.active && sec.valid && !sec.ambiguous && index(retained, n) < 0) return true;
+	return false;
+}
 function plan(uci, reconcile) {
 	let before = snapshot(uci), after = copy(before);
 	let c = detached(after);
@@ -119,8 +170,9 @@ function plan(uci, reconcile) {
 	let reloads = [];
 	if (index(packages, 'firewall') >= 0) push(reloads, 'firewall');
 	if (index(packages, 'network') >= 0 || tables.data != (tables.before || '')) push(reloads, 'network');
-	if (index(packages, 'dhcp') >= 0 || (index(reloads, 'firewall') >= 0 && routing.domains_active)) push(reloads, 'dhcp');
-	return { changes, packages, reloads, before, after, tables, desired_generation, ...routing };
+	let domain_preservation = preservation(before, after);
+	if (index(packages, 'dhcp') >= 0 || (index(reloads, 'firewall') >= 0 && needs_refill(domain_preservation.after, domain_preservation.keep))) push(reloads, 'dhcp');
+	return { changes, packages, reloads, before, after, tables, desired_generation, ...routing, domain_preservation };
 }
 function must(ok, stage) { if (!ok) die(stage); }
 function write_section(uci, p, n, s) {
@@ -172,36 +224,68 @@ function interface_state(iface) {
 	return r.code == 0 && trim(r.stdout || '') == '' ? { up: false, absent: true } : null;
 }
 
-function set_elements(names, before) {
-	let out = {};
-	for (let n in names) {
-		if (!common.full_match(n, /^nv_[A-Za-z0-9_]+_(dom|byp)$/)) continue;
-		let r = command([ 'nft', 'list', 'set', 'inet', 'fw4', n ]);
-		// A previously absent set has no elements to retain.
-		if (r.code != 0) {
-			let exists = false;
-			for (let sid, sec in before.firewall) if (sec['.type'] == 'ipset' && sec.name == n) exists = true;
-			if (exists) die('could not capture nft set ' + n);
-			continue;
+function set_elements(sets) {
+	let out = {}, total = 0;
+	if (!length(keys(sets))) return out;
+	let r = command([ 'nft', '-j', 'list', 'table', 'inet', 'fw4' ], '3');
+	if (r.code != 0) {
+		// Absence is recoverable; an unavailable tool or unreadable table is not.
+		let inventory = command([ 'nft', '-j', 'list', 'tables' ], '3'), tables;
+		must(inventory.code == 0, 'could not inventory nft tables');
+		try { tables = json(inventory.stdout); } catch (e) { die('invalid nft table inventory'); }
+		must(type(tables?.nftables) == 'array', 'invalid nft table inventory');
+		for (let item in tables.nftables)
+			must(item.table?.family != 'inet' || item.table?.name != 'fw4', 'could not capture nft fw4 table');
+		return out;
+	}
+	let data;
+	try { data = json(r.stdout); } catch (e) { die('invalid nft set snapshot'); }
+	must(type(data?.nftables) == 'array', 'invalid nft set snapshot');
+	for (let item in data.nftables) {
+		let sec = item.set, n = sec?.name;
+		if (!sets[n] || sec.family != 'inet' || sec.table != 'fw4') continue;
+		must(sec.type == 'ipv4_addr' && !length(filter(sec.flags || [], (flag) => flag != 'interval')) && !sec.timeout, 'unsupported nft set ' + n);
+		let ips = [], seen = {};
+		for (let ip in (sec.elem || [])) {
+			must(common.validate_ipv4(ip), 'unsupported nft element in ' + n);
+			if (!seen[ip]) { seen[ip] = true; push(ips, ip); total++; }
+			must(total <= 65536, 'nft preservation exceeds 65536 addresses');
 		}
-		let m = match(r.stdout || '', /elements = \{([^}]*)\}/s), ips = [];
-		for (let ip in m ? split(m[1], /[ ,\t\n]+/) : [])
-			if (common.validate_ipv4(ip) && index(ips, ip) < 0) push(ips, ip);
 		out[n] = ips;
 	}
 	return out;
 }
 function restore_elements(saved) {
-	for (let n, ips in saved)
-		for (let i = 0; i < length(ips); i += 256)
+	let start = milliseconds();
+	must(start != null, 'nft restoration clock unavailable');
+	for (let n in sort(keys(saved))) {
+		let ips = saved[n];
+		for (let i = 0; i < length(ips); i += 256) {
+			must(milliseconds() < start + 10000, 'nft restoration deadline');
 			must(command([ 'nft', 'add', 'element', 'inet', 'fw4', n,
-				'{ ' + join(', ', slice(ips, i, i + 256)) + ' }' ]).code == 0, 'nft elements ' + n);
+				'{ ' + join(', ', slice(ips, i, i + 256)) + ' }' ], '1').code == 0, 'nft elements ' + n);
+		}
+	}
+}
+// Bound the one global nft snapshot before parsing; common.run otherwise reads
+// all stdout. timeout also bounds close() when a producer exceeds this limit.
+function run_bounded_nft(argv, quiet) {
+	if (argv[2] != 'nft' || argv[3] != '-j') return common.run(argv, quiet);
+	let proc = common.open_cmd(argv, 'r', quiet);
+	if (!proc) return { code: -1, stdout: '' };
+	let out = '', part, overflow = false;
+	while ((part = proc.read(4096)) != null && length(part)) {
+		if (length(out) + length(part) > 2097152) { overflow = true; break; }
+		out += part;
+	}
+	let code = proc.close();
+	return { code: overflow ? 1 : code, stdout: overflow ? '' : out };
 }
 // Explicit injection surface. Production defaults never treat a missing tool
 // as success. Tests replace only these dependencies, not executable discovery.
 adapters = {
 	commit: function(uci, p) { return uci.commit(p); },
-	run: common.run,
+	run: run_bounded_nft,
 	read_tables: function() { return readfile(TABLES); },
 	write_tables: function(data) { return checked_write(TABLES, data); },
 	read_outcome: function(name) { return readfile(outcome_path(name)); },
@@ -244,7 +328,10 @@ function merge_tables(current, from, to) {
 	return text == '' && to == null ? null : text;
 }
 
-function execute_inner(uci, p) {
+function publish_outcome(name, record) {
+	try { return adapters.write_outcome(name, record); } catch (e) { return false; }
+}
+function execute_inner(uci, p, affected) {
 	let changed = length(p.changes) > 0 || p.tables.data != (p.tables.before || '');
 	if (!changed && !p.activation) {
 		let ok = false;
@@ -257,13 +344,6 @@ function execute_inner(uci, p) {
 		// An anonymous deletion must be restorable at its original position.
 		for (let ch in p.changes)
 			if (ch.kind == 'delete' && type(uci.reorder) != 'function') die('UCI section reordering is unavailable');
-		if (index(p.reloads, 'firewall') >= 0) {
-			stage = 'capture:elements';
-			let names = [ ...(p.keep_sets || []) ];
-			for (let n, sec in p.before.firewall)
-				if (sec['.type'] == 'ipset' && sec.nordvpn_managed == '1' && sec.nordvpn_iface == p.interface && index(names, sec.name) < 0) push(names, sec.name);
-			saved = set_elements(names, p.before);
-		}
 		if (p.activation?.before_configuration) {
 			stage = p.activation.stage; push(attempted, 'activation');
 			must(command(p.activation.argv).code == 0, stage);
@@ -284,12 +364,31 @@ function execute_inner(uci, p) {
 			must(adapters.commit(uci, pkg), stage);
 		}
 		for (let pkg in p.reloads) {
+			if (pkg == 'firewall') {
+				stage = 'capture:elements';
+				saved = set_elements(p.domain_preservation.before);
+				// Runtime loss/cold boot also needs DNS refill, even if UCI was
+				// unchanged. This decision covers every active domain instance.
+				let retained = filter(p.domain_preservation.keep, (n) => saved[n] != null);
+				if (needs_refill(p.domain_preservation.after, retained) && index(p.reloads, 'dhcp') < 0) push(p.reloads, 'dhcp');
+				// The global reload can interrupt every domain instance. Persist
+				// uncertainty before it, including when a worker dies mid-reload.
+				for (let sets in [ p.domain_preservation.before, p.domain_preservation.after ])
+					for (let n, sec in sets) {
+						let name = common.validate_instance(sec.owner);
+						if (!name || name == p.instance || affected[name]) continue;
+						affected[name] = { prior: read_outcome(name) };
+						stage = 'record:pending:' + name;
+						must(publish_outcome(name, { ok: false, stage: 'applying:firewall', updated_at: common.iso_ts(time()),
+							generation: affected[name].prior?.generation }), stage);
+					}
+			}
 			stage = 'reload:' + pkg; push(attempted, pkg);
 			must(command(COMMANDS[pkg]).code == 0, stage);
 			if (pkg == 'firewall') {
 				stage = 'restore:elements';
 				let retained = {};
-				for (let n in (p.keep_sets || [])) if (saved[n]) retained[n] = saved[n];
+				for (let n in p.domain_preservation.keep) if (saved[n] != null) retained[n] = saved[n];
 				restore_elements(retained);
 			}
 		}
@@ -321,7 +420,9 @@ function execute_inner(uci, p) {
 			try { must(adapters.commit(uci, pkg), 'restore commit:' + pkg); }
 			catch (restore_error) { push(errors, '' + restore_error); }
 		if (length(attempted)) {
-			for (let pkg in p.reloads)
+			// Activation before configuration can fail before set capture. No
+			// package reload ran in that case; avoid an uncaptured firewall reload.
+			for (let pkg in length(filter(attempted, (s) => s != 'activation')) ? p.reloads : [])
 				try {
 					must(command(COMMANDS[pkg]).code == 0, 'restore reload:' + pkg);
 					if (pkg == 'firewall') restore_elements(saved);
@@ -338,14 +439,21 @@ function execute_inner(uci, p) {
 			rollback: { ok: !length(errors), errors, runtime_attempted: length(attempted) > 0 } };
 	}
 }
-function publish_outcome(name, record) {
-	try { return adapters.write_outcome(name, record); } catch (e) { return false; }
-}
 function execute(uci, p) {
 	let name = common.validate_instance(p.instance), prior = name ? read_outcome(name) : null;
 	if (name && !publish_outcome(name, { ok: false, stage: 'applying', updated_at: common.iso_ts(time()), generation: p.desired_generation }))
 		return { ok: false, changed: false, stage: 'record:pending', error: 'could not record routing application; no changes executed', rollback: null };
-	let result = execute_inner(uci, p);
+	let affected = {}, result = execute_inner(uci, p, affected);
+	// Restore existing evidence only after the entire runtime boundary (or
+	// complete compensation) succeeded. This never creates a new confirmation
+	// for an unconfirmed instance or updates its recorded preference generation.
+	if (result.ok || result.rollback?.ok) {
+		let failed = [];
+		for (let other, record in affected)
+			if (!publish_outcome(other, record.prior || { ok: false, stage: 'unconfirmed' })) push(failed, other);
+		if (length(failed)) result = { ...result, ok: false, stage: 'record:global_result', original_error: result.error,
+			error: (result.error ? result.error + '; ' : '') + 'could not restore routing confirmation for ' + join(', ', failed) };
+	}
 	if (name) {
 		// Peer-only transactions cannot certify unapplied routing preferences.
 		let record = !p.routing_policy && result.ok ? (prior || { ok: false, stage: 'unconfirmed' }) :
@@ -415,6 +523,7 @@ function firewall_present(sec, text) {
 // the running dnsmasq instance's generated config. A reload exit is insufficient.
 // This confirms installation, not end-to-end traffic or resolver reachability.
 verify_runtime = function(p, desired, tables) {
+	let domain_inventory = p.domain_preservation?.[desired == p.after ? 'after' : 'before'] || {};
 	if (p.activation) {
 		let st = interface_state(p.interface), r;
 		if (!st) return false;
@@ -487,6 +596,8 @@ verify_runtime = function(p, desired, tables) {
 			if ((sec['.type'] == 'rule' || sec['.type'] == 'redirect') && !firewall_present(sec, nft)) return false;
 			if (sec['.type'] == 'ipset' && !match(nft, regexp('set ' + sec.name + ' \\{'))) return false;
 		}
+		for (let n, sec in domain_inventory)
+			if (sec.active && sec.valid && !match(nft, regexp('set ' + n + ' \\{'))) return false;
 		for (let ch in p.changes) {
 			let old = desired == p.after ? ch.before : ch.after;
 			let now = desired == p.after ? ch.after : ch.before;
@@ -523,7 +634,9 @@ verify_runtime = function(p, desired, tables) {
 				}
 				if (!confirmed) return false;
 			}
-			if (sec.nordvpn_managed == '1' && sec.nordvpn_iface == p.interface && sec['.type'] == 'ipset') {
+			let global_domain = domain_inventory[sec.nordvpn_set];
+			if (sec.nordvpn_managed == '1' && sec['.type'] == 'ipset' &&
+			    (sec.nordvpn_iface == p.interface || (global_domain?.active && global_domain?.valid))) {
 				let names = sec.name;
 				for (let name in type(names) == 'array' ? names : [ names ]) {
 					if (!name || index(text, '4#inet#fw4#' + name) < 0) return false;
