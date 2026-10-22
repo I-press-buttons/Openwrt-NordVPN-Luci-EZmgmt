@@ -474,6 +474,7 @@ return view.extend({
 		ui.hideModal();
 		var n = this.notice(_('Deleting instance "%s"…').format(name), 'info');
 		return callDeleteInstance(name).then(L.bind(function(res) {
+			res = this.operationResult(res, name);
 			this.dismiss(n);
 			if (res && res.error) {
 				this.notice(_('Delete failed: %s').format(res.error), 'error');
@@ -676,7 +677,9 @@ return view.extend({
 		}
 		if (s.gateway && /^[a-z]{2}-onion/.test(s.gateway))
 			details.push(_('🧅 Onion over VPN'));
-		if (s.state !== 'connected' && s.state !== 'no_egress' && s.routing && s.routing.killswitch)
+		if (this.routingUnconfirmed(s))
+			details.push(_('Routing protection is unconfirmed. Retry Apply and check any reported errors.'));
+		else if (s.state !== 'connected' && s.state !== 'no_egress' && s.routing && s.routing.killswitch)
 			details.push(_('Kill switch is blocking LAN traffic'));
 		var protLine = null;
 		if (s.state === 'connected') {
@@ -758,6 +761,9 @@ return view.extend({
 	// (through the tunnel), or the router's upstream, usually the ISP's, which
 	// sees every name looked up. Only shown while the tunnel carries traffic.
 	dnsLine: function(s) {
+		if (this.routingUnconfirmed(s))
+			return E('div', { class: 'nv-status-details', style: 'color:var(--warning-color,#b8860b)' },
+				_('DNS policy is unconfirmed. Retry Apply and check any reported errors.'));
 		var rt = s.routing || {};
 		if (s.enabled === false || (s.state !== 'connected' && s.state !== 'no_egress') ||
 		    (rt.mode !== 'auto' && rt.mode !== 'steered'))
@@ -921,13 +927,34 @@ return view.extend({
 			poll.add(this._statusPoll, STATUS_POLL_S);
 	},
 
+	routingUnconfirmed: function(s) {
+		return !!((s && s.routing_application && s.routing_application.confirmed === false) ||
+			(this._routingUnconfirmed && this._routingUnconfirmed[this.instance]));
+	},
+
+	// Remember a failed application until this instance has a confirmed result.
+	// Saved preferences alone must not be displayed as installed DNS/protection.
+	operationResult: function(res, instance) {
+		instance = instance || this.instance;
+		this._routingUnconfirmed = this._routingUnconfirmed || {};
+		if (res && (res.error || res.ok === false)) {
+			this._routingUnconfirmed[instance] = true;
+			if (!res.error)
+				res = Object.assign({}, res, { error: _('Application failed at %s.').format(res.stage || _('an unknown stage')) });
+		} else if (res && (res.ok === true || res.state === 'success')) {
+			delete this._routingUnconfirmed[instance];
+		}
+		return res;
+	},
+
 	// Starts an apply and resolves with the very object the old synchronous
 	// `apply` returned, so every call site keeps its result handling unchanged.
 	// Never rejects on a backend-reported failure — only on a watcher that cannot
 	// reach the router at all. `source` labels the history entry: 'reconnect',
 	// 'enable' or 'save'.
 	applyAsync: function(instance, source) {
-		return this.runJob(function(inst) { return callApplyStart(inst, source); }, instance, 'apply');
+		return this.runJob(function(inst) { return callApplyStart(inst, source); }, instance, 'apply')
+			.then(L.bind(function(res) { return this.operationResult(res, instance); }, this));
 	},
 
 	// Runs one backend job (`kind` 'apply' or 'rotate') through `start` and
@@ -1026,7 +1053,9 @@ return view.extend({
 
 	disconnect: function() {
 		var n = this.notice(_('Disabling…'), 'info');
-		return callDisconnect(this.instance).then(L.bind(function(res) {
+		var instance = this.instance;
+		return callDisconnect(instance).then(L.bind(function(res) {
+			res = this.operationResult(res, instance);
 			this.dismiss(n);
 			if (res && res.error)
 				this.notice(_('Disable failed: %s').format(res.error), 'error');
@@ -2996,7 +3025,7 @@ return view.extend({
 			if (res && res.needs_reconnect)
 				return this.applySaved(false, p);
 			this.dismiss(p);
-			return res || { error: _('no response') };
+			return this.operationResult(res || { error: _('no response') });
 		}, this), L.bind(function(e) {
 			this.dismiss(p);
 			throw e;

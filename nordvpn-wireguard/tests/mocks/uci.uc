@@ -66,15 +66,17 @@ export function cursor() {
 				s[c][sec]['.type'] = a;
 			else
 				s[c][sec][a] = b;
+			return true;
 		},
 		delete: function(c, sec, opt) {
 			if (!s[c])
-				return;
+				return false;
 			if (opt != null) {
 				if (s[c][sec]) delete s[c][sec][opt];
 			} else {
 				delete s[c][sec];
 			}
+			return true;
 		},
 		list_append: function(c, sec, opt, val) {
 			if (!s[c] || !s[c][sec])
@@ -84,6 +86,14 @@ export function cursor() {
 				cur = (cur != null) ? [cur] : [];
 			push(cur, val);
 			s[c][sec][opt] = cur;
+		},
+		reorder: function(c, sec, pos) {
+			let names = filter(keys(s[c] || {}), (n) => n != sec);
+			splice(names, pos, 0, sec);
+			let reordered = {};
+			for (let n in names) reordered[n] = s[c][n];
+			s[c] = reordered;
+			return true;
 		},
 		save: function() { return true; },
 		commit: function(config) {

@@ -11,6 +11,7 @@ const _cache = require('nordvpn.cache');
 const normalize = _cache.normalize, write_cache = _cache.write_cache;
 const _common = require('nordvpn.common');
 const _apply_mod = require('nordvpn.apply');
+require('routing_adapter').install(_apply_mod.routing_adapters);
 const _creds = require('nordvpn.credentials');
 import { cursor } from 'uci';
 

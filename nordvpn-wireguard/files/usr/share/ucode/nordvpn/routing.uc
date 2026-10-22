@@ -11,8 +11,7 @@
 
 import { readfile } from 'fs';
 const _common = require('nordvpn.common');
-const run = _common.run,
-      atomic_write = _common.atomic_write;
+const run = _common.run;
 const _clients = require('nordvpn.clients');
 
 const MARK = 'nordvpn_managed';
@@ -430,10 +429,10 @@ function reconcile_local_routes(uci, iface, table, desired) {
 // unregistered name makes ip4table and lookup rules silently inert. Register
 // the instance's table with a stamped line (best effort). Numeric tables and
 // already-registered names need nothing.
-function ensure_rt_table(name) {
+function ensure_rt_table(name, state) {
 	if (_common.full_match(name, /^[0-9]+$/))
 		return true;
-	let data = readfile(RT_TABLES) || '';
+	let data = state.data;
 	let used = {};
 	for (let line in split(data, '\n')) {
 		let m = match(line, /^[ \t]*([0-9]+)[ \t]+([^ \t#]+)/);
@@ -446,22 +445,22 @@ function ensure_rt_table(name) {
 	for (let n = 100; n <= 252; n++) {
 		if (used['' + n])
 			continue;
-		return atomic_write(RT_TABLES,
-			data + (length(data) && substr(data, -1) != '\n' ? '\n' : '') +
-			sprintf('%d\t%s # %s\n', n, name, MARK));
+		state.data = data + (length(data) && substr(data, -1) != '\n' ? '\n' : '') +
+			sprintf('%d\t%s # %s\n', n, name, MARK);
+		return true;
 	}
 	return false;
 }
 
 // Numeric id of a routing table (a number, a builtin name, or a name
 // registered in rt_tables), or null when it cannot be resolved.
-function rt_table_id(name) {
+function rt_table_id(name, state) {
 	if (_common.full_match(name, /^[0-9]+$/))
 		return int(name);
 	let builtin = { main: 254, 'default': 253 };
 	if (builtin[name])
 		return builtin[name];
-	for (let line in split(readfile(RT_TABLES) || '', '\n')) {
+	for (let line in split(state ? state.data : (readfile(RT_TABLES) || ''), '\n')) {
 		let m = match(line, /^[ \t]*([0-9]+)[ \t]+([^ \t#]+)/);
 		if (m && m[2] == name)
 			return int(m[1]);
@@ -556,10 +555,10 @@ function device_owners(uci) {
 }
 
 // Remove ONLY a stamped rt_tables line for `name`; user entries are kept.
-function drop_rt_table(name) {
+function drop_rt_table(name, state) {
 	if (name == null || name == '' || _common.full_match(name, /^[0-9]+$/))
 		return;
-	let data = readfile(RT_TABLES);
+	let data = state.data;
 	if (!data || index(data, MARK) < 0)
 		return;
 	let kept = [];
@@ -573,7 +572,7 @@ function drop_rt_table(name) {
 		push(kept, line);
 	}
 	if (changed)
-		atomic_write(RT_TABLES, join('\n', kept));
+		state.data = join('\n', kept);
 }
 
 // Is routing table `name` any instance's (effective) table? `skip` names an
@@ -1017,6 +1016,7 @@ function detect(uci, s, runtime) {
 // (tests). Returns { changed_network, changed_firewall, changed_dhcp,
 // domains_active, notes }.
 function enforce(uci, s, opts) {
+	let tables = opts?.rt_tables || { data: readfile(RT_TABLES) || '' };
 	let notes = [];
 	let cn = false, cf = false, cd = false;
 	let iface = s.interface;
@@ -1089,14 +1089,14 @@ function enforce(uci, s, opts) {
 	let steer_nets = steer ? (all_lan || s.source_networks) : [];
 	let table = s.routing_table;
 	if (steer) {
-		if (!ensure_rt_table(table))
-			push(notes, 'could not register routing table ' + table + ' in ' + RT_TABLES);
+		if (!ensure_rt_table(table, tables))
+			die('could not register routing table ' + table + ' in ' + RT_TABLES);
 	} else {
-		drop_rt_table(s.routing_table);
+		drop_rt_table(s.routing_table, tables);
 		// The implicit table of all-LAN exceptions is named after the
 		// interface; release it too once no other instance uses that name.
 		if (s.routing_table != iface && !table_in_use(uci, iface, s.name))
-			drop_rt_table(iface);
+			drop_rt_table(iface, tables);
 	}
 	if (reconcile_rules(uci, 'rule', 'steer_lookup', iface, steer_nets, function(net) {
 		return { 'in': net, lookup: table, priority: '20000' };
@@ -1117,7 +1117,7 @@ function enforce(uci, s, opts) {
 		});
 	for (let t in old_tables)
 		if (!table_in_use(uci, t))
-			drop_rt_table(t);
+			drop_rt_table(t, tables);
 	if (reconcile_rules(uci, 'rule', 'steer_ks', iface, (steer && s.killswitch) ? steer_nets : [], function(net) {
 		return { 'in': net, action: 'prohibit', priority: '21000' };
 	}))
@@ -1144,7 +1144,7 @@ function enforce(uci, s, opts) {
 			else
 				push(steer_devs, mac);
 		}
-		mark = device_mark(rt_table_id(table));
+		mark = device_mark(rt_table_id(table, tables));
 		if (!mark && length(steer_devs)) {
 			push(notes, 'device steering needs a routing table with an id of 1-255; ' + table + ' has none');
 			steer_devs = [];
@@ -1164,7 +1164,7 @@ function enforce(uci, s, opts) {
 	if (steer && !all_lan && length(s.source_domains || []) > 0) {
 		let supported = (opts && opts.nftset != null) ? !!opts.nftset : nftset_supported();
 		if (!mark)
-			mark = device_mark(rt_table_id(table));
+			mark = device_mark(rt_table_id(table, tables));
 		if (!supported)
 			push(notes, 'domain steering needs dnsmasq with nftset support (dnsmasq-full)');
 		else if (!det.lan_zone)
@@ -1202,7 +1202,7 @@ function enforce(uci, s, opts) {
 	let steer_ips = [];
 	if (steer && !all_lan && length(s.source_ips || []) > 0) {
 		if (!mark)
-			mark = device_mark(rt_table_id(table));
+			mark = device_mark(rt_table_id(table, tables));
 		if (!det.lan_zone)
 			push(notes, 'address steering: could not determine the LAN zone');
 		else if (!mark)
@@ -1257,7 +1257,7 @@ function enforce(uci, s, opts) {
 	let byp_devs = [], byp_doms = [], byp_ips = [];
 	let bmark = device_mark(BYPASS_TABLE_ID);
 	if (steer && det.exceptions) {
-		if (rt_table_id(table) == BYPASS_TABLE_ID)
+		if (rt_table_id(table, tables) == BYPASS_TABLE_ID)
 			push(notes, 'exceptions need a routing table other than main');
 		else {
 			byp_devs = s.bypass_devices || [];
@@ -1721,7 +1721,7 @@ function enforce(uci, s, opts) {
 	}, 'nordvpn_key', 'firewall'))
 		cf = true;
 
-	return { changed_network: cn, changed_firewall: cf, changed_dhcp: cd,
+	return { interface: iface, instance: s.name, routing_policy: true, changed_network: cn, changed_firewall: cf, changed_dhcp: cd,
 		domains_active: length(steer_doms) > 0 || length(byp_doms) > 0, keep_sets: keep_sets,
 		dns_locked: lock != null, notes: notes };
 }

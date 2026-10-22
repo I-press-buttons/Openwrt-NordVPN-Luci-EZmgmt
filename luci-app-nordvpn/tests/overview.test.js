@@ -147,6 +147,26 @@ async function run() {
 	await app.refreshUpdateStatus();
 	assert(app.updateMessage.text.includes('Reload this page'), 'success explains how to load the new UI');
 
+	app.instance = 'main';
+	var routingFailure = { ok: false, stage: 'reload:firewall', error: 'firewall reload failed', rollback: { ok: false } };
+	assert.strictEqual(app.operationResult(routingFailure, 'main'), routingFailure, 'structured backend failure is preserved');
+	assert.strictEqual(app._routingUnconfirmed.main, true, 'failed application cannot confirm saved protection preferences');
+	var dnsWarning = app.dnsLine({ state: 'connected', routing: { mode: 'steered' } });
+	assert(JSON.stringify(dnsWarning).includes('DNS policy is unconfirmed'), 'failed routing shows an unconfirmed DNS policy');
+	app.operationResult({ ok: true, changed: false, stage: 'unchanged' }, 'other');
+	assert.strictEqual(app._routingUnconfirmed.main, true, 'another instance success cannot clear the failure');
+	var missingError = app.operationResult({ ok: false, stage: 'commit:network' }, 'main');
+	assert(missingError.error.includes('commit:network'), 'structured failure without legacy error still reaches existing notices');
+	app.operationResult({ ok: true, changed: false, stage: 'unchanged' }, 'main');
+	assert.strictEqual(app._routingUnconfirmed.main, undefined, 'confirmed unchanged application clears the warning');
+	app._routingUnconfirmed = {};
+	assert.strictEqual(app.routingUnconfirmed({ routing_application: { confirmed: false, stage: 'applying' } }), true,
+		'a fresh view uses persisted pending state after worker death or page reload');
+	assert.strictEqual(app.routingUnconfirmed({ routing_application: { confirmed: true } }), false,
+		'persisted confirmed installation is accepted after page reload');
+	var reloadedDnsWarning = app.dnsLine({ state: 'connected', routing_application: { confirmed: false }, routing: { mode: 'auto' } });
+	assert(JSON.stringify(reloadedDnsWarning).includes('DNS policy is unconfirmed'), 'reloaded view cannot claim failed DNS installation');
+
 	var notices = [];
 	app.notice = function(message) { notices.push(message); return {}; };
 	app.dismiss = function() {};

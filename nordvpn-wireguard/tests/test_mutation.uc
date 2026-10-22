@@ -5,6 +5,7 @@ import { cursor } from 'uci';
 const c = require('nordvpn.common');
 const m = require('nordvpn.mutation');
 const a = require('nordvpn.apply');
+require('routing_adapter').install(a.routing_adapters);
 const r = require('nordvpn.rotate');
 const creds = require('nordvpn.credentials');
 const api = require('nordvpn.api');
