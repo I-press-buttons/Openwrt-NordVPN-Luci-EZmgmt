@@ -6,7 +6,7 @@
 
 'use strict';
 
-import { readfile, mkdir, unlink } from 'fs';
+import { readfile, mkdir, unlink, stat } from 'fs';
 const _cache = require('nordvpn.cache');
 const normalize = _cache.normalize, write_cache = _cache.write_cache;
 const _common = require('nordvpn.common');
@@ -74,6 +74,30 @@ eq('locations memo answers the same', m.locations.call(), loc);
 	eq('locations follow a rewritten cache', length(m.locations.call().countries), 1);
 	write_cache(cache, cdir + '/nordvpn_servers_cache.json');
 	eq('locations follow it back', length(m.locations.call().countries), 3);
+}
+// Equal-size replacements within one second still invalidate both memos by
+// inode identity. Pin cached_at/created fields by serializing one base object.
+{
+	let path = cdir + '/nordvpn_servers_cache.json';
+	let first = json(readfile(path));
+	let before, after;
+	for (let attempt = 0; attempt < 3; attempt++) {
+		first.countries[0].name = 'EstoniX';
+		first.countries[0].cities[0].relays[0].name = 'Estonia #X';
+		_common.atomic_write(path, sprintf('%J', first));
+		before = stat(path);
+		m.locations.call();
+		m.servers.call({ args: { country: 'ee', city: 'ee-tallinn', hop_mode: 'single' } });
+		first.countries[0].name = 'EstoniY';
+		first.countries[0].cities[0].relays[0].name = 'Estonia #Y';
+		_common.atomic_write(path, sprintf('%J', first));
+		after = stat(path);
+		if (before.mtime == after.mtime) break;
+	}
+	ok('same-size same-second replacement changes inode', before.mtime == after.mtime && before.size == after.size && before.inode != after.inode);
+	eq('tree memo observes equal-size new generation', m.locations.call().countries[0].name, 'EstoniY');
+	eq('server memo observes equal-size new generation', m.servers.call({ args: { country: 'ee', city: 'ee-tallinn', hop_mode: 'single' } }).relays[0].name, 'Estonia #Y');
+	write_cache(cache, path);
 }
 // servers answers are memoized per cache file and request, and follow a
 // rewritten cache like the tree does.

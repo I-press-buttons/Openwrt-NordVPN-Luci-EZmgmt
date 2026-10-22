@@ -16,25 +16,21 @@ const open_cmd = _common.open_cmd,
       CACHE_MAX_AGE = _common.CACHE_MAX_AGE,
       CACHE_SCHEMA_VERSION = _common.CACHE_SCHEMA_VERSION,
       FETCH_STATUS_FILE = _common.FETCH_STATUS_FILE,
-      CACHE_LOCK_FILE = _common.CACHE_LOCK_FILE,
       relay_kind = _common.relay_kind,
       clean_label = _common.clean_label,
       validate_hostname = _common.validate_hostname,
       validate_wg_key = _common.validate_wg_key,
       validate_country_code = _common.validate_country_code,
       atomic_write = _common.atomic_write,
-      acquire_lock = _common.acquire_lock,
-      release_lock = _common.release_lock,
       iso_ts = _common.iso_ts,
       log = _common.log;
 
 const MAX_RESPONSE = 16 * 1024 * 1024; // hard cap per API response
 const CONNECT_TIMEOUT = 15;
 const TOTAL_TIMEOUT = 60;
-// Longest plausible gap between two progress writes of a running refresh: one
-// page (TOTAL_TIMEOUT) or the final sort and cache write, with ample slack for
-// a slow router. A 'running' record older than this has no live worker.
+// Used only when reading pre-upgrade, identity-less progress records.
 const FETCH_STALL = 300;
+const refresh_slot = require('nordvpn.jobs').create(FETCH_STATUS_FILE, null, { live_until_exit: true });
 
 // ── JSON / HTTP helpers ──────────────────────────────────────────────
 
@@ -98,37 +94,53 @@ function read_fetch_status() {
 	return safe_json(data);
 }
 
-// Is this 'running' record backed by a live worker? Its writer must still
-// exist and have reported progress recently. `now` is injectable for tests.
-// Pure apart from the /proc lookup.
+// Legacy records keep their old recovery rules; new records use exact process
+// identity and advisory execution ownership, without an age ceiling.
 function fetch_running(st, now) {
-	if (type(st) != 'object' || st.state != 'running')
-		return false;
+	if (type(st) != 'object' || st.state != 'running') return false;
+	if (st.id) return refresh_slot.active(st);
 	now = now || time();
 	let at = (type(st.updated_at_epoch) == 'int') ? st.updated_at_epoch : 0;
-	// Routers have no RTC: a stamp far in the future is as implausible as an
-	// old one once NTP moves the clock.
-	if (!at || (now - at) > FETCH_STALL || at > (now + 60))
-		return false;
-	if (type(st.pid) == 'int' && st.pid > 0 && stat('/proc/self') && !stat('/proc/' + st.pid))
-		return false;
-	return true;
+	return !!(at && now - at <= FETCH_STALL && at <= now + 60 &&
+		(!st.pid || !stat('/proc/self') || stat('/proc/' + st.pid)));
 }
 
-// The fetch status as the UI should see it. A worker killed mid-refresh (the
-// OOM killer, a reboot of the daemon) leaves its last 'running' record behind
-// for good, which would keep the refresh button disabled and every new
-// refresh refused; such a record is reported as an error instead. Read-only.
-function fetch_status_report(now) {
+function report(st) {
+	if (!st) return st;
+	let out = { ...st, ...(st.progress || {}), state: st.state };
+	if (st.state == 'failed') {
+		out.state = 'error';
+		out.message = st.error;
+		if (st.progress && st.progress.phase == 'publishing')
+			out.message += '; cache publication may have succeeded; check the available server list';
+	} else if (st.state == 'done') out.phase = 'done';
+	return out;
+}
+
+function fetch_status_report(now, id) {
 	let st = read_fetch_status();
-	if (type(st) != 'object' || st.state != 'running' || fetch_running(st, now))
-		return st;
-	st.state = 'error';
-	st.stale = true;
-	st.pid = null;
-	st.message = 'the server list refresh stopped unexpectedly';
+	if (id || (st && st.id)) return report(refresh_slot.status(id));
+	if (st && st.state == 'running' && !fetch_running(st, now))
+		return { ...st, state: 'error', stale: true, pid: null,
+			message: 'the server list refresh stopped unexpectedly' };
 	return st;
 }
+
+// A reservation is published before spawn, including scheduler forks. Busy
+// losers return the current identity and never write winner progress.
+function reservation_for_path(result, path) {
+	if (result.already_running && result.apply.context && result.apply.context.path != path)
+		return { busy: true, error: 'another cache path is being refreshed; retry when it finishes' };
+	return result;
+}
+function reserve_refresh(path) {
+	return reservation_for_path(refresh_slot.reserve('cache', 'refresh', { path: path }, 0), path);
+}
+function spawn_refresh(path, spawn) {
+	return reservation_for_path(refresh_slot.start('cache', 'refresh', { path: path }, 0, spawn), path);
+}
+
+function fail_refresh(id, error) { return refresh_slot.fail(id, error); }
 
 // ── Normalization ────────────────────────────────────────────────────
 
@@ -445,22 +457,21 @@ function normalize(list) {
 
 // ── Full paginated fetch ─────────────────────────────────────────────
 
-function fetch_servers() {
+function fetch_servers(progress, http) {
+	let notify = progress || function() { return true; };
+	let get = http || http_get;
 	let acc = new_accumulator();
 	let offset = 0, pages = 0, last_page = 0;
 	let started = iso_ts();
 
-	write_fetch_status({ state: 'running', started_at: started, page_size: PAGE_SIZE,
-		pages: 0, loaded: 0, gateways: 0, source: SERVERS_URL });
+	if (!notify({ state: 'running', phase: 'fetching', started_at: started, page_size: PAGE_SIZE,
+		pages: 0, loaded: 0, gateways: 0, source: SERVERS_URL })) return { error: 'failed to publish refresh progress' };
 
 	while (pages < MAX_PAGES) {
 		let url = sprintf('%s?limit=%d&offset=%d&filters[servers_technologies][identifier]=wireguard_udp',
 			SERVERS_URL, PAGE_SIZE, offset);
-		let r = http_get(url);
+		let r = get(url);
 		if (!r.ok) {
-			write_fetch_status({ state: 'error', message: r.error, pages: pages,
-				page_size: PAGE_SIZE, loaded: acc.stats.servers_seen,
-				gateways: acc.stats.gateways, source: SERVERS_URL });
 			return { error: r.error };
 		}
 
@@ -472,9 +483,6 @@ function fetch_servers() {
 				index(lower, 'banned you temporarily') >= 0)
 				? 'NordVPN API rate limited (Cloudflare); wait a few minutes and retry'
 				: 'failed to parse NordVPN server response';
-			write_fetch_status({ state: 'error', message: msg, pages: pages,
-				page_size: PAGE_SIZE, loaded: acc.stats.servers_seen,
-				gateways: acc.stats.gateways, source: SERVERS_URL });
 			return { error: msg };
 		}
 
@@ -487,9 +495,9 @@ function fetch_servers() {
 
 		pages++;
 		offset += PAGE_SIZE;
-		write_fetch_status({ state: 'running', started_at: started, page_size: PAGE_SIZE,
+		if (!notify({ state: 'running', phase: 'fetching', started_at: started, page_size: PAGE_SIZE,
 			pages: pages, last_page: last_page, loaded: acc.stats.servers_seen,
-			gateways: acc.stats.gateways, source: SERVERS_URL });
+			gateways: acc.stats.gateways, source: SERVERS_URL })) return { error: 'failed to publish refresh progress' };
 
 		if (last_page < PAGE_SIZE)
 			break;
@@ -497,9 +505,6 @@ function fetch_servers() {
 
 	if (pages >= MAX_PAGES) {
 		let msg = 'pagination safety limit reached';
-		write_fetch_status({ state: 'error', message: msg, pages: pages,
-			page_size: PAGE_SIZE, loaded: acc.stats.servers_seen,
-			gateways: acc.stats.gateways, source: SERVERS_URL });
 		return { error: msg };
 	}
 
@@ -507,14 +512,40 @@ function fetch_servers() {
 	resp.pagination = { page_size: PAGE_SIZE, pages: pages,
 		servers_seen: acc.stats.servers_seen, last_page_size: last_page };
 
-	write_fetch_status({ state: 'done', page_size: PAGE_SIZE, pages: pages,
-		last_page: last_page, loaded: acc.stats.servers_seen,
-		gateways: resp.stats.gateways, finished_at: iso_ts(), source: SERVERS_URL });
-
 	return resp;
 }
 
 // ── Cache read/write ─────────────────────────────────────────────────
+
+// Reject normalized trees that cannot serve a single usable gateway. Strict
+// count/ownership checks also prevent publishing partial malformed structures.
+function validate_cache(obj) {
+	if (type(obj) != 'object' || type(obj.countries) != 'array' || !length(obj.countries) ||
+		type(obj.stats) != 'object' || type(obj.generated_at) != 'string')
+		return 'server response contains no usable cache structure';
+	let cities = 0, gateways = 0;
+	for (let country in obj.countries) {
+		if (type(country) != 'object' || !validate_country_code(country.code) ||
+			type(country.name) != 'string' || type(country.cities) != 'array' || !length(country.cities))
+			return 'invalid country in normalized cache';
+		for (let city in country.cities) {
+			if (type(city) != 'object' || type(city.code) != 'string' || !length(city.code) ||
+				type(city.name) != 'string' || type(city.relays) != 'array' || !length(city.relays))
+				return 'invalid city in normalized cache';
+			cities++;
+			for (let relay in city.relays) {
+				if (type(relay) != 'object' || !validate_hostname(relay.hostname) ||
+					!validate_wg_key(relay.public_key) || relay.location != city.code ||
+					type(relay.port) != 'int' || relay.port < 1 || relay.port > 65535)
+					return 'invalid gateway in normalized cache';
+				gateways++;
+			}
+		}
+	}
+	if (!gateways || obj.stats.gateways != gateways || obj.stats.cities != cities ||
+		obj.stats.countries != length(obj.countries)) return 'unusable or inconsistent server response';
+	return null;
+}
 
 // Read the cache, rejecting malformed or schema-incompatible content.
 function read_cache(path) {
@@ -522,7 +553,7 @@ function read_cache(path) {
 	if (!data)
 		return null;
 	let obj = safe_json(data);
-	if (type(obj) != 'object' || obj.schema_version != CACHE_SCHEMA_VERSION)
+	if (type(obj) != 'object' || obj.schema_version != CACHE_SCHEMA_VERSION || validate_cache(obj))
 		return null;
 	return obj;
 }
@@ -543,43 +574,63 @@ function cache_is_stale(path) {
 	return is_stale(read_cache(path));
 }
 
-function write_cache(response, path) {
+function write_cache(response, path, writer) {
+	if (validate_cache(response)) return false;
 	response.cached_at = time();
 	response.schema_version = CACHE_SCHEMA_VERSION;
-	response.cache_info = {
-		created: iso_ts(),
-		expires_at: iso_ts(time() + CACHE_MAX_AGE)
-	};
-	let data = sprintf('%J', response);
-	if (!data || length(data) == 0)
-		return false;
-	return atomic_write(path, data);
+	response.cache_info = { created: iso_ts(), expires_at: iso_ts(time() + CACHE_MAX_AGE) };
+	return (writer || atomic_write)(path, sprintf('%J', response));
 }
 
-// Fetch all pages and persist the cache under a single-writer lock. Keeps the
-// previous cache when the refresh fails. Returns the response or { error }.
-function fetch_and_build(path) {
-	let lock = acquire_lock(CACHE_LOCK_FILE);
-	if (!lock)
-		return { error: 'refresh already in progress' };
-
-	let resp = fetch_servers();
-	if (!resp || resp.error) {
-		release_lock(lock);
-		return resp || { error: 'fetch failed' };
+// The outer coordinator alone owns terminal status. Its separate execution
+// slot spans normalization, readable replacement and terminal publication.
+// Explicit adapters are for offline failure injection only.
+function fetch_and_build(path, id, adapters) {
+	let a = adapters || {}, slot = a.slot || refresh_slot;
+	if (!id) {
+		let reservation = slot.reserve('cache', 'refresh', { path: path }, 0);
+		if (!reservation.started) return { error: reservation.error || 'refresh already in progress' };
+		id = reservation.apply.id;
 	}
-
-	let ok = write_cache(resp, path);
-	release_lock(lock);
-	if (!ok)
-		return { error: 'failed to write cache file: ' + path };
-
-	return resp;
+	let published = false, response = null;
+	let outcome = slot.run(id, 'cache', 'refresh', function(instance, context) {
+		if (context.path != path) return { error: 'refresh cache path does not match its reservation' };
+		let details = { phase: 'fetching', source: SERVERS_URL };
+		function progress(next) {
+			details = next;
+			return slot.progress(id, details);
+		}
+		let resp = fetch_servers(progress, a.http);
+		if (!resp || resp.error) return resp || { error: 'fetch failed' };
+		if (!progress({ ...details, phase: 'validating' })) return { error: 'failed to publish validation progress' };
+		let error = validate_cache(resp);
+		if (error) return { error: error };
+		if (!progress({ ...details, phase: 'publishing' })) return { error: 'failed to publish cache progress' };
+		resp.generation = id;
+		if (!write_cache(resp, path, a.write)) return { error: 'failed to write cache file: ' + path };
+		// Atomic replacement guarantees reader visibility; verify the same
+		// schema/structure through the production reader before claiming done.
+		published = true;
+		let readable = (a.read || read_cache)(path);
+		if (!readable || readable.generation != id) return { error: 'published cache generation is not readable: ' + path };
+		response = resp;
+		return { ok: true, generation: id, cached_at: resp.cached_at, stats: resp.stats };
+	});
+	if (outcome && outcome.ok) return response;
+	if (published) {
+		let error = 'cache replaced but refresh completion could not be confirmed; new cache retained: ' +
+			((outcome && outcome.error) || 'terminal status unavailable');
+		log(error);
+		return { error: error, cache_published: true };
+	}
+	if (outcome && outcome.skipped) return { error: 'refresh already in progress' };
+	return outcome || { error: 'refresh failed' };
 }
 
 return {
 	FETCH_STALL,
 	write_fetch_status, read_fetch_status, fetch_running, fetch_status_report, add_server, normalize,
-	locations_tree, city_relays, pool_relays,
+	locations_tree, city_relays, pool_relays, validate_cache,
+	reserve_refresh, spawn_refresh, fail_refresh,
 	fetch_servers, read_cache, is_stale, cache_is_stale, write_cache, fetch_and_build
 };

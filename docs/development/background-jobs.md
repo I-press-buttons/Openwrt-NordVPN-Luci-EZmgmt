@@ -64,10 +64,12 @@ Legacy flat status records remain readable with their previous wall-clock
 recovery behavior. Finish old workers before upgrading, or reboot after package
 installation: old workers cannot participate in new conditional transitions.
 Status/history live in `/tmp` and are intentionally lost on reboot. Empty or
-malformed status cannot be treated as success. The cache refresher and updater
-retain their separate formats and lifecycles. Later probes/cache workers may
-instantiate another slot with another status path, rather than contending for
-the tunnel execution slot.
+malformed status cannot be treated as success. The cache refresher instantiates a separate slot and exposes progress/legacy
+error mapping as described in [cache publication](cache-publication.md). Its
+optional `live_until_exit` policy keeps running ownership until process exit;
+`progress()` conditionally updates only the exact running worker. The updater
+retains its separate format and lifecycle. Later probes may instantiate another
+slot rather than contending for the tunnel execution slot.
 
 ## Validation and limits
 

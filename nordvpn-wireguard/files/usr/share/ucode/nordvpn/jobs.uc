@@ -50,7 +50,8 @@ function write(path, value) {
 	return true;
 }
 
-function create(path, adapters) {
+function create(path, adapters, options) {
+	let opts = options || {};
 	let a = adapters || {};
 	let load = a.read || function() { return read(path); };
 	let save = a.write || function(value) { return write(path, value); };
@@ -92,7 +93,8 @@ function create(path, adapters) {
 	}
 
 	function publish(st) {
-		st.updated_at = c.iso_ts(clock());
+		st.updated_at_epoch = clock();
+		st.updated_at = c.iso_ts(st.updated_at_epoch);
 		return save(st);
 	}
 
@@ -109,6 +111,9 @@ function create(path, adapters) {
 			return type(started) == 'int' && started > 0 && started <= now + 60 &&
 				now - started <= max && (!st.pid || process(st.pid) != null);
 		}
+		// Some bounded, paginated workers have no useful total wall deadline.
+		if (opts.live_until_exit && st.phase == 'running')
+			return !!(st.pid && st.owner && process(st.pid) == st.owner);
 		let stamp = st.phase == 'queued' ? st.queued_at_uptime : st.started_at_uptime;
 		let current_uptime = monotonic();
 		if (current_uptime == null) return false;
@@ -235,6 +240,16 @@ function create(path, adapters) {
 		});
 	}
 
+	function progress(id, details) {
+		return metadata(function() {
+			let st = load();
+			if (!st || st.id != id || st.phase != 'running' || st.pid != pid() || st.owner != process(pid()))
+				return false;
+			st.progress = details;
+			return publish(st);
+		}) == true;
+	}
+
 	function run(id, instance, kind, work) {
 		let execution = lock(execution_path);
 		if (!execution) return { skipped: true, reason: kind == 'apply' ? 'apply already running' : 'an apply or rotation is already running' };
@@ -282,7 +297,7 @@ function create(path, adapters) {
 		return outcome;
 	}
 
-	return { reserve, spawned, fail, start, run, status, active,
+	return { reserve, spawned, fail, start, run, status, active, progress,
 		read: function() { return public_record(load()); },
 		// Legacy writer for callers migrating old records; normal transitions
 		// above are always conditional on identity and ownership under metadata.
