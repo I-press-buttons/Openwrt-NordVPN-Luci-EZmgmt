@@ -226,8 +226,7 @@ function refresh_step(uci, now) {
 	}
 }
 
-function instance_step(uci, inst, now, hm) {
-	let s = load_settings(uci, inst);
+function instance_step(uci, inst, now, hm, s, runtime) {
 	// One read of the per-instance state serves the rotation clock and the
 	// watchdog below (mark_attempt only adds the clock field).
 	let st = read_state(inst) || {};
@@ -274,7 +273,7 @@ function instance_step(uci, inst, now, hm) {
 			return;
 	}
 
-	let cur = status(uci, inst, s);
+	let cur = status(uci, inst, s, runtime());
 	if (should_probe(s, cur.state) && cur.device && cur.gateway &&
 	    !in_flight(probing[inst] || 0, now, PROBE_STUCK))
 		start_probe(inst, cur.device, cur.gateway, s.probe_targets);
@@ -342,9 +341,20 @@ function tick() {
 		} catch (e) {
 			log('scheduler: server list refresh: ' + errmsg(e));
 		}
+		let settings = [];
 		for (let name in list_instances(uci)) {
+			try { push(settings, load_settings(uci, name)); }
+			catch (e) { log('scheduler: instance ' + name + ': ' + errmsg(e)); }
+		}
+		let snapshot = null;
+		let runtime = function() {
+			if (!snapshot) snapshot = _status.collect_runtime(settings, now);
+			return snapshot;
+		};
+		for (let s in settings) {
+			let name = s.name;
 			try {
-				instance_step(uci, name, now, hm);
+				instance_step(uci, name, now, hm, s, runtime);
 			} catch (e) {
 				log('scheduler: instance ' + name + ': ' + errmsg(e));
 			}

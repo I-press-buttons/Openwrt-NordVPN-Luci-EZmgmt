@@ -288,7 +288,7 @@ ok('clear_credentials removes the key', global.MOCK_UCI.network.nordvpn.private_
 				nordvpn_country_code: 'ee', nordvpn_location: 'ee-tallinn' },
 			peer: { '.type': 'wireguard_nordvpn', interface: 'nordvpn',
 				nordvpn_gateway: 'ee70.nordvpn.com', public_key: KEY } } };
-	global.MOCK_UBUS = { 'network.interface.nordvpn~status': { up: true, l3_device: 'nordvpn', uptime: 42 } };
+	global.MOCK_UBUS = { 'network.interface~dump': { interface: [ { interface: 'nordvpn', up: true, l3_device: 'nordvpn', uptime: 42 } ] } };
 	let open_before = global.MOCK_UBUS_OPEN || 0;
 	let ov = m.overview.call();
 	eq('overview: one entry per instance, main first', map(ov.instances, (i) => i.instance), [ 'main', 'second' ]);

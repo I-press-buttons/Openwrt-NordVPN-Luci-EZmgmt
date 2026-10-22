@@ -10,12 +10,17 @@
 'use strict';
 
 export function connect() {
+	global.MOCK_UBUS_CONNECTS = (global.MOCK_UBUS_CONNECTS || 0) + 1;
+	if (global.MOCK_UBUS_CONNECT_THROW) die('injected ubus connect failure');
 	let err = null;
 	global.MOCK_UBUS_OPEN = (global.MOCK_UBUS_OPEN || 0) + 1;
 	let closed = false;
 	return {
 		call: function(object, method, args) {
 			let key = object + '~' + method;
+			if (!global.MOCK_UBUS_CALLS) global.MOCK_UBUS_CALLS = [];
+			push(global.MOCK_UBUS_CALLS, key);
+			if (global.MOCK_UBUS_THROW) die('injected ubus call failure');
 			let resp = global.MOCK_UBUS ? global.MOCK_UBUS[key] : null;
 			if (resp == null) {
 				err = 'Method not found';
