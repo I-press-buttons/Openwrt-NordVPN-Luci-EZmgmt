@@ -73,3 +73,15 @@ msgstr ""
 #: htdocs/luci-static/resources/view/nordvpn/overview.js
 msgid "Update status unavailable. If an update is running, wait for LuCI services to restart, then reload this page."
 msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js
+msgid "Server list unavailable."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js
+msgid "Could not read server list: %s"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js
+msgid "Retry"
+msgstr ""

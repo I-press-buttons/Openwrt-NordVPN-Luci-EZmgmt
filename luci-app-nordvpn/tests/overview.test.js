@@ -17,9 +17,16 @@ String.prototype.format = function() {
 var uci = {
 	get: function(config, section, option) {
 		var sec = uciValues[section] || {};
-		return option ? sec[option] : sec;
+		return option ? sec[option] : uciValues[section];
 	},
-	set: function() { uciWrites.push(Array.prototype.slice.call(arguments)); },
+	set: function(config, section, option, value) {
+		uciWrites.push(Array.prototype.slice.call(arguments));
+		(uciValues[section] || (uciValues[section] = {}))[option] = value;
+	},
+	unset: function(config, section, option) {
+		uciWrites.push(Array.prototype.slice.call(arguments));
+		delete (uciValues[section] || {})[option];
+	},
 	unload: function() {},
 	load: function() { return Promise.resolve(); },
 	save: function() { return Promise.resolve(); }
@@ -50,7 +57,9 @@ var context = {
 			}
 		}[name];
 		},
-	L: { bind: function(fn, obj) { return fn.bind(obj); } }
+	L: { bind: function(fn, obj) { return fn.bind.apply(fn, Array.prototype.slice.call(arguments, 1)); } },
+	setTimeout: function() {},
+	document: { addEventListener: function() {} }
 };
 context.view = context.require('view');
 context.rpc = context.require('rpc');
@@ -72,7 +81,283 @@ assert.strictEqual(app.routingOnlyChange({ killswitch: JSON.stringify('0') },
 assert.strictEqual(app.routingOnlyChange({ fixed_server: JSON.stringify('old') },
 	{ fixed_server: JSON.stringify('new') }), false, 'server changes require reconnecting');
 
+function deferred() {
+	var resolve, reject;
+	var promise = new Promise(function(yes, no) { resolve = yes; reject = no; });
+	return { promise: promise, resolve: resolve, reject: reject };
+}
+
+async function draftTests() {
+	// A small DOM executes the real connection widgets, their bound callbacks,
+	// form replacement, UCI collection and save/discard flows.
+	context.dom.create = function(tag, attrs, children) {
+		return { tag: tag, attrs: attrs || {}, children: children || [], value: (attrs || {}).value || '',
+			style: {}, events: {}, classList: { add: function() {}, remove: function() {}, toggle: function() {} },
+			addEventListener: function(name, fn) { this.events[name] = fn; },
+			appendChild: function(child) { if (!Array.isArray(this.children)) this.children = [this.children]; this.children.push(child); } };
+	};
+	context.dom.content = function(node, value) { node.children = value; };
+	context.window.confirm = function() { return true; };
+	context.poll.remove = function() {};
+	function textOf(node) {
+		if (node == null) return '';
+		if (typeof node !== 'object') return '' + node;
+		if (Array.isArray(node)) return node.map(textOf).join('');
+		return textOf(node.children);
+	}
+	var requests, view;
+	function fixture(pin, rotation) {
+		uciValues = { main: { fixed_server: pin || '', locations: ['de'], hop_mode: 'single', mtu: '1420', rotation_enabled: rotation ? '1' : '0' },
+			other: { fixed_server: 'other-pin', locations: ['de'], hop_mode: 'single' } };
+		uciWrites.length = 0;
+		requests = [];
+		calls.servers = function(codes, hop, group) {
+			var request = deferred(); request.query = [ codes.slice(), hop, group ]; requests.push(request);
+			return request.promise;
+		};
+		calls.commit = function() { return Promise.resolve(); };
+		uci.save = function() { return Promise.resolve(); };
+		uci.load = function() { return Promise.resolve(); };
+		calls.instances = function() { return Promise.resolve({ instances: [
+			{ instance: 'main', enabled: false, routing: { mode: 'auto' } },
+			{ instance: 'other', enabled: false, routing: { mode: 'auto' } }
+		] }); };
+		view = Object.assign({}, app, { instance: 'main', status: { enabled: false }, _connectionState: null,
+			_otherDirty: false, _saving: false, dirty: false, refs: {}, credNode: {}, formNode: {},
+			saveBtn: {}, discardBtn: {}, locations: { countries: [{ code: 'de', name: 'Germany', single: 2, multi: 2, onion: 2, p2p: 2,
+				cities: [{ code: 'de-berlin', name: 'Berlin', single: 2, multi: 2, onion: 2, p2p: 2 }] },
+				{ code: 'fr', name: 'France', single: 2, multi: 2, onion: 2, p2p: 2,
+					cities: [{ code: 'fr-paris', name: 'Paris', single: 2, multi: 2, onion: 2, p2p: 2 }] }] },
+			// Keep unrelated panels small; their ordinary input is a real view input.
+			buildCredentials: function() { return []; }, buildRoutingSection: function() { return []; },
+			buildAdvanced: function() {
+				return [ this.input('mtu', 'text', uci.get('nordvpn', this.instance, 'mtu') || '1420'),
+					this.input('cache_dir', 'text', uci.get('nordvpn', 'main', 'cache_dir') || '') ];
+			}, updateInstancesTable: function() {}, updateStatusBand: function() {}, refreshHistory: function() {},
+			notice: function(message) { this.lastNotice = message; return {}; }, dismiss: function() {},
+			clearChangeIndicator: function() {} });
+		view.buildFormSections();
+		return view;
+	}
+	async function finish(request, result, fail) {
+		if (fail) request.reject(new Error(result));
+		else request.resolve(result || { relays: [] });
+		await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+	}
+	function assertPin(pin, message) {
+		assert.strictEqual(view._serverChosen, pin, message);
+		assert(textOf(view.srvTrigger).includes(pin || 'Automatic server'), 'visible picker agrees with the draft');
+		view.collectIntoUci();
+		assert.strictEqual(uciValues[view.instance].fixed_server || '', pin, 'UCI collection writes the visible pin');
+	}
+
+	// Focused original regression: initial list RPC returns after a new pin.
+	fixture('persisted-pin');
+	view.srvSetChosen('edited-pin');
+	await finish(requests[0]);
+	assertPin('edited-pin', 'server-list completion cannot overwrite a newly selected pin');
+	assert(textOf(view.srvTrigger).includes('(not in the set)'), 'absent pins stay visible as unavailable');
+
+	fixture('persisted-pin');
+	view.srvSetChosen('');
+	await finish(requests[0]);
+	assertPin('', 'server-list completion cannot restore an explicitly cleared pin');
+	assert.strictEqual(view.dirty, true);
+	view.srvSetChosen('persisted-pin');
+	assert.strictEqual(view.dirty, false, 'returning to the persisted connection values clears dirty state');
+
+	fixture('', true);
+	view.srvSetChosen('temporary-pin');
+	view.srvSetChosen('');
+	assert.strictEqual(view.rotEnable.checked, false, 'pinning explicitly disables scheduled rotation');
+	assert.strictEqual(view.dirty, true, 'clearing a temporary pin retains the changed rotation setting as dirty');
+	view.collectIntoUci();
+	assert.strictEqual(uciValues.main.rotation_enabled, '0', 'the changed rotation setting reaches UCI');
+
+	fixture('persisted-pin');
+	view.poolSetWhole('fr');
+	view.setHopMode('multihop');
+	await finish(requests[requests.length - 1]);
+	await finish(requests[0], 'superseded failure', true);
+	assert.strictEqual(view.hopMode(), 'multihop');
+	assert.strictEqual(view.poolEntries.map(function(e) { return e.code; }).join(','), 'de,fr');
+	assert.strictEqual(textOf(view.srvError), '', 'a superseded error cannot replace latest success');
+	assertPin('persisted-pin', 'location and hop responses preserve the pin');
+	assert.strictEqual(uciValues.main.hop_mode, 'multihop');
+	assert.strictEqual(uciValues.main.locations.join(','), 'de,fr');
+
+	fixture('persisted-pin');
+	view.poolSetWhole('fr');
+	await finish(requests[1], { relays: [{ hostname: 'new-data' }] });
+	await finish(requests[0], { relays: [{ hostname: 'old-data' }] });
+	assert.strictEqual(view.srvRelayByHost('old-data'), null, 'older same-context success cannot overwrite newer server data');
+	assert(view.srvRelayByHost('new-data'));
+
+	fixture('persisted-pin');
+	view.p2pBox.checked = true;
+	view.p2pBox.attrs.change();
+	assert.strictEqual(requests[1].query[2], 'p2p', 'group callback queries the edited group');
+	await finish(requests[0]);
+	await finish(requests[1], { error: 'offline' });
+	assert(textOf(view.srvError).includes('offline') && textOf(view.srvError).includes('Retry'), 'latest list error is visible and retryable');
+	assertPin('persisted-pin', 'group changes and failures preserve the pin');
+	assert.strictEqual(uciValues.main.server_group, 'p2p');
+	var retry = view.srvError.children[2];
+	var retryPromise = retry.attrs.click();
+	await finish(requests[2]); await retryPromise;
+	assert.strictEqual(textOf(view.srvError), '', 'successful retry clears the error');
+
+	fixture('persisted-pin');
+	view.srvSetChosen('edited-pin');
+	await view.discard();
+	await finish(requests[0], 'late discarded failure', true);
+	await finish(requests[1]);
+	assertPin('persisted-pin', 'discard restores persisted values and invalidates earlier requests');
+	assert.strictEqual(view.dirty, false);
+
+	fixture('persisted-pin');
+	view.srvSetChosen('edited-pin');
+	view.selectInstance('other');
+	await finish(requests[1]);
+	await finish(requests[0], { relays: [{ hostname: 'old-instance-data' }] });
+	assertPin('other-pin', 'instance switch rejects old form results even when query generations overlap');
+	assert.strictEqual(view.srvRelayByHost('old-instance-data'), null);
+
+	fixture('persisted-pin');
+	view.srvSetChosen('saved-pin');
+	var oldRequest = requests[0];
+	await view.save();
+	await finish(oldRequest, { relays: [{ hostname: 'old-form-data' }] });
+	await finish(requests[1]);
+	assertPin('saved-pin', 'successful save synchronization retains the saved pin after late list responses');
+	assert.strictEqual(view.dirty, false);
+
+	fixture('persisted-pin');
+	view.srvSetChosen('edited-pin');
+	var load = deferred(); uci.load = function() { return load.promise; };
+	var discarding = view.discard();
+	await finish(requests[0], { relays: [{ hostname: 'discarded-data' }] });
+	assert.strictEqual(view.srvRelayByHost('discarded-data'), null, 'discard invalidates a pending list before config load completes');
+	load.resolve(); await discarding;
+	assertPin('persisted-pin', 'delayed discard restores persisted values');
+
+	fixture('persisted-pin');
+	view.srvSetChosen('saved-pin');
+	var commit = deferred(); calls.commit = function() { return commit.promise; };
+	var saving = view.save();
+	await Promise.resolve(); await Promise.resolve();
+	view.srvSetChosen('newer-pin');
+	view.refs.mtu.value = '1380'; view.refs.mtu.events.input();
+	await finish(requests[0]);
+	commit.resolve(); await saving;
+	assert.strictEqual(view._connectionState.baseline.fixed_server, 'saved-pin', 'successful save establishes the captured snapshot as baseline');
+	assert.strictEqual(uciValues.main.fixed_server, 'saved-pin', 'pending save writes the captured pin');
+	assert.strictEqual(view.refs.mtu.value, '1380', 'save completion retains later nonconnection edits');
+	assert.strictEqual(view.dirty, true);
+	assertPin('newer-pin', 'save completion retains the newer visible pin and its eventual UCI value');
+
+	fixture('persisted-pin');
+	view.srvSetChosen('saved-pin');
+	var statusRead = deferred(); calls.instances = function() { return statusRead.promise; };
+	saving = view.save();
+	await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+	view.srvSetChosen('after-commit-pin');
+	view.refs.mtu.value = '1360'; view.refs.mtu.events.input();
+	statusRead.resolve({ instances: [{ instance: 'main', enabled: false, routing: { mode: 'manual' } }] });
+	await saving;
+	assert.strictEqual(view.refs.mtu.value, '1360', 'late post-save status refresh preserves newer ordinary inputs');
+	assertPin('after-commit-pin', 'post-save refresh cannot replace edits made after commit');
+
+	fixture('persisted-pin');
+	view.cacheRow = {}; view._cacheJob = 'draft-refresh';
+	calls.refresh_status = function() { return Promise.resolve({ id: 'draft-refresh', state: 'done' }); };
+	var locationsRead = deferred(); calls.locations = function() { return locationsRead.promise; };
+	var refreshing = view.pollCacheOnce({});
+	await Promise.resolve(); await Promise.resolve();
+	view.selectInstance('other');
+	view.srvSetChosen('other-refresh-edit');
+	locationsRead.resolve(view.locations); await refreshing;
+	await finish(requests[requests.length - 1]);
+	assertPin('other-refresh-edit', 'late cache refresh across an instance switch preserves the new draft');
+
+	fixture('persisted-pin');
+	view.srvSetChosen('edited-pin');
+	view.refs.mtu.value = '1380'; view.refs.mtu.events.input();
+	uci.save = function() { return Promise.reject(new Error('save offline')); };
+	await view.save();
+	await finish(requests[0]);
+	assert.strictEqual(uciValues.main.fixed_server, 'persisted-pin', 'failed save restores staged UCI baseline');
+	assert.strictEqual(uciValues.main.mtu, '1420');
+	assert.strictEqual(view.refs.mtu.value, '1380');
+	assert.strictEqual(view.dirty, true, 'failed save retains editable state');
+	assert.strictEqual(view.saveBtn.disabled, false, 'failed save is retryable');
+	// Discard also restores other fields after failed UCI staging.
+	await view.discard();
+	assert.strictEqual(view.refs.mtu.value, '1420');
+	assertPin('persisted-pin', 'discard after failure restores the original pin');
+
+	fixture('persisted-pin');
+	view.srvSetChosen('saved-pin');
+	commit = deferred(); calls.commit = function() { return commit.promise; };
+	saving = view.save();
+	await Promise.resolve(); await Promise.resolve();
+	view.selectInstance('other');
+	view.srvSetChosen('other-edit');
+	commit.resolve(); await saving;
+	assertPin('other-edit', 'old-instance save completion cannot overwrite the new instance draft');
+	assert.strictEqual(view._connectionState.baseline.fixed_server, 'other-pin');
+
+	fixture('persisted-pin');
+	view.srvSetChosen('edited-pin');
+	commit = deferred(); calls.commit = function() { return commit.promise; };
+	saving = view.save();
+	await Promise.resolve(); await Promise.resolve();
+	view.srvSetChosen('later-edit');
+	commit.reject(new Error('commit offline')); await saving;
+	await finish(requests[0], 'list offline', true);
+	assert.strictEqual(view.dirty, true);
+	assertPin('later-edit', 'late commit and refresh failures preserve newer edits');
+
+	fixture('persisted-pin');
+	view.srvSetChosen('edited-pin');
+	view.refs.cache_dir.value = '/tmp/saving-cache'; view.refs.cache_dir.events.input();
+	commit = deferred(); calls.commit = function() { return commit.promise; };
+	saving = view.save();
+	await Promise.resolve(); await Promise.resolve();
+	uciValues.main.external_option = 'new action';
+	uciValues.main.mtu = '1300';
+	uciValues.main.fixed_server = 'external-pin';
+	uciValues.main.cache_dir = '/tmp/new-action-cache';
+	commit.reject(new Error('commit offline')); await saving;
+	assert.strictEqual(uciValues.main.external_option, 'new action', 'failed save preserves newly introduced options');
+	assert.strictEqual(uciValues.main.mtu, '1300', 'failed save preserves options this save did not change');
+	assert.strictEqual(uciValues.main.fixed_server, 'external-pin', 'failed save preserves staged fields subsequently changed by another action');
+	assert.strictEqual(uciValues.main.cache_dir, '/tmp/new-action-cache', 'failed save preserves newer shared cache settings');
+	assert.strictEqual(view._serverChosen, 'edited-pin', 'conditional staging rollback does not replace the editable pin');
+
+	fixture('persisted-pin');
+	view.srvSetChosen('edited-pin');
+	commit = deferred(); calls.commit = function() { return commit.promise; };
+	saving = view.save();
+	await Promise.resolve(); await Promise.resolve();
+	delete uciValues.main;
+	commit.reject(new Error('deleted while saving')); await saving;
+	assert.strictEqual(uciValues.main, undefined, 'failed save cannot recreate a deleted instance');
+	assert.strictEqual(view._serverChosen, 'edited-pin');
+
+	fixture('persisted-pin');
+	view._routingMode = 'manual';
+	view.refs.mtu.value = '1380'; view.refs.mtu.events.input();
+	var oldInput = view.refs.mtu;
+	await view.refreshStatus();
+	assert.strictEqual(view.refs.mtu, oldInput, 'status-driven routing changes cannot rebuild a dirty nonconnection field');
+	assert.strictEqual(view.refs.mtu.value, '1380');
+	uci.save = function() { return Promise.resolve(); };
+	calls.commit = function() { return Promise.resolve(); };
+}
+
 async function run() {
+	await draftTests();
 	// Watch the returned job ID even if a newer identical operation starts.
 	var originalTimer = context.window.setTimeout;
 	context.window.setTimeout = function(fn) { fn(); };
