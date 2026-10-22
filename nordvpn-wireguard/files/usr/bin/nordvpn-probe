@@ -1,0 +1,9 @@
+#!/usr/bin/ucode -S
+// SPDX-License-Identifier: MIT
+// Detached IP-insights worker; all remote HTTP work lives outside rpcd.
+'use strict';
+const c = require('nordvpn.common');
+let name = c.validate_instance(ARGV[0]);
+if (!name || ARGV[1] != '--job-id' || !ARGV[2]) exit(1);
+let result = require('nordvpn.probes').service.run(name, ARGV[2]);
+exit(result && result.ok ? 0 : 1);

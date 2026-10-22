@@ -50,8 +50,16 @@ function acquire(names, wait) {
 			}
 			push(locks, token);
 		}
-		if (busy == null)
+		if (busy == null) {
+			// Invalidate even a reconnect to the same gateway. Probes cannot
+			// start or publish while these instance locks remain held.
+			let invalidated = require('nordvpn.probe_state').store.bump(names);
+			if (invalidated.error) {
+				release(locks);
+				return { busy: true, error: invalidated.error, instances: names };
+			}
 			return { locks: locks, instances: names };
+		}
 		release(locks);
 		if (attempt >= (wait || 0) * 10)
 			return { busy: true, instance: busy, instances: names,

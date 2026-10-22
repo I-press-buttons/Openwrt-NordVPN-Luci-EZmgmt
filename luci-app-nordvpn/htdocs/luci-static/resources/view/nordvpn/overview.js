@@ -74,7 +74,8 @@ var callRefreshLocations = rpc.declare({ object: 'nordvpn', method: 'refresh_loc
 // it runs as a job exactly like an apply (see callApplyStart) and is watched
 // through apply_status. `rotate_now` stays in the backend for the CLI only.
 var callRotateStart = rpc.declare({ object: 'nordvpn', method: 'rotate_start', params: [ 'instance' ] });
-var callExternalIp = rpc.declare({ object: 'nordvpn', method: 'external_ip', params: [ 'instance' ] });
+var callExternalIpStatus = rpc.declare({ object: 'nordvpn', method: 'external_ip_status', params: [ 'instance', 'id' ] });
+var callExternalIpStart = rpc.declare({ object: 'nordvpn', method: 'external_ip_start', params: [ 'instance' ] });
 var callClients = rpc.declare({ object: 'nordvpn', method: 'clients' });
 var callDisconnect = rpc.declare({ object: 'nordvpn', method: 'disconnect', params: [ 'instance' ] });
 var callDisableAll = rpc.declare({ object: 'nordvpn', method: 'disable_all' });
@@ -692,11 +693,9 @@ return view.extend({
 			details.push(_('Kill switch is blocking LAN traffic'));
 		var protLine = null;
 		if (s.state === 'connected') {
-			var ipKey = this.instance + '|' + (s.gateway || '');
-			if (this.extIp && this.extIp.key === ipKey)
-				protLine = this.protectionLine(this.extIp.res);
-			else
-				this.maybeFetchExternalIp(ipKey);
+			var ipKey = this.externalIpKey();
+			protLine = this.externalIpLine(ipKey);
+			this.maybeFetchExternalIp(ipKey);
 		}
 		if (s.rotation && s.rotation.enabled)
 			details.push(_('Automatic rotation is on'));
@@ -721,23 +720,69 @@ return view.extend({
 		]));
 	},
 
-	// Ask NordVPN how it sees the tunnel once per instance+gateway combination
-	// (the status poll runs every 5 s; the API would rate-limit that). A
-	// failed lookup is remembered too, so it is not retried on every poll.
+	externalIpKey: function() {
+		return this.instance + '|' + ((this.status || {}).probe_generation || '');
+	},
+
+	// A pending, expired or failed observation never retains protected styling.
+	externalIpLine: function(key) {
+		var observation = this.extIp && this.extIp.key === key ? this.extIp.observation : null;
+		var state = observation ? observation.state : 'pending';
+		if (state === 'fresh' && Date.now() < this.extIp.expires)
+			return this.protectionLine(observation.result);
+		if (state === 'fresh') state = 'stale';
+		var text = state === 'failed' ? _('Protection check failed: %s').format(observation.error || _('unknown error')) :
+			(state === 'pending' ? _('Protection check pending') : _('Protection check is stale'));
+		return E('div', { class: 'nv-status-details' }, text);
+	},
+
+	// Only local cache/status and launch RPCs. Normal status polling drives
+	// exact-ID probe polling independently; no remote timeout holds rpcd or UI.
 	maybeFetchExternalIp: function(key) {
-		if (this._extIpPending === key)
-			return;
-		this._extIpPending = key;
-		callExternalIp(this.instance).then(L.bind(function(res) {
-			if (this._extIpPending !== key)
+		var instance = this.instance, form = this._formGeneration, now = Date.now();
+		if (this._extIpPending && this._extIpPending.key === key && this._extIpPending.form === form)
+			return this._extIpPending.promise;
+		if (this._extIpLastCheck && this._extIpLastCheck.key === key && now - this._extIpLastCheck.at < 4000)
+			return Promise.resolve();
+		var request = { key: key, form: form }, self = this;
+		this._extIpPending = request;
+		this._extIpLastCheck = { key: key, at: now };
+		function current() {
+			return self._extIpPending === request && instance === self.instance && form === self._formGeneration &&
+				key === self.externalIpKey() && (self.status || {}).state === 'connected';
+		}
+		function accept(res) {
+			if (!current()) return false;
+			if (res && res.generation && res.generation !== (self.status || {}).probe_generation) {
+				self.extIp = { key: key, observation: { state: 'stale' } };
+				return false;
+			}
+			res = res || { state: 'failed', error: _('Protection check unavailable') };
+			self.extIp = { key: key, observation: res, expires: Date.now() + Math.max(0, res.ttl_seconds || 0) * 1000 };
+			return true;
+		}
+		var previous = this.extIp && this.extIp.key === key ? this.extIp.observation : null;
+		var id = previous && previous.state === 'pending' ? previous.id : null;
+		request.promise = callExternalIpStatus(instance, id).then(function(res) {
+			if (id && (!res || res.id !== id)) {
+				accept({ state: 'failed', error: _('Protection check returned another job') });
 				return;
-			this._extIpPending = null;
-			this.extIp = { key: key, res: (res && !res.error) ? res : null };
-			if (this.extIp.res)
-				this.updateStatusBand();
-		}, this)).catch(L.bind(function() {
-			this._extIpPending = null;
-		}, this));
+			}
+			if (!accept(res)) return;
+			var writable = !L.hasViewPermission || L.hasViewPermission();
+			if (writable && (!self._extIpRetryAt || Date.now() >= self._extIpRetryAt) &&
+				(res.state === 'stale' || res.state === 'missing' || (res.state === 'failed' && !res.retry_after_seconds)))
+				return callExternalIpStart(instance).then(function(started) { accept(started); });
+		}).catch(function(error) {
+			if (!current()) return;
+			self._extIpRetryAt = Date.now() + 30000;
+			accept({ state: 'failed', error: String(error) });
+		}).then(function() {
+			if (!current()) return;
+			self._extIpPending = null;
+			self.updateStatusBand();
+		});
+		return request.promise;
 	},
 
 	// NordVPN's own verdict on the tunnel's exit (and, with "Route all LAN

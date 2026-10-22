@@ -68,8 +68,9 @@ malformed status cannot be treated as success. The cache refresher instantiates 
 error mapping as described in [cache publication](cache-publication.md). Its
 optional `live_until_exit` policy keeps running ownership until process exit;
 `progress()` conditionally updates only the exact running worker. The updater
-retains its separate format and lifecycle. Later probes may instantiate another
-slot rather than contending for the tunnel execution slot.
+retains its separate format and lifecycle. [Asynchronous protection probes](async-probes.md)
+use another slot and the read-only `peek()` accessor, which reports abandoned
+workers without recovery writes. A later write-side start owns recovery.
 
 ## Validation and limits
 

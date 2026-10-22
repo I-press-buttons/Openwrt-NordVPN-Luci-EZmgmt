@@ -356,8 +356,100 @@ async function draftTests() {
 	calls.commit = function() { return Promise.resolve(); };
 }
 
+async function probeTests() {
+	var legacyCalls = 0, starts = 0, renders = 0;
+	calls.external_ip = function() { legacyCalls++; return Promise.resolve({ protected: true }); };
+	function fixture(generation) {
+		return Object.assign({}, app, { instance: 'main', _formGeneration: 1,
+			status: { state: 'connected', gateway: 'same-server', probe_generation: generation || 'one' },
+			extIp: null, _extIpPending: null, _extIpLastCheck: null, _extIpRetryAt: null,
+			updateStatusBand: function() { renders++; } });
+	}
+	function textOf(node) {
+		if (node == null) return '';
+		if (typeof node !== 'object') return '' + node;
+		if (Array.isArray(node)) return node.map(textOf).join('');
+		return textOf(node.children);
+	}
+	var view = fixture(), requested = [];
+	calls.external_ip_status = function(instance, id) {
+		requested.push([instance, id]); return Promise.resolve({ state: 'stale', generation: 'one' });
+	};
+	calls.external_ip_start = function() { starts++; return Promise.resolve({ id: 'mine', state: 'pending', generation: 'one' }); };
+	await view.maybeFetchExternalIp(view.externalIpKey());
+	assert.strictEqual(starts, 1, 'stale observation launches one asynchronous worker');
+	assert.strictEqual(legacyCalls, 0, 'LuCI never calls the retained synchronous HTTP method');
+	assert(textOf(view.externalIpLine(view.externalIpKey())).includes('pending'), 'pending freshness is visible');
+	view._extIpLastCheck = null;
+	calls.external_ip_status = function(instance, id) {
+		requested.push([instance, id]);
+		return Promise.resolve({ id: 'mine', state: 'fresh', generation: 'one', ttl_seconds: 120,
+			result: { protected: true, ip: '1.2.3.4' } });
+	};
+	await view.maybeFetchExternalIp(view.externalIpKey());
+	assert.strictEqual(requested[1][1], 'mine', 'polling passes the precise worker ID');
+	assert(textOf(view.externalIpLine(view.externalIpKey())).includes('Protected by NordVPN'), 'fresh success displays provider verdict');
+	view.extIp.expires = 0;
+	assert(textOf(view.externalIpLine(view.externalIpKey())).includes('stale'), 'locally expired success loses protected styling immediately');
+	view.status.probe_generation = 'two';
+	assert(!textOf(view.externalIpLine(view.externalIpKey())).includes('Protected by NordVPN'), 'same-gateway reconnect cannot reuse old success');
+	view = fixture();
+	var delayed = deferred();
+	calls.external_ip_status = function() { return delayed.promise; };
+	var pending = view.maybeFetchExternalIp(view.externalIpKey());
+	assert.strictEqual(view.maybeFetchExternalIp(view.externalIpKey()), pending, 'one tab deduplicates a pending status request');
+	// A normal status RPC can finish before the delayed probe-status response.
+	var normalDone = false;
+	await Promise.resolve().then(function() { normalDone = true; });
+	assert(normalDone && view.extIp === null, 'probe polling does not hold normal status updates');
+	view.instance = 'other';
+	delayed.resolve({ state: 'fresh', generation: 'one', ttl_seconds: 120, result: { protected: true } });
+	await pending;
+	assert.strictEqual(view.extIp, null, 'late response cannot populate another instance');
+	view = fixture(); delayed = deferred();
+	calls.external_ip_status = function() { return delayed.promise; };
+	pending = view.maybeFetchExternalIp(view.externalIpKey());
+	view._formGeneration++;
+	delayed.resolve({ state: 'fresh', generation: 'one', ttl_seconds: 120, result: { protected: true } });
+	await pending;
+	assert.strictEqual(view.extIp, null, 'late response cannot populate a replaced form');
+	view = fixture(); delayed = deferred();
+	calls.external_ip_status = function() { return delayed.promise; };
+	pending = view.maybeFetchExternalIp(view.externalIpKey());
+	view.status.probe_generation = 'new-generation';
+	delayed.resolve({ state: 'fresh', generation: 'one', ttl_seconds: 120, result: { protected: true } });
+	await pending;
+	assert.strictEqual(view.extIp, null, 'late generation cannot restore protection after rotation');
+	view = fixture(); delayed = deferred();
+	calls.external_ip_status = function() { return delayed.promise; };
+	pending = view.maybeFetchExternalIp(view.externalIpKey());
+	view.status.state = 'disconnected';
+	delayed.reject(new Error('old request failed'));
+	await pending;
+	assert.strictEqual(view.extIp, null, 'late failure after disconnect cannot replace view context');
+	view = fixture();
+	view.extIp = { key: view.externalIpKey(), observation: { id: 'mine', state: 'pending' } };
+	calls.external_ip_status = function() { return Promise.resolve({ id: 'other-job', state: 'fresh', generation: 'one', ttl_seconds: 120, result: { protected: true } }); };
+	await view.maybeFetchExternalIp(view.externalIpKey());
+	assert.strictEqual(view.extIp.observation.state, 'failed', 'another job cannot satisfy an exact-ID watcher');
+	assert(!textOf(view.externalIpLine(view.externalIpKey())).includes('Protected by NordVPN'), 'failed status never keeps protected styling');
+	view = fixture(); var beforeStarts = starts;
+	calls.external_ip_status = function() { return Promise.resolve({ state: 'failed', generation: 'one', retry_after_seconds: 30, error: 'timeout' }); };
+	await view.maybeFetchExternalIp(view.externalIpKey());
+	assert.strictEqual(starts, beforeStarts, 'server backoff suppresses worker starts');
+	assert(textOf(view.externalIpLine(view.externalIpKey())).includes('timeout'), 'failed observation is visible');
+	view = fixture();
+	context.L.hasViewPermission = function() { return false; };
+	calls.external_ip_status = function() { return Promise.resolve({ state: 'stale', generation: 'one' }); };
+	await view.maybeFetchExternalIp(view.externalIpKey());
+	assert.strictEqual(starts, beforeStarts, 'read-only views inspect cache without starting probes');
+	delete context.L.hasViewPermission;
+	assert(renders > 0, 'accepted observations update the status band');
+}
+
 async function run() {
 	await draftTests();
+	await probeTests();
 	// Watch the returned job ID even if a newer identical operation starts.
 	var originalTimer = context.window.setTimeout;
 	context.window.setTimeout = function(fn) { fn(); };

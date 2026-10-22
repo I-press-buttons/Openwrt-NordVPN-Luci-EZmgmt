@@ -250,6 +250,20 @@ function create(path, adapters, options) {
 		}) == true;
 	}
 
+	// Read-only watchers must not recover/write records. An abandoned worker
+	// is reported as failed here; a subsequent write-side start recovers it.
+	function peek(id) {
+		let st = load();
+		if (id && (!st || st.id != id)) {
+			for (let previous in ((st && st.history) || []))
+				if (previous.id == id) return public_record(previous);
+			return { id: id, state: 'missing', error: 'job status is unavailable or expired' };
+		}
+		if (st && st.state == 'running' && !active(st))
+			return { ...public_record(st), state: 'failed', phase: 'failed', error: 'the ' + (st.kind || 'background') + ' worker stopped or exceeded its runtime limit' };
+		return public_record(st);
+	}
+
 	function run(id, instance, kind, work) {
 		let execution = lock(execution_path);
 		if (!execution) return { skipped: true, reason: kind == 'apply' ? 'apply already running' : 'an apply or rotation is already running' };
@@ -297,7 +311,7 @@ function create(path, adapters, options) {
 		return outcome;
 	}
 
-	return { reserve, spawned, fail, start, run, status, active, progress,
+	return { reserve, spawned, fail, start, run, status, active, progress, peek,
 		read: function() { return public_record(load()); },
 		// Legacy writer for callers migrating old records; normal transitions
 		// above are always conditional on identity and ownership under metadata.
