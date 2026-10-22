@@ -87,6 +87,111 @@ function deferred() {
 	return { promise: promise, resolve: resolve, reject: reject };
 }
 
+function pickerTests() {
+	context.dom.create = function(tag, attrs, children) {
+		return { tag: tag, attrs: attrs || {}, children: children || [], value: (attrs || {}).value || '', events: {},
+			classList: { add: function() {}, remove: function() {} },
+			addEventListener: function(name, fn) { this.events[name] = fn; }, focus: function() { context.document.activeElement = this; },
+			appendChild: function(child) { this.children.push(child); } };
+	};
+	context.dom.content = function(node, children) { node.children = children; };
+	var timers = new Map(), nextTimer = 0;
+	context.setTimeout = function(fn) { timers.set(++nextTimer, fn); return nextTimer; };
+	context.clearTimeout = function(id) { timers.delete(id); };
+	function flush() { var pending = Array.from(timers.values()); timers.clear(); pending.forEach(function(fn) { fn(); }); }
+	function nodes(node, test) {
+		if (!node || typeof node !== 'object') return [];
+		if (Array.isArray(node)) return node.flatMap(function(child) { return nodes(child, test); });
+		return (test(node) ? [node] : []).concat(nodes(node.children, test));
+	}
+	function css(node, name) { return (node.attrs.class || '').split(' ').includes(name); }
+	function rows(v) { return nodes(v.srvPanel, function(node) { return css(node, 'nv-srv-relay'); }); }
+	var relays = Array.from({ length: 125 }, function(_, i) {
+		return { hostname: 'host' + (125 - i), name: 'Server #' + (125 - i), country_code: 'de', city: i % 2 ? 'Berlin' : 'Bonn', load: 10 };
+	});
+	relays.push({ hostname: 'dedicated', name: 'Dedicated', country_code: 'de', load: 0, dedicated: true });
+	var v = Object.assign({}, app, { _ccNames: { de: 'Germany' }, status: { gateway: 'host100' }, _srvFilter: '',
+		_serverChosen: 'host110', srvPanel: context.dom.create('div'), srvTrigger: context.dom.create('button'),
+		markConnectionDirty: function() {}, updateRotationAvailability: function() {} });
+	v._serverData = { relays: relays };
+	v._serverIndex = v.srvBuildIndex(relays);
+	assert(Object.isFrozen(v._serverIndex) && Object.isFrozen(v._serverIndex.groups[0].rows), 'display index is immutable');
+	assert.strictEqual(v.srvRelayByHost('host5').hostname, 'host5');
+	assert.strictEqual(v.srvRelayByHost('absent'), null);
+	assert.strictEqual(v.srvLowestLoad().hostname, 'host1', 'numeric ties are deterministic and dedicated is excluded');
+	assert.strictEqual(v._serverIndex.groups[0].rows[1].relay.hostname, 'host1');
+	assert(Object.isFrozen(v._serverIndex.byHost.host5), 'indexed relays are immutable snapshots');
+	var grouped = v.srvBuildIndex([
+		{ hostname: 'fr2', country_code: 'fr', load: 2 }, { hostname: 'de-missing', country_code: 'de' },
+		{ hostname: 'de10', country_code: 'de', load: 10 }, { hostname: 'de2', country_code: 'de', load: 10 } ]);
+	assert.strictEqual(grouped.groups.map(function(g) { return g.name; }).join(','), 'FR,Germany', 'country groups sort by display name');
+	assert.strictEqual(grouped.groups[1].rows.map(function(r) { return r.relay.hostname; }).join(','), 'de2,de10,de-missing', 'missing names use hostname and missing loads sort last');
+	assert.strictEqual(v.srvBuildIndex([{ hostname: 'only-dedicated', load: 0, dedicated: true }, { hostname: 'no-load' }]).lowest, null);
+	var originalSort = Array.prototype.sort;
+	context.savedVmSort = vm.runInNewContext('Object.getPrototypeOf([]).sort', context);
+	try {
+		Array.prototype.sort = function() { throw new Error('filter/render must not sort'); };
+		vm.runInNewContext("Object.getPrototypeOf([]).sort = function() { throw new Error('filter/render must not sort'); };", context);
+		v.srvTogglePanel(); flush();
+		assert.strictEqual(rows(v).length, 50, 'initial DOM has only one page of relay rows');
+		assert.strictEqual(v._srvMatchCount, 126);
+		var more = nodes(v.srvPanel, function(n) { return css(n, 'nv-srv-more'); })[0];
+		more.focus(); more.attrs.click({ stopPropagation: function() {} });
+		assert.strictEqual(rows(v).length, 50, 'Show more replaces the page with at most fifty rows');
+		assert.strictEqual(context.document.activeElement, rows(v)[0], 'keyboard paging focuses the first new row');
+		nodes(v.srvPanel, function(n) { return css(n, 'nv-srv-more'); })[0].attrs.click({ stopPropagation: function() {} });
+		assert.strictEqual(rows(v).length, 26, 'all remaining relays are reachable on the last page');
+		assert.strictEqual(nodes(v.srvPanel, function(n) { return css(n, 'nv-srv-more'); }).length, 0);
+		nodes(v.srvPanel, function(n) { return css(n, 'nv-srv-prev'); })[0].attrs.click({ stopPropagation: function() {} });
+		assert.strictEqual(rows(v).length, 50, 'Previous returns to a full bounded page');
+		v._srvFilter = 'BERLIN'; v._srvOffset = 0; v.srvRenderList();
+		assert.strictEqual(rows(v).length, 50);
+		assert.strictEqual(v._srvMatchCount, 62, 'matching total excludes unmatched pin summaries');
+		assert.strictEqual(v._serverChosen, 'host110', 'rendering never changes draft selection');
+		v._srvFilter = 'HOST5'; v.srvRenderList();
+		assert.strictEqual(v._srvMatchCount, 11, 'hostname search is normalized and does not force unmatched pins into the results');
+		v._srvFilter = 'nothing'; v.srvRenderList();
+		assert.strictEqual(rows(v).length, 0);
+		assert.strictEqual(nodes(v.srvPanel, function(n) { return css(n, 'nv-srv-quick'); }).length, 2, 'quick controls survive empty filters');
+		v._serverChosen = 'missing'; v.srvRenderList();
+		assert.strictEqual(v._serverChosen, 'missing', 'missing pins are retained');
+	} finally { Array.prototype.sort = originalSort; vm.runInNewContext('Object.getPrototypeOf([]).sort = savedVmSort;', context); }
+	var filter = v._srvFilterEl;
+	filter.value = 'Berlin'; filter.events.input(); filter.value = 'Bonn'; filter.events.input();
+	assert.strictEqual(timers.size, 1, 'rapid input coalesces');
+	flush(); assert.strictEqual(v._srvFilter, 'Bonn');
+	filter.value = 'late'; filter.events.input(); v.srvClosePanel();
+	assert.strictEqual(timers.size, 0, 'closing cancels delayed work');
+	v.srvTogglePanel(); flush();
+	assert.strictEqual(v._srvFilterEl.value, 'late', 'reopening preserves typed filter');
+	v._srvFilter = ''; v._srvFilterEl.value = ''; v.srvRenderList();
+	var pendingMore = nodes(v.srvPanel, function(n) { return css(n, 'nv-srv-more'); })[0];
+	v._srvFilterEl.value = 'Server #125'; v._srvFilterEl.events.input();
+	pendingMore.attrs.click({ stopPropagation: function() {} });
+	assert.strictEqual(rows(v).length, 1, 'paging during debounce renders the new filter from its first page');
+	assert.strictEqual(timers.size, 0, 'paging cancels the pending filter callback');
+	v._srvFilterEl.events.input(); v.srvReplaceData([]);
+	assert.strictEqual(timers.size, 0, 'new data cancels callbacks for old data');
+	assert.strictEqual(v.srvLowestLoad(), null);
+	var contextView = Object.assign({}, v, { credNode: {}, ensureConnectionState: function() {}, buildCredentials: function() {},
+		buildConnection: function() {}, buildRoutingSection: function() {}, buildRotation: function() {}, buildAdvanced: function() {},
+		srvRenderTrigger: function() {} });
+	contextView._srvFilterTimer = context.setTimeout(function() { throw new Error('old form callback'); });
+	contextView.buildFormSections();
+	assert.strictEqual(timers.size, 0, 'form/context replacement cancels pending work');
+	// The fallback must remain numeric when Intl is absent or rejects options.
+	var intl = context.Intl;
+	for (var replacement of [null, { Collator: function() { throw new Error('unsupported'); } },
+		{ Collator: function() { this.compare = function(a, b) { return a < b ? -1 : (a > b ? 1 : 0); }; } }]) {
+		context.Intl = replacement;
+		var fallback = vm.runInNewContext('(function() { ' + source + '\n})()', context);
+		var idx = fallback.srvBuildIndex([relays[0], relays[123], relays[115]]);
+		assert.strictEqual(idx.groups[0].rows.map(function(r) { return r.relay.hostname; }).join(','), 'host2,host10,host125');
+	}
+	context.Intl = intl;
+	context.setTimeout = function() {};
+}
+
 async function draftTests() {
 	// A small DOM executes the real connection widgets, their bound callbacks,
 	// form replacement, UCI collection and save/discard flows.
@@ -448,6 +553,7 @@ async function probeTests() {
 }
 
 async function run() {
+	pickerTests();
 	await draftTests();
 	await probeTests();
 	// Watch the returned job ID even if a newer identical operation starts.
