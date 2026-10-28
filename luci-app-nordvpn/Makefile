@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: MIT
-# Copyright 2026 Andrey Aleksandrov <aladex@gmail.com>
+# Copyright 2026 Andrey Aleksandrov
 
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-nordvpn
 PKG_VERSION:=1.8.0
 PKG_RELEASE:=1
-PKG_MAINTAINER:=Andrey Aleksandrov <aladex@gmail.com>
+PKG_MAINTAINER:=Chris Morris (I-press-buttons)
 PKG_LICENSE:=MIT
 
 LUCI_TITLE:=LuCI support for NordVPN WireGuard
+LUCI_URL:=https://github.com/I-press-buttons/Openwrt-NordVPN-Luci-EZmgmt
+LUCI_MAINTAINER:=$(PKG_MAINTAINER)
 LUCI_DESCRIPTION:=Web interface for the NordVPN WireGuard backend (nordvpn-wireguard): \
 	runtime status, one-time credential setup, server selection, automatic \
 	rotation and cache management. Unofficial; not affiliated with Nord Security.

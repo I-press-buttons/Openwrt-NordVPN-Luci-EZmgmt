@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
-# Copyright 2026 Andrey Aleksandrov <aladex@gmail.com>
+# Copyright 2026 Andrey Aleksandrov
 
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=nordvpn-wireguard
 PKG_VERSION:=1.8.0
 PKG_RELEASE:=1
-PKG_MAINTAINER:=Andrey Aleksandrov <aladex@gmail.com>
+PKG_MAINTAINER:=Chris Morris (I-press-buttons)
 PKG_LICENSE:=MIT
 
 include $(INCLUDE_DIR)/package.mk
@@ -16,7 +16,7 @@ define Package/nordvpn-wireguard
   CATEGORY:=Network
   SUBMENU:=VPN
   TITLE:=NordVPN WireGuard backend
-  URL:=https://github.com/Aladex/nordvpn-luci
+  URL:=https://github.com/I-press-buttons/Openwrt-NordVPN-Luci-EZmgmt
   PKGARCH:=all
   DEPENDS:= \
 	+ca-bundle \

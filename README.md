@@ -33,8 +33,7 @@ This project does all of that from one LuCI page:
 - **No LuCI required.** The backend works from the command line and over
   ubus too, so scripts and headless routers can use it.
 
-This is a fork of [**Aladex/nordvpn-luci**](https://github.com/Aladex/nordvpn-luci)
-that adds the extra features marked **(fork)** below.
+Extra features developed for this project are marked **(fork)** below.
 
 ## Features
 
@@ -237,10 +236,6 @@ wait a few seconds and reload the page. VPN configuration is retained by apk.
 
 Log out of LuCI and back in, then open **VPN → NordVPN**. Installing only
 `nordvpn-wireguard` gives you a headless CLI/ubus service.
-
-> The signed package feed at `aladex.github.io/nordvpn-luci` belongs to the
-> original project and serves the **upstream** packages, without this fork's
-> additions.
 
 ### Build from source
 
@@ -731,9 +726,6 @@ supported.
 
 ## Related projects
 
-- [**Aladex/nordvpn-luci**](https://github.com/Aladex/nordvpn-luci) is the
-  original project this fork is based on, and it has its own signed package
-  feed at <https://aladex.github.io/nordvpn-luci/>.
 - [**NordVPN Lite**](https://nordvpn.com/blog/nordvpn-for-openwrt-routers/) is
   the official, deliberately minimal OpenWrt client: one NordLynx connection
   with a basic setup.
