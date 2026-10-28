@@ -44,7 +44,15 @@ Validation:
   warning. No certificate or authentication credential was replaced.
 - The live VPN remained connected while the scheduler and rpcd reloaded.
 
-Deploy the new UI with its matching backend package: its asynchronous protection
-checks rely on newer RPC methods than the older installed 1.8.0 backend. Live
-security patches do not by themselves update the router UI or package metadata.
-Router-side originals are retained in the existing repair backup directory.
+The UI was subsequently deployed with matching backend source from the merged
+revision. Workers and RPC modules were compiled against the native router
+runtime first; advisory locking and private atomic writes were exercised. The
+full previous source and configuration are retained in a root-only rollback
+archive on the router. Public UI assets are mode 0644; runtime records remain
+0600. The local source version is labelled separately from APK package metadata.
+
+The routing verifier requires `timeout`, which is not enabled in every BusyBox
+build. The backend declares `coreutils-timeout` explicitly so package installs
+include it. This dependency was discovered by the real-router routing apply
+check; mocked command execution in the offline suite cannot establish that a
+system utility is installed.

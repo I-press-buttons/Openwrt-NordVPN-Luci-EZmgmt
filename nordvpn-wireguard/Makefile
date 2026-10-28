@@ -21,6 +21,7 @@ define Package/nordvpn-wireguard
   DEPENDS:= \
 	+ca-bundle \
 	+curl \
+	+coreutils-timeout \
 	+kmod-wireguard \
 	+rpcd \
 	+rpcd-mod-ucode \
