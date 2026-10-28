@@ -746,7 +746,12 @@ sh nordvpn-wireguard/tests/run.sh
 ```
 
 CI (`.github/workflows/build.yml`) runs shell and JSON checks, ESLint on the
-LuCI view, and the ucode tests on every pull request and push to `master`.
+LuCI view, and the ucode tests on every pull request and branch push (except
+`gh-pages`). Pushing a feature branch opens a PR to `master`; once those checks
+pass, CI squash-merges the exact tested commit and deletes the branch. Failed
+checks leave the PR open. GitHub's branch protection and review rules still
+apply. Pushes to `master` do not open PRs.
+
 Package builds run only for changed nightlies, deliberate version tags, or a
 manual workflow run. A manual run with *nightly* unticked builds both packages
 with the snapshot SDK and uploads the `nordvpn-packages` artifact without
