@@ -6,11 +6,12 @@
 
 'use strict';
 
-import { readfile, mkdir, unlink } from 'fs';
+import { readfile, mkdir, unlink, stat } from 'fs';
 const _cache = require('nordvpn.cache');
 const normalize = _cache.normalize, write_cache = _cache.write_cache;
 const _common = require('nordvpn.common');
 const _apply_mod = require('nordvpn.apply');
+require('routing_adapter').install(_apply_mod.routing_adapters);
 const _creds = require('nordvpn.credentials');
 import { cursor } from 'uci';
 
@@ -74,6 +75,30 @@ eq('locations memo answers the same', m.locations.call(), loc);
 	write_cache(cache, cdir + '/nordvpn_servers_cache.json');
 	eq('locations follow it back', length(m.locations.call().countries), 3);
 }
+// Equal-size replacements within one second still invalidate both memos by
+// inode identity. Pin cached_at/created fields by serializing one base object.
+{
+	let path = cdir + '/nordvpn_servers_cache.json';
+	let first = json(readfile(path));
+	let before, after;
+	for (let attempt = 0; attempt < 3; attempt++) {
+		first.countries[0].name = 'EstoniX';
+		first.countries[0].cities[0].relays[0].name = 'Estonia #X';
+		_common.atomic_write(path, sprintf('%J', first));
+		before = stat(path);
+		m.locations.call();
+		m.servers.call({ args: { country: 'ee', city: 'ee-tallinn', hop_mode: 'single' } });
+		first.countries[0].name = 'EstoniY';
+		first.countries[0].cities[0].relays[0].name = 'Estonia #Y';
+		_common.atomic_write(path, sprintf('%J', first));
+		after = stat(path);
+		if (before.mtime == after.mtime) break;
+	}
+	ok('same-size same-second replacement changes inode', before.mtime == after.mtime && before.size == after.size && before.inode != after.inode);
+	eq('tree memo observes equal-size new generation', m.locations.call().countries[0].name, 'EstoniY');
+	eq('server memo observes equal-size new generation', m.servers.call({ args: { country: 'ee', city: 'ee-tallinn', hop_mode: 'single' } }).relays[0].name, 'Estonia #Y');
+	write_cache(cache, path);
+}
 // servers answers are memoized per cache file and request, and follow a
 // rewritten cache like the tree does.
 eq('servers memo answers the same', m.servers.call({ args: { locations: [ 'ee', 'us' ], hop_mode: 'single' } }), srv_union);
@@ -133,6 +158,9 @@ ok('apply returns a state object', m.apply.call().state != null);
 {
 	unlink(_common.APPLY_STATUS_FILE);
 	eq('apply_status idle without a job file', m.apply_status.call({}).state, 'idle');
+	eq('apply_status accepts optional exact ID', m.apply_status.args.id, '');
+	eq('unknown exact ID reports missing rather than idle',
+		m.apply_status.call({ args: { id: 'absent' } }).state, 'missing');
 	eq('apply_start rejects an unknown instance',
 		m.apply_start.call({ args: { instance: 'nope' } }).error, 'no such instance');
 
@@ -260,7 +288,7 @@ ok('clear_credentials removes the key', global.MOCK_UCI.network.nordvpn.private_
 				nordvpn_country_code: 'ee', nordvpn_location: 'ee-tallinn' },
 			peer: { '.type': 'wireguard_nordvpn', interface: 'nordvpn',
 				nordvpn_gateway: 'ee70.nordvpn.com', public_key: KEY } } };
-	global.MOCK_UBUS = { 'network.interface.nordvpn~status': { up: true, l3_device: 'nordvpn', uptime: 42 } };
+	global.MOCK_UBUS = { 'network.interface~dump': { interface: [ { interface: 'nordvpn', up: true, l3_device: 'nordvpn', uptime: 42 } ] } };
 	let open_before = global.MOCK_UBUS_OPEN || 0;
 	let ov = m.overview.call();
 	eq('overview: one entry per instance, main first', map(ov.instances, (i) => i.instance), [ 'main', 'second' ]);

@@ -5,14 +5,13 @@
 'use strict';
 
 import { srand } from 'math';
-import { readfile, unlink, stat } from 'fs';
+import { readfile } from 'fs';
 import { cursor } from 'uci';
 const _common = require('nordvpn.common');
 const FIXED_ADDRESS = _common.FIXED_ADDRESS,
       DEFAULT_PORT = _common.DEFAULT_PORT,
       DEFAULT_KEEPALIVE = _common.DEFAULT_KEEPALIVE,
       APPLY_STATUS_FILE = _common.APPLY_STATUS_FILE,
-      APPLY_LOCK_FILE = _common.APPLY_LOCK_FILE,
       APPLY_MAX_RUNTIME = _common.APPLY_MAX_RUNTIME,
       load_settings = _common.load_settings,
       cache_file_path = _common.cache_file_path,
@@ -33,9 +32,21 @@ const selection_candidates = _select.selection_candidates,
       order_candidates = _select.order_candidates;
 const _routing = require('nordvpn.routing');
 const enforce_routing = _routing.enforce;
+const _transaction = require('nordvpn.routing_transaction');
+const routing_adapters = _transaction.adapters;
+function routing_plan(uci, s, edit) {
+	return _transaction.plan(uci, function(desired, tables) {
+		if (edit) edit(desired);
+		let result = enforce_routing(desired, s, { rt_tables: tables });
+		for (let note in result.notes)
+			if (match(note, /not installed|not locked|DNS is already locked|domain steering needs|excluded domains need/)) die(note);
+		return result;
+	});
+}
 const _history = require('nordvpn.history');
 const record_event = _history.record_event;
 const _creds = require('nordvpn.credentials');
+const _mutation = require('nordvpn.mutation');
 
 // Locate the managed peer section (type wireguard_<iface>, interface=<iface>).
 function find_peer(uci, iface) {
@@ -58,7 +69,6 @@ function set_credentials(uci, token, instance) {
 		return { error: 'invalid interface name' };
 	if (!managed_interface(uci, iface))
 		return { error: 'interface ' + iface + ' is not managed by nordvpn' };
-	_creds.migrate(uci);
 	return _creds.set(uci, token, null, null, instance);
 }
 
@@ -162,17 +172,12 @@ function write_relay(uci, iface, relay, s, opts) {
 // Bring the managed interface up. iface is whitelist-validated, so the argv is
 // injection-safe (no shell).
 function bring_up(iface) {
-	return run([ 'ifup', iface ]).code == 0;
+	return routing_adapters.run([ 'timeout', '15', 'ifup', iface ]).code == 0;
 }
 
-// Newest WireGuard handshake age (seconds) for the interface. Returns -1 when
-// the wg binary is absent (off-device: exit 127 from the shell), null when
-// there is no handshake — including when the device does not exist, which is
-// a failed connection, not a pass.
+// Newest WireGuard handshake age, or null for missing tools/device/handshake.
 function handshake_age(iface) {
-	let res = run([ 'wg', 'show', iface, 'latest-handshakes' ], true);
-	if (res.code == 127)
-		return -1;
+	let res = routing_adapters.run([ 'timeout', '5', 'wg', 'show', iface, 'latest-handshakes' ], true);
 	if (res.code != 0)
 		return null;
 	let best = 0;
@@ -190,16 +195,13 @@ function handshake_age(iface) {
 	return age < 0 ? 0 : age;
 }
 
-// Wait up to `seconds` for a fresh handshake. True when connected — or when wg
-// is unavailable (off-device), so the apply logic is not blocked in tests.
+// Wait up to `seconds` for a fresh handshake. Missing wg is a failure.
 // Sleeps in-process: spawning `sleep` through a shell every second only adds
 // two process starts per second of waiting.
 function verify_handshake(iface, seconds) {
 	for (let i = 0; i < seconds; i++) {
 		sleep(1000);
 		let age = handshake_age(iface);
-		if (age == -1)
-			return true;
 		if (age != null && age < 180)
 			return true;
 	}
@@ -261,48 +263,42 @@ function nft_set_elements(names) {
 	return out;
 }
 
-// Put elements saved by nft_set_elements() back after a firewall reload.
-function nft_restore_elements(saved) {
-	for (let name, ips in saved)
-		for (let i = 0; i < length(ips); i += 256)
-			run([ 'nft', 'add', 'element', 'inet', 'fw4', name,
-				'{ ' + join(', ', slice(ips, i, i + 256)) + ' }' ], true);
-}
-
-// Commit and reload whatever an enforce_routing() pass changed. The firewall
-// goes first so the domain nft set exists before dnsmasq is told to fill it;
-// a firewall reload also empties that set, so dnsmasq is reloaded then too.
-// dnsmasq's reload regenerates its config and restarts it only when that
-// changed; otherwise it just gets a SIGHUP, which flushes its cache so the
-// clients' next lookups repopulate the set. A restart would interrupt DNS and
-// DHCP for every client, VPN or not. Steering/prohibit rules are plain netifd
-// config; a reload makes netifd apply the delta (unchanged interfaces are left
-// alone). True when anything was committed.
+// Execute a detached plan under mutation.configuration(); returns structured
+// outcome, including the original failure and any scoped restoration failures.
 function commit_routing(uci, routing) {
-	if (routing.changed_firewall) {
-		// Addresses dnsmasq resolved for steered and excluded domains survive
-		// the reload, so their connections keep their path (see enforce()).
-		let saved = nft_set_elements(routing.keep_sets || []);
-		uci.commit('firewall');
-		run([ '/etc/init.d/firewall', 'reload' ]);
-		nft_restore_elements(saved);
-	}
-	if (routing.changed_network) {
-		uci.commit('network');
-		run([ 'ubus', 'call', 'network', 'reload' ]);
-	}
-	if (routing.changed_dhcp)
-		uci.commit('dhcp');
-	if (routing.changed_dhcp || (routing.changed_firewall && routing.domains_active))
-		run([ '/etc/init.d/dnsmasq', 'reload' ]);
-	return !!(routing.changed_firewall || routing.changed_network || routing.changed_dhcp);
+	return _transaction.execute(uci, routing);
 }
 
-function connect_one(uci, iface, relay, s, opts) {
-	if (!write_relay(uci, iface, relay, s, opts))
-		return false;
-	uci.commit('network');
-	return bring_up(iface);
+const TUNNEL_LOCK_WAIT = 60;
+
+function activation(iface, up) {
+	let st = _transaction.interface_state(iface);
+	if (!st) die('could not snapshot runtime state for ' + iface);
+	return { stage: (up ? 'ifup:' : 'ifdown:') + iface, up: !!up, previous_up: !!st.up,
+		argv: [ up ? 'ifup' : 'ifdown', iface ], restore_argv: [ st.up ? 'ifup' : 'ifdown', iface ] };
+}
+function connection_plan(uci, iface, edit, up) {
+	let p = _transaction.plan(uci, function(desired) { edit(desired); return { interface: iface }; });
+	p.reloads = []; // ifup/ifdown applies this interface; no global netifd reload.
+	p.activation = activation(iface, up);
+	return p;
+}
+function connect_one_result(uci, iface, relay, s, opts) {
+	let result = _mutation.configuration(function(fresh) {
+		let p = connection_plan(fresh, iface, function(desired) {
+			if (!write_relay(desired, iface, relay, s, opts)) die('invalid relay');
+		}, true);
+		return commit_routing(fresh, p);
+	}, s.mutation_wait || 0);
+	return result;
+}
+// Compatibility for local scripts; application/rotation consume full outcomes.
+function connect_one(uci, iface, relay, s, opts) { return connect_one_result(uci, iface, relay, s, opts).ok; }
+function restore_connection(iface, saved, wait) {
+	return _mutation.configuration(function(fresh) {
+		return commit_routing(fresh, connection_plan(fresh, iface,
+			function(desired) { restore_peer(desired, iface, saved); }, true));
+	}, wait || 0);
 }
 
 // What the running tunnel is built from: the interface and peer options
@@ -344,23 +340,15 @@ function wan_default_at_risk(uci) {
 }
 
 // Take the instance's tunnel lock (see nordvpn.common.tunnel_lock_path),
-// waiting up to `wait` seconds for a rotation that holds it to finish. The
-// lock ages out after the longest a rotation of the instance may take.
+// waiting up to `wait` seconds for an operation that holds it to finish.
+// Ownership is descriptor-based and never expires while its holder is live.
 function acquire_tunnel_lock(instance, s, wait) {
-	let path = _common.tunnel_lock_path(instance);
-	let max = _common.rotation_max_runtime(s);
-	let lock = _common.acquire_lock(path, max);
-	for (let i = 0; !lock && i < wait; i++) {
-		sleep(1000);
-		lock = _common.acquire_lock(path, max);
-	}
-	return lock;
+	return _mutation.acquire([ validate_instance(instance) || 'main' ], wait);
 }
 
 // How long an apply waits for a running rotation of the same instance. Well
 // inside APPLY_MAX_RUNTIME: four candidates at MAX_VERIFY_TIMEOUT plus this
 // still fit.
-const TUNNEL_LOCK_WAIT = 60;
 
 // A global netifd reload has been observed (OpenWrt 24.10) to remove the
 // kernel's main IPv4 default route while netifd still reports it as
@@ -390,7 +378,17 @@ function restore_wan_default() {
 				continue;
 			for (let rt in (ifc.route || [])) {
 				if (rt.target == '0.0.0.0' && rt.mask == 0 && rt.nexthop && rt.nexthop != '0.0.0.0') {
-					let res = run([ 'ip', 'route', 'add', 'default', 'via', rt.nexthop, 'dev', ifc.l3_device ]);
+					let res;
+					try {
+						res = _mutation.configuration(function(fresh) {
+							let now = run([ 'ip', '-4', 'route', 'show', 'default' ]);
+							if (now.code != 0 || trim(now.stdout || '') != '')
+								return now;
+							return run([ 'ip', 'route', 'add', 'default', 'via', rt.nexthop, 'dev', ifc.l3_device ]);
+						}, TUNNEL_LOCK_WAIT);
+					} catch (e) {
+						return false;
+					}
 					if (res.code != 0)
 						return false;
 					// Only claim success once the route really went in.
@@ -425,20 +423,26 @@ function restore_wan_default_async() {
 // apply), and its handshake is fresh. The stamps write_relay() refreshed are
 // committed; there is no ifup, so no connection through the tunnel drops.
 // null when the tunnel has to be (re)started.
-function keep_running(uci, iface, relay, s, before) {
-	if (!write_relay(uci, iface, relay, s))
-		return null;
-	if (tunnel_fingerprint(uci, iface) != before)
-		return null;
+function keep_running_inner(uci, iface, relay, s, before) {
+	let compatible = false;
+	let p = _transaction.plan(uci, function(desired) {
+		compatible = write_relay(desired, iface, relay, s) && tunnel_fingerprint(desired, iface) == before;
+		return { interface: iface };
+	});
+	if (!compatible) return null;
 	let age = handshake_age(iface);
-	if (age == null || age >= 180)
-		return null;
-	uci.commit('network');
-	return {
-		state: 'success', interface: iface, gateway: relay.hostname,
-		endpoint: relay.hostname + ':' + (relay.port || DEFAULT_PORT),
-		restarted: false
-	};
+	if (age == null || age >= 180) return null;
+	p.reloads = []; // only metadata stamps changed; keep the established tunnel.
+	let result = commit_routing(uci, p);
+	if (!result.ok) return { ...result, state: 'failure' };
+	return { ...result, state: 'success', interface: iface, gateway: relay.hostname,
+		endpoint: relay.hostname + ':' + (relay.port || DEFAULT_PORT), restarted: false };
+}
+
+function keep_running(uci, iface, relay, s, before) {
+	return _mutation.configuration(function(fresh) {
+		return keep_running_inner(fresh, iface, relay, s, before);
+	}, s.mutation_wait || 0);
 }
 
 // Apply the persisted configuration. A fixed server is applied once; an
@@ -448,50 +452,59 @@ function keep_running(uci, iface, relay, s, before) {
 // 'reconnect' (the user asked for a fresh connection), the server the tunnel
 // is on is tried first while it still matches the selection, so saving
 // anything but the location keeps the exit IP and the connections on it.
-function apply_inner(uci, instance, source) {
-	let s = load_settings(uci, instance);
-	let iface = validate_interface(s.interface);
-	if (!iface)
-		return { state: 'failure', error: 'invalid interface name' };
-	if (!managed_interface(uci, iface))
-		return { state: 'failure', error: 'interface ' + iface + ' is not managed by nordvpn' };
-	// Saving settings must not implicitly turn a deliberately disabled tunnel
-	// back on. Explicit Enable/Reconnect and external apply calls retain their
-	// historical behavior.
-	if (source == 'save' && !s.enabled)
-		return { state: 'disabled', interface: iface, restarted: false };
-	// What the running tunnel is built from, before anything below changes it.
-	let before = tunnel_fingerprint(uci, iface);
-	// The instance's credentials may have changed in the bank or been switched
-	// to another entry since the last apply: bring the interface key in line.
-	_creds.migrate(uci);
-	if (_creds.sync_instance(uci, instance))
-		uci.commit('network');
-	if (!validate_wg_key(uci.get('network', iface, 'private_key')))
-		return { state: 'failure', error: 'no credentials configured' };
+function apply_inner(uci, instance, source, lock_wait) {
+	let cache = read_cache(cache_file_path(load_settings(cursor(), instance)));
+	let prepared = _mutation.configuration(function(uci) {
+		let invalid = _mutation.validate_owner(uci, instance);
+		if (invalid)
+			return { state: 'failure', error: invalid };
+		let s = load_settings(uci, instance);
+		s.mutation_wait = lock_wait;
+		let iface = validate_interface(s.interface);
+		if (!iface)
+			return { state: 'failure', error: 'invalid interface name' };
+		if (!managed_interface(uci, iface))
+			return { state: 'failure', error: 'interface ' + iface + ' is not managed by nordvpn' };
+		// Saving settings must not implicitly turn a deliberately disabled tunnel
+		// back on. Explicit Enable/Reconnect and external apply calls retain their
+		// historical behavior.
+		if (source == 'save' && !s.enabled)
+			return { state: 'disabled', interface: iface, restarted: false };
+		// What the running tunnel is built from, before anything below changes it.
+		let before = tunnel_fingerprint(uci, iface);
+		// The instance's credentials may have changed in the bank or been switched
+		// to another entry since the last apply: bring the interface key in line.
 
-	let cache = read_cache(cache_file_path(s));
-	if (!cache)
-		return { state: 'failure', error: 'server list not available; refresh the cache first' };
+		if (!validate_wg_key(uci.get(_creds.PKG, _creds.instance_credential(uci, instance), 'private_key')))
+			return { state: 'failure', error: 'no credentials configured' };
+		if (!cache)
+			return { state: 'failure', error: 'server list not available; refresh the cache first' };
 
-	// Applying implies the user wants the instance on — undo a disable, both
-	// in the config and in the already-loaded settings the enforcement uses.
-	if (!s.enabled) {
-		uci.set('nordvpn', s.name, 'enabled', '1');
-		uci.commit('nordvpn');
+		let enable = !s.enabled;
 		s.enabled = true;
-	}
+		let routing = routing_plan(uci, s, function(desired) {
+			let key = validate_wg_key(uci.get(_creds.PKG, _creds.instance_credential(uci, instance), 'private_key'));
+			if (!key) die('no credentials configured');
+			if (desired.get('network', iface, 'private_key') != key) {
+				desired.set('network', iface, 'private_key', key);
+				desired.set('network', iface, 'addresses', [ FIXED_ADDRESS ]);
+				desired.delete('network', iface, 'nordvpn_token');
+			}
+			if (enable) desired.set('nordvpn', s.name, 'enabled', '1');
+		});
+		let applied = commit_routing(uci, routing);
+		if (!applied.ok) return { ...applied, state: 'failure' };
 
-	// Reconcile the managed routing/firewall objects with the settings. Only
-	// stamped objects are ever touched; a detected manual scheme is left alone.
-	let routing = enforce_routing(uci, s);
-	if (commit_routing(uci, routing)) {
-		// Committing deletions invalidates the cursor's section iteration
-		// state (find_peer silently missed sections) — start fresh.
-		uci = cursor();
-	}
-	for (let note in routing.notes)
-		_common.log('routing: ' + note);
+		for (let note in routing.notes)
+			_common.log('routing: ' + note);
+
+		return { settings: s, before: before, cache: cache };
+	}, lock_wait);
+	if (!prepared.settings)
+		return prepared;
+	let s = prepared.settings, before = prepared.before;
+	let iface = s.interface;
+	uci = cursor();
 
 	srand(time());
 	let saved = current_peer(uci, iface);
@@ -506,7 +519,9 @@ function apply_inner(uci, instance, source) {
 			if (kept)
 				return kept;
 		}
-		let up = connect_one(uci, iface, relay, s);
+		let connection = connect_one_result(uci, iface, relay, s);
+		if (!connection.ok) return { ...connection, state: 'failure', interface: iface };
+		let up = true;
 		let ok = up && verify_handshake(iface, s.verify_timeout);
 		return {
 			state: ok ? 'success' : (up ? 'partial_failure' : 'failure'),
@@ -532,8 +547,8 @@ function apply_inner(uci, instance, source) {
 		tries = 4;
 	for (let i = 0; i < tries; i++) {
 		let relay = list[i];
-		if (!connect_one(uci, iface, relay, s))
-			continue;
+		let connection = connect_one_result(uci, iface, relay, s);
+		if (!connection.ok) return { ...connection, state: 'failure', interface: iface };
 		if (verify_handshake(iface, s.verify_timeout))
 			return {
 				state: 'success', interface: iface, gateway: relay.hostname,
@@ -543,13 +558,10 @@ function apply_inner(uci, instance, source) {
 	}
 
 	let hint = tunnel_hint(iface);
-	if (saved) {
-		restore_peer(uci, iface, saved);
-		uci.commit('network');
-		bring_up(iface);
-	}
-	return { state: 'failure', restored: saved != null,
-		error: hint || 'could not reach any server for the current selection; restored the previous connection' };
+	let restored = saved ? restore_connection(iface, saved, lock_wait) : null;
+	return { state: 'failure', restored: !!restored?.ok, rollback: restored,
+		error: (hint || 'could not reach any server for the current selection') +
+			(restored ? (restored.ok ? '; restored the previous connection' : '; restoration failed: ' + restored.error) : '') };
 }
 
 // What started an apply, recorded as the history entry's `reason`: the UI's
@@ -581,20 +593,29 @@ function apply_event(res, source) {
 // way round); a rotation in progress is waited for, up to `lock_wait`
 // seconds (default TUNNEL_LOCK_WAIT).
 function apply(uci, instance, source, lock_wait) {
-	let at_risk = wan_default_at_risk(uci);
-	let res;
-	let lock = acquire_tunnel_lock(instance, load_settings(uci, instance),
+	instance = validate_instance(instance) || 'main';
+	let migration = _creds.migrate(cursor());
+	if (type(migration) == 'object' && migration.error)
+		return { ...migration, state: 'failure' };
+	let owner = acquire_tunnel_lock(instance, null,
 		(type(lock_wait) == 'int') ? lock_wait : TUNNEL_LOCK_WAIT);
-	if (!lock) {
-		res = { state: 'failure', error: 'a rotation of this instance is still running; try again when it finishes' };
-	} else {
-		try {
-			res = apply_inner(uci, instance, source);
-		} catch (e) {
-			res = { state: 'failure', error: 'apply error: ' + e };
+	if (owner.busy)
+		return { ...owner, state: 'failure' };
+	let res, at_risk = false;
+	try {
+		uci = cursor();
+		if (uci.get('nordvpn', instance) == null)
+			res = { state: 'failure', error: 'no such instance' };
+		else {
+			at_risk = wan_default_at_risk(uci);
+			res = apply_inner(uci, instance, source, (type(lock_wait) == 'int') ? lock_wait : TUNNEL_LOCK_WAIT);
 		}
-		_common.release_lock(lock);
+	} catch (e) {
+		res = { state: 'failure', busy: index('' + e, 'busy') >= 0, error: 'apply error: ' + e };
 	}
+	_mutation.release(owner.locks);
+	if (res.busy)
+		return res;
 	if (at_risk || wan_default_at_risk(cursor()))
 		restore_wan_default();
 	let ev = apply_event(res, source);
@@ -652,7 +673,7 @@ function set_iface_table(uci, iface, table) {
 // a netifd reload leaves the unchanged interface alone. Returns
 // { ok, routing_only: true } or { needs_reconnect: true, reason } when only a
 // full apply() can do it.
-function apply_routing(uci, instance) {
+function apply_routing_inner(uci, instance) {
 	let s = load_settings(uci, instance);
 	let iface = validate_interface(s.interface);
 	if (!iface)
@@ -669,251 +690,75 @@ function apply_routing(uci, instance) {
 		return { needs_reconnect: true, reason: reason };
 	let at_risk = wan_default_at_risk(uci);
 
-	// Never interleave with a full apply or a rotation job: either is about to
-	// reconcile the same objects (from the settings it read when it started)
-	// and restart the interface anyway. A rotation job may hold the lock for
-	// longer than an apply, so only the longest any job may run makes the
-	// lock stale by age; a holder that died is reclaimed at once by its pid.
-	let lock = _common.acquire_lock(APPLY_LOCK_FILE, _common.JOB_MAX_RUNTIME_CAP);
-	if (!lock)
-		return { needs_reconnect: true, reason: 'apply already running' };
-
 	let res;
 	try {
-		let routing = enforce_routing(uci, s);
-		// After enforce(), which registered a new table in rt_tables: netifd
-		// resolves the name when it reloads.
-		if (set_iface_table(uci, iface, s.routing_table))
-			routing.changed_network = true;
-		if (commit_routing(uci, routing) && routing.changed_network &&
+		let routing = routing_plan(uci, s, function(desired) { set_iface_table(desired, iface, s.routing_table); });
+		let applied = commit_routing(uci, routing);
+		if (!applied.ok) return { ...applied, routing_only: true, interface: iface };
+		if (applied.changed && index(routing.reloads, 'network') >= 0 &&
 		    (at_risk || wan_default_at_risk(cursor())))
 			restore_wan_default_async();
 		for (let note in routing.notes)
 			_common.log('routing: ' + note);
-		res = { ok: true, routing_only: true, interface: iface, notes: routing.notes };
+		res = { ...applied, routing_only: true, interface: iface, notes: routing.notes };
 	} catch (e) {
-		res = { error: 'routing update failed: ' + e };
+		res = { ok: false, changed: false, stage: 'plan', error: 'routing plan failed: ' + e };
 	}
-	_common.release_lock(lock);
 	return res;
 }
 
-// ── Asynchronous jobs (worker + status file) ─────────────────────────
-// apply() is slow by nature: it reads the multi-megabyte server cache and then
-// waits verify_timeout seconds per candidate for a handshake — NordVPN
-// publishes dead endpoints, so two silent candidates alone cost 16 s at the
-// default. rpcd serves ubus calls one at a time, so running that inside the
-// call starved everything else, including the `uci confirm` the browser sends
-// to keep its own changes: the router hit the rollback timer and reverted
-// /etc/config/nordvpn underneath the user. The UI therefore spawns
-// /usr/bin/nordvpn-apply and polls the status file written here, exactly like
-// the cache refresh does with nordvpn.cache's fetch status. A manual rotation
-// is slower still (up to max_retries candidates) and runs the same way, as a
-// job of kind 'rotate' (see nordvpn.rotate.run_job). One job runs at a time.
-// The synchronous apply() and rotate() stay as-is for scripts and the CLI.
+// ── Asynchronous tunnel jobs ─────────────────────────────────────────
+// Keep the tunnel slot separate from cache/updater work and future probes.
+const _jobs = require('nordvpn.jobs');
+const tunnel_jobs = _jobs.create(APPLY_STATUS_FILE);
 
-// Worker command per job kind; the instance name is appended.
-const JOB_WORKERS = {
-	apply: '/usr/bin/nordvpn-apply ',
-	rotate: '/usr/bin/nordvpn-rotate --job '
-};
+function write_apply_status(status) { return tunnel_jobs.write(status); }
+function read_apply_status() { return tunnel_jobs.read(); }
+function apply_running(st, now) { return tunnel_jobs.active(st, now); }
+// Optional exact-ID lookup; the one-argument form is the legacy test clock.
+function apply_status_report(now, id) { return tunnel_jobs.status(id, now); }
 
-// Stamp `updated_at` and atomically write the apply-status file.
-function write_apply_status(status) {
-	if (type(status) != 'object')
-		return false;
-	status.updated_at = iso_ts();
-	return _common.atomic_write(APPLY_STATUS_FILE, sprintf('%J', status));
-}
-
-// Parsed apply-status object or null.
-function read_apply_status() {
-	let raw = readfile(APPLY_STATUS_FILE);
-	if (!raw)
-		return null;
-	try {
-		let st = json(raw);
-		// Anything but an object would make every status poll throw.
-		return (type(st) == 'object') ? st : null;
-	} catch (e) {
-		return null;
-	}
-}
-
-// Own pid (see nordvpn.common.self_pid()). Recorded with a 'running' record
-// so a dead worker is detectable; null when /proc is unavailable, in which
-// case only the runtime ceiling applies.
-function self_pid() {
-	return _common.self_pid();
-}
-
-// Runtime ceiling of a job: an apply's is fixed, a rotation's follows the
-// instance's max_retries and verify_timeout.
 function job_max_runtime(kind, instance) {
-	if (kind != 'rotate')
-		return APPLY_MAX_RUNTIME;
-	return _common.rotation_max_runtime(load_settings(cursor(), instance));
+	return kind == 'rotate'
+		? _common.rotation_max_runtime(load_settings(cursor(), instance)) : APPLY_MAX_RUNTIME;
 }
 
-// The ceiling a record states, within [APPLY_MAX_RUNTIME, JOB_MAX_RUNTIME_CAP];
-// the apply ceiling for anything else, including records of older versions.
-function job_ceiling(st) {
-	let m = (type(st) == 'object') ? st.max_runtime : null;
-	return (type(m) == 'int' && m >= APPLY_MAX_RUNTIME && m <= _common.JOB_MAX_RUNTIME_CAP)
-		? m : APPLY_MAX_RUNTIME;
-}
-
-// Is this record a believable 'running' one? A worker can die mid-apply (a
-// reboot, the OOM killer, a stray `killall ucode`) and what it left behind
-// must not wedge the instance forever: an apply whose process is gone, or one
-// past the runtime ceiling, is not running whatever the file says. `now` is
-// injectable so the recovery rules stay testable.
-function apply_running(st, now) {
-	if (type(st) != 'object' || st.state != 'running')
-		return false;
-	now = now || time();
-	let started = (type(st.started_at_epoch) == 'int') ? st.started_at_epoch : 0;
-	// No start stamp, or one older than a whole job could take: abandoned.
-	// A stamp in the future is just as implausible — routers have no RTC and
-	// the clock jumps the moment NTP lands, which must not freeze the record.
-	if (!started || (now - started) > job_ceiling(st) || started > (now + 60))
-		return false;
-	if (type(st.pid) == 'int' && st.pid > 0 && !stat('/proc/' + st.pid))
-		return false;
-	return true;
-}
-
-// The record the UI polls. A 'running' record whose worker is gone is turned
-// into a terminal 'failed' — and rewritten as such — so the page shows an
-// error instead of spinning forever and the next job start is allowed.
-function apply_status_report(now) {
-	let st = read_apply_status();
-	if (!st)
-		return null;
-	if (st.state == 'running' && !apply_running(st, now)) {
-		st.state = 'failed';
-		st.stale = true;
-		st.pid = null;
-		st.finished_at = iso_ts(now);
-		st.error = (st.kind == 'rotate') ? 'the rotation worker stopped unexpectedly'
-			: 'the apply worker stopped unexpectedly';
-		write_apply_status(st);
-	}
-	return st;
-}
-
-// Did a job end the way the user asked for? A rotation that was skipped (a
-// pinned server, nothing else to rotate to) finished as a no-op, not a fault.
-function job_succeeded(kind, res) {
-	if (kind == 'rotate')
-		return !!(res && (res.ok || res.skipped));
-	return !!(res && res.state == 'success');
-}
-
-// Run one job of `kind` for one instance and record the outcome: the whole
-// body of the detached worker. `work(name)` does the job and returns its
-// result. The lock is what actually prevents two overlapping jobs (the status
-// file is only what the UI reads), and its own stale reclamation is the
-// second recovery path for a killed worker.
-function run_job(instance, kind, work) {
+// Detached workers must claim the ID supplied by their launcher. Manual CLI
+// invocations reserve their own job, then use exactly the same lifecycle.
+function run_job(instance, kind, work, id, context) {
 	let name = validate_instance(instance) || 'main';
-	let busy = (kind == 'apply') ? 'apply already running' : 'an apply or rotation is already running';
-	let max = job_max_runtime(kind, name);
-	let lock = _common.acquire_lock(APPLY_LOCK_FILE, max);
-	if (!lock) {
-		// The lock ages out on its own, but the status record knows sooner: a
-		// 'running' record whose worker is gone means this lock is orphaned, and
-		// honouring it would block the user's retry for minutes. Reclaim it only
-		// on that evidence — a missing or terminal record is exactly what a
-		// worker that took the lock a millisecond ago also looks like, and
-		// stealing the lock from it would run two jobs at once.
-		let st = read_apply_status();
-		if (!st || st.state != 'running' || apply_running(st))
-			// Leave the status file alone: it belongs to the running job.
-			return { skipped: true, reason: busy };
-		unlink(APPLY_LOCK_FILE);
-		lock = _common.acquire_lock(APPLY_LOCK_FILE, max);
-		if (!lock)
-			return { skipped: true, reason: busy };
-		_common.log('reclaimed the job lock of a worker that never finished');
+	if (!id) {
+		let reservation = tunnel_jobs.reserve(name, kind, context, job_max_runtime(kind, name));
+		if (!reservation.started)
+			return reservation.error && !reservation.busy ? { error: reservation.error } :
+				{ skipped: true, reason: kind == 'apply' ? 'apply already running' : 'an apply or rotation is already running' };
+		id = reservation.apply.id;
 	}
-
-	let started = time();
-	let base = { kind: kind, instance: name, started_at: iso_ts(started),
-		started_at_epoch: started, max_runtime: max };
-	write_apply_status({ ...base, state: 'running', pid: self_pid(),
-		finished_at: null, result: null, error: null });
-
-	let res;
-	try {
-		res = work(name);
-	} catch (e) {
-		// A throw must not leave the record on 'running' — the UI would wait out
-		// the whole ceiling for a job that is already over.
-		res = (kind == 'apply') ? { state: 'failure', error: 'apply error: ' + e }
-			: { error: kind + ' error: ' + e };
-	}
-	_common.release_lock(lock);
-
-	let finished = time();
-	write_apply_status({ ...base, pid: null,
-		state: job_succeeded(kind, res) ? 'done' : 'failed',
-		finished_at: iso_ts(finished), finished_at_epoch: finished,
-		result: res, error: (res && res.error) ? res.error : null });
-	return res;
+	return tunnel_jobs.run(id, name, kind, work);
 }
 
-// Apply one instance as a job (the nordvpn-apply worker).
-function run_apply(instance, source) {
-	return run_job(instance, 'apply', function(name) { return apply(cursor(), name, source); });
+function run_apply(instance, source, id) {
+	return run_job(instance, 'apply', function(name, context) {
+		return apply(cursor(), name, context.source);
+	}, id, { source: apply_source(source) });
 }
 
-// Spawn the detached worker for one job and pre-record the 'running' state, so
-// a poll landing between the spawn and the worker's own first write reads
-// 'running' rather than the previous run's result. `echo $!` hands back the
-// worker's pid, which makes a worker that dies on the spot recoverable on the
-// next poll instead of only after the runtime ceiling. `arg` is an optional
-// extra worker argument (the apply source), taken only from a fixed list.
 function start_job(instance, kind, arg) {
 	let name = validate_instance(instance);
-	if (!name)
-		return { error: 'invalid instance name' };
-	if (!JOB_WORKERS[kind])
-		return { error: 'unknown job' };
-
-	let st = apply_status_report();
-	if (apply_running(st)) {
-		// The very job asked for is already in flight: that is the one the
-		// caller wants. Any other must finish first — waiting on it would
-		// report its outcome as the caller's.
-		if ((st.kind || 'apply') == kind && st.instance == name)
-			return { already_running: true, apply: st };
-		return { busy: true, error: sprintf('%s of instance %s is still running; try again when it finishes',
-			(st.kind == 'rotate') ? 'a rotation' : 'an apply', st.instance) };
-	}
-
-	// `name` is restricted to [A-Za-z0-9_] and `arg` to a fixed list, so
-	// neither can break out of the sh -c string; quoting them here would only
-	// fight the outer sh_quote().
-	let r = run([ 'sh', '-c', JOB_WORKERS[kind] + name + (arg ? ' ' + arg : '') +
-		' >/dev/null 2>&1 & echo $!' ]);
-	if (r.code != 0)
-		return { error: 'could not start the ' + kind + ' worker' };
-
-	let out = trim(r.stdout || '');
-	let started = time();
-	let rec = { kind: kind, instance: name, state: 'running',
-		pid: _common.full_match(out, /^[0-9]+$/) ? int(out) : null,
-		started_at: iso_ts(started), started_at_epoch: started,
-		max_runtime: job_max_runtime(kind, name),
-		finished_at: null, result: null, error: null };
-	// The worker writes its own 'running' record before it does any work and
-	// cannot have finished yet, so this write cannot clobber a real result.
-	write_apply_status(rec);
-	return { started: true, instance: name, apply: rec };
+	if (!name) return { error: 'invalid instance name' };
+	if (kind != 'apply' && kind != 'rotate') return { error: 'unknown job' };
+	let source = kind == 'apply' ? apply_source(arg) : null;
+	return tunnel_jobs.start(name, kind, { source: source }, job_max_runtime(kind, name), function(st) {
+		// Instance, source and kernel-generated UUID contain no shell syntax.
+		let command = kind == 'apply' ? '/usr/bin/nordvpn-apply ' : '/usr/bin/nordvpn-rotate --job ';
+		command += name + (source ? ' ' + source : '') + ' --job-id ' + st.id;
+		let r = run([ 'sh', '-c', command + ' >/dev/null 2>&1 & echo $!' ]);
+		let out = trim(r.stdout || '');
+		return r.code == 0 && _common.full_match(out, /^[0-9]+$/) && int(out) > 0
+			? { pid: int(out) } : { error: 'could not start the ' + kind + ' worker' };
+	});
 }
 
-// start_job() for an apply.
 function start_apply(instance, source) {
 	return start_job(instance, 'apply', apply_source(source));
 }
@@ -922,43 +767,198 @@ function start_apply(instance, source) {
 // rotation stopped, and every managed routing/firewall object released so the
 // steered networks return to normal networking — IPv6 included. The next
 // apply re-enables and recreates everything.
-function disconnect(uci, instance) {
+function disconnect_inner(uci, instance) {
 	let s = load_settings(uci, instance);
 	let iface = validate_interface(s.interface);
 	if (!iface)
 		return { error: 'invalid interface name' };
 	if (!managed_interface(uci, iface))
 		return { error: 'interface ' + iface + ' is not managed by nordvpn' };
-	// Serialize with apply and rotation so neither can bring the tunnel back up
-	// after this disable has completed.
-	let lock = acquire_tunnel_lock(instance, s, 0);
-	if (!lock)
-		return { error: 'a rotation or apply of this instance is running; retry disable when it finishes' };
 	let res;
 	try {
 		let at_risk = wan_default_at_risk(uci);
-		uci.set('nordvpn', s.name, 'enabled', '0');
-		uci.commit('nordvpn');
-
 		s.enabled = false;
-		let routing = enforce_routing(uci, s);
-		if (commit_routing(uci, routing))
-			uci = cursor();
+		let routing = routing_plan(uci, s, function(desired) {
+			desired.set('nordvpn', s.name, 'enabled', '0');
+			if (desired.get('network', iface) != null) desired.set('network', iface, 'auto', '0');
+		});
+		routing.activation = activation(iface, false);
+		let applied = commit_routing(uci, routing);
+		if (!applied.ok) return { ...applied, interface: iface };
 
-		if (uci.get('network', iface) != null) {
-			uci.set('network', iface, 'auto', '0');
-			uci.commit('network');
-		}
-		run([ 'ifdown', iface ]);
 		if (at_risk)
 			restore_wan_default_async();
 		record_event(instance, 'disabled');
-		res = { ok: true, interface: iface };
+		res = { ...applied, interface: iface };
 	} catch (e) {
 		res = { error: '' + e };
 	}
-	_common.release_lock(lock);
 	return res;
+}
+
+// Remove the key of the bank entry `instance` uses. The entry is shared, so
+// every instance on it goes down (see nordvpn.credentials.clear_key()).
+function clear_credentials(uci, instance) {
+	return _creds.clear_instance(uci, instance);
+}
+
+// Create a new VPN instance section with its own interface. Committed
+// atomically here (not via the UI's staged-apply machinery, whose rollback
+// window makes programmatic section creation fragile).
+function create_instance_inner(uci, name, credential) {
+	let valid = _common.validate_instance(name);
+	if (!valid || valid != name)
+		return { error: 'invalid instance name' };
+	if (name == 'globals')
+		return { error: 'this name is reserved' };
+	if (uci.get('nordvpn', name) != null)
+		return { error: 'an instance with this name already exists' };
+
+	let iface = validate_interface('nv_' + name);
+	if (!iface)
+		return { error: 'instance name is too long for an interface name' };
+	let taken = false;
+	for (let other in _common.list_instances(uci))
+		if (load_settings(uci, other).interface == iface)
+			taken = true;
+	if (taken || uci.get('network', iface) != null)
+		return { error: 'interface ' + iface + ' already exists' };
+
+	// New instances share the 'default' credentials unless told otherwise.
+	let cred = (credential == null || credential == '') ? _creds.DEFAULT_ID : credential;
+	if (!_creds.exists(uci, cred))
+		return { error: 'no such credentials' };
+
+	let key = validate_wg_key(uci.get(_creds.PKG, cred, 'private_key'));
+	let p = _transaction.plan(uci, function(desired) {
+		desired.set('nordvpn', name, 'instance');
+		desired.set('nordvpn', name, 'interface', iface);
+		desired.set('nordvpn', name, 'enabled', '1');
+		if (cred != _creds.DEFAULT_ID) desired.set('nordvpn', name, 'credential', cred);
+		if (key) {
+			desired.set('network', iface, 'interface');
+			desired.set('network', iface, 'proto', 'wireguard');
+			desired.set('network', iface, 'vpn_type', 'nordvpn');
+			desired.set('network', iface, 'private_key', key);
+			desired.set('network', iface, 'addresses', [ FIXED_ADDRESS ]);
+		}
+		return { interface: iface };
+	});
+	p.reloads = [];
+	let applied = commit_routing(uci, p);
+	if (!applied.ok) return applied;
+	if (key) record_event(name, 'credentials_set');
+	return { ...applied, instance: name, interface: iface, credential: cred, configured: !!key };
+}
+
+// Tear down a VPN instance: stamped routing/firewall objects, the netifd
+// interface + peer, and the config section. 'main' is special — it anchors
+// the shared cache options and the UI, so instead of deleting the section its
+// options are reset to the shipped defaults (the migration stamp is kept).
+function delete_instance_inner(uci, name) {
+	if (uci.get('nordvpn', name) == null)
+		return { error: 'no such instance' };
+
+	let s = load_settings(uci, name);
+	let iface = validate_interface(s.interface);
+	if (!iface)
+		return { error: 'invalid interface name' };
+
+	let at_risk = wan_default_at_risk(uci);
+	// Remove stamped artifacts by enforcing the all-off state.
+	s.auto_routing = false;
+	s.killswitch = false;
+	s.block_ipv6 = false;
+	s.vpn_dns = 'off';
+	s.use_vpn_dns = false;
+	s.source_networks = [];
+	s.source_devices = [];
+	s.source_domains = [];
+	s.source_ips = [];
+	s.bypass_devices = [];
+	s.bypass_domains = [];
+	s.bypass_ips = [];
+	let managed = managed_interface(uci, iface);
+	let routing = _transaction.plan(uci, function(desired, tables) {
+		let result = enforce_routing(desired, s, { rt_tables: tables });
+		if (managed) {
+			let peer = find_peer(desired, iface);
+			if (peer) desired.delete('network', peer);
+			desired.delete('network', iface);
+		}
+		if (name == 'main') {
+			for (let k in desired.get_all('nordvpn', name))
+				if (substr(k, 0, 1) != '.' && k != 'config_version') desired.delete('nordvpn', name, k);
+		} else desired.delete('nordvpn', name);
+		return result;
+	});
+	if (managed) { routing.activation = activation(iface, false); routing.activation.before_configuration = true; }
+	let applied = commit_routing(uci, routing);
+	if (!applied.ok) return applied;
+	if (at_risk) restore_wan_default_async();
+	_history.clear_events(name);
+	return { ...applied, ...(name == 'main' ? { reset: name } : { deleted: name }), interface: iface };
+}
+
+// All short entry points acquire ownership before reading configuration.
+function short_mutation(name, work) {
+	if (!validate_instance(name))
+		return { error: 'invalid instance name' };
+	let owner = _mutation.acquire([ name ]);
+	if (owner.busy)
+		return owner;
+	let result;
+	try {
+		result = _mutation.configuration(function(fresh) { return work(fresh); });
+	} catch (e) {
+		result = { busy: index('' + e, 'busy') >= 0, error: '' + e };
+	}
+	_mutation.release(owner.locks);
+	return result;
+}
+
+function apply_routing(uci, name) {
+	name = (name == null || name == '') ? 'main' : name;
+	return short_mutation(name, function(fresh) {
+		if (fresh.get('nordvpn', name) == null)
+			return { error: 'no such instance' };
+		let invalid = _mutation.validate_owner(fresh, name);
+		if (invalid)
+			return { error: invalid };
+		return apply_routing_inner(fresh, name);
+	});
+}
+
+function disconnect(uci, name) {
+	name = (name == null || name == '') ? 'main' : name;
+	return short_mutation(name, function(fresh) {
+		if (fresh.get('nordvpn', name) == null)
+			return { error: 'no such instance' };
+		let invalid = _mutation.validate_owner(fresh, name);
+		if (invalid)
+			return { error: invalid };
+		return disconnect_inner(fresh, name);
+	});
+}
+
+function delete_instance(uci, name) {
+	name = (name == null || name == '') ? 'main' : name;
+	return short_mutation(name, function(fresh) {
+		let iface = load_settings(fresh, name).interface;
+		if (managed_interface(fresh, iface)) {
+			let invalid = _mutation.validate_owner(fresh, name);
+			if (invalid)
+				return { error: invalid };
+		}
+		return delete_instance_inner(fresh, name);
+	});
+}
+
+function create_instance(uci, name, credential) {
+	let migration = _creds.migrate(cursor());
+	if (type(migration) == 'object' && migration.error)
+		return migration;
+	return short_mutation(name, function(fresh) { return create_instance_inner(fresh, name, credential); });
 }
 
 // Disable every configured instance, attempting all of them even if one has
@@ -985,128 +985,5 @@ function disable_all(uci) {
 	return { ok: length(errors) == 0, disabled, errors };
 }
 
-// Remove the key of the bank entry `instance` uses. The entry is shared, so
-// every instance on it goes down (see nordvpn.credentials.clear_key()).
-function clear_credentials(uci, instance) {
-	let iface = validate_interface(load_settings(uci, instance).interface);
-	if (!iface)
-		return { error: 'invalid interface name' };
-	if (!managed_interface(uci, iface))
-		return { error: 'interface ' + iface + ' is not managed by nordvpn' };
-	_creds.migrate(uci);
-	let res = _creds.clear_key(uci, _creds.instance_credential(uci, instance));
-	if (res.ok)
-		res.interface = iface;
-	return res;
-}
-
-// Create a new VPN instance section with its own interface. Committed
-// atomically here (not via the UI's staged-apply machinery, whose rollback
-// window makes programmatic section creation fragile).
-function create_instance(uci, name, credential) {
-	let valid = _common.validate_instance(name);
-	if (!valid || valid != name)
-		return { error: 'invalid instance name' };
-	if (name == 'globals')
-		return { error: 'this name is reserved' };
-	if (uci.get('nordvpn', name) != null)
-		return { error: 'an instance with this name already exists' };
-
-	let iface = validate_interface('nv_' + name);
-	if (!iface)
-		return { error: 'instance name is too long for an interface name' };
-	let taken = false;
-	for (let other in _common.list_instances(uci))
-		if (load_settings(uci, other).interface == iface)
-			taken = true;
-	if (taken || uci.get('network', iface) != null)
-		return { error: 'interface ' + iface + ' already exists' };
-
-	// New instances share the 'default' credentials unless told otherwise.
-	_creds.migrate(uci);
-	let cred = (credential == null || credential == '') ? _creds.DEFAULT_ID : credential;
-	if (!_creds.exists(uci, cred))
-		return { error: 'no such credentials' };
-
-	uci.set('nordvpn', name, 'instance');
-	uci.set('nordvpn', name, 'interface', iface);
-	uci.set('nordvpn', name, 'enabled', '1');
-	if (cred != _creds.DEFAULT_ID)
-		uci.set('nordvpn', name, 'credential', cred);
-	uci.commit('nordvpn');
-
-	let key = _creds.sync_instance(uci, name) == 'set';
-	if (key) {
-		uci.commit('network');
-		record_event(name, 'credentials_set');
-	}
-	return { ok: true, instance: name, interface: iface, credential: cred, configured: key };
-}
-
-// Tear down a VPN instance: stamped routing/firewall objects, the netifd
-// interface + peer, and the config section. 'main' is special — it anchors
-// the shared cache options and the UI, so instead of deleting the section its
-// options are reset to the shipped defaults (the migration stamp is kept).
-function delete_instance(uci, name) {
-	if (uci.get('nordvpn', name) == null)
-		return { error: 'no such instance' };
-
-	let s = load_settings(uci, name);
-	let iface = validate_interface(s.interface);
-	if (!iface)
-		return { error: 'invalid interface name' };
-
-	let at_risk = wan_default_at_risk(uci);
-	// Remove stamped artifacts by enforcing the all-off state.
-	s.auto_routing = false;
-	s.killswitch = false;
-	s.block_ipv6 = false;
-	s.vpn_dns = 'off';
-	s.use_vpn_dns = false;
-	s.source_networks = [];
-	s.source_devices = [];
-	s.source_domains = [];
-	s.source_ips = [];
-	s.bypass_devices = [];
-	s.bypass_domains = [];
-	s.bypass_ips = [];
-	let routing = enforce_routing(uci, s);
-	if (commit_routing(uci, routing))
-		uci = cursor(); // see apply(): committed deletions break iteration
-
-	// The instance section goes either way, but a foreign interface it merely
-	// pointed at (wan, a user tunnel) is never taken down or stripped.
-	if (managed_interface(uci, iface)) {
-		run([ 'ifdown', iface ]);
-		let peer = find_peer(uci, iface);
-		if (peer)
-			uci.delete('network', peer);
-		if (uci.get('network', iface) != null)
-			uci.delete('network', iface);
-		uci.commit('network');
-	}
-
-	if (name == 'main') {
-		let all = uci.get_all('nordvpn', 'main');
-		for (let k in all) {
-			if (substr(k, 0, 1) == '.' || k == 'config_version')
-				continue;
-			uci.delete('nordvpn', 'main', k);
-		}
-		uci.commit('nordvpn');
-		if (at_risk)
-			restore_wan_default_async();
-		_history.clear_events(name);
-		return { ok: true, reset: name, interface: iface };
-	}
-
-	uci.delete('nordvpn', name);
-	uci.commit('nordvpn');
-	if (at_risk)
-		restore_wan_default_async();
-	_history.clear_events(name);
-	return { ok: true, deleted: name, interface: iface };
-}
-
-return { set_credentials, clear_credentials, current_key, current_peer, restore_peer, write_relay, bring_up, verify_handshake, netifd_hint, tunnel_hint, connect_one, tunnel_fingerprint, wan_default_at_risk, prefer_current, keep_running, parse_nft_elements, nft_set_elements, commit_routing, APPLY_SOURCES, apply_source, apply_event, apply, apply_routing, disconnect, disable_all, create_instance, delete_instance, restore_wan_default, restore_wan_default_async,
+return { routing_adapters, routing_plan, set_credentials, clear_credentials, current_key, current_peer, restore_peer, restore_connection, write_relay, bring_up, verify_handshake, netifd_hint, tunnel_hint, connect_one, connect_one_result, tunnel_fingerprint, wan_default_at_risk, prefer_current, keep_running, parse_nft_elements, nft_set_elements, commit_routing, APPLY_SOURCES, apply_source, apply_event, apply, apply_routing, disconnect, disable_all, create_instance, delete_instance, restore_wan_default, restore_wan_default_async,
 	write_apply_status, read_apply_status, apply_running, apply_status_report, run_job, run_apply, start_job, start_apply };

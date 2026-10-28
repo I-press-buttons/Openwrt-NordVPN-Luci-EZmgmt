@@ -1,9 +1,9 @@
 name: CI
 
-# Feature branches run CI, open a PR to master, and merge after every check
-# passes. Master changes are still tested; releases come from the nightly build
-# (once a day, only when master changed since the last release) and annotated
-# v* tags (a deliberate version bump).
+# Feature branches run static/unit checks and open a PR to master. Passing
+# feature PRs are squash-merged after those checks; branch protections apply.
+# Package builds stay opt-in: manual dispatch, changed nightlies and v* tags.
+# Nightlies publish at most once a day when master changed.
 on:
   push:
     branches: ["**", "!gh-pages"]
@@ -14,9 +14,10 @@ on:
     # 06:17 UTC daily (off the hour, where scheduled runs queue up).
     - cron: "17 6 * * *"
   workflow_dispatch:
+    # Manual runs build packages; optionally publish a changed nightly too.
     inputs:
       nightly:
-        description: "Publish a nightly release of master now (skipped if master is unchanged)"
+        description: "Also publish a nightly release of master (skipped if unchanged)"
         type: boolean
         default: false
 
@@ -27,7 +28,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Decides whether this run builds at all and, for a nightly, its release
+  # Decides whether this run proceeds and, for a nightly, its release
   # number: today's UTC date (YYYYMMDD), so each nightly's package version
   # (e.g. 1.7.0-r20260930) is higher than the last and apk upgrades to it.
   changes:
@@ -134,10 +135,13 @@ jobs:
             nordvpn-wireguard/files/usr/bin/nordvpn-cache-update \
             nordvpn-wireguard/files/usr/bin/nordvpn-cache-query \
             nordvpn-wireguard/files/usr/bin/nordvpn-apply \
+            nordvpn-wireguard/files/usr/bin/nordvpn-probe \
+            nordvpn-wireguard/files/usr/bin/nordvpn-service \
             nordvpn-wireguard/files/usr/bin/nordvpn-rotate \
             nordvpn-wireguard/files/usr/bin/nordvpn-update; do
             echo "ucode -c $f"
-            "$UC" -L "$MOCKS/*.uc" -L "$LIB/*.uc" -L "$B/*.so" -c "$f"
+            "$UC" -L "$MOCKS/*.uc" -L "$LIB/*.uc" -L "$B/*.so" \
+              -L "$PWD/nordvpn-wireguard/tests/compile/*.uc" -c "$f"
           done
       - name: Run offline fixture/unit tests (modules compiled by import)
         run: |
@@ -147,10 +151,14 @@ jobs:
 
   build-backend:
     name: Build packages (snapshot SDK, apk)
-    # GitHub-hosted for every event: this fork has no self-hosted runner.
+    # Package builds are opt-in outside nightly and deliberate tag releases.
     runs-on: ubuntu-latest
     needs: changes
-    if: needs.changes.outputs.run == 'true'
+    if: >-
+      needs.changes.outputs.run == 'true' &&
+      (needs.changes.outputs.nightly != '' ||
+       github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')))
     steps:
       - uses: actions/checkout@v4
 
@@ -310,6 +318,7 @@ jobs:
         id: pr
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           HEAD_BRANCH: ${{ github.ref_name }}
         run: |
           pr=$(gh pr list --head "$HEAD_BRANCH" --base master --json number --jq '.[0].number')
@@ -319,12 +328,12 @@ jobs:
           fi
           echo "number=$pr" >> "$GITHUB_OUTPUT"
 
-  # A failed check leaves its PR open for fixes. When all static checks,
-  # frontend/backend tests, and both package builds pass, merge the PR.
+  # A failed check leaves its PR open for fixes. Package builds remain opt-in
+  # and do not gate ordinary feature pushes; all static and unit checks do.
   merge-feature-pr:
     name: Merge feature PR after checks
     runs-on: ubuntu-latest
-    needs: [changes, static, eslint, ucode, build-backend, open-feature-pr]
+    needs: [changes, static, eslint, ucode, open-feature-pr]
     if: github.event_name == 'push' && github.ref_type == 'branch' && github.ref != 'refs/heads/master' && needs.changes.outputs.run == 'true'
     permissions:
       contents: write
@@ -333,6 +342,7 @@ jobs:
       - name: Merge passing PR
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           PR_NUMBER: ${{ needs.open-feature-pr.outputs.number }}
         run: |
           # A newer push can arrive while this run is testing. Only merge the
@@ -342,7 +352,7 @@ jobs:
             echo "::notice::PR advanced to $head; waiting for that commit's checks"
             exit 0
           fi
-          gh pr merge "$PR_NUMBER" --squash --delete-branch
+          gh pr merge "$PR_NUMBER" --squash --delete-branch --match-head-commit "$GITHUB_SHA"
 
   # A nightly publishes v<PKG_VERSION>-r<YYYYMMDD> with notes generated from
   # the changes merged since the previous release. Pushing an annotated v*

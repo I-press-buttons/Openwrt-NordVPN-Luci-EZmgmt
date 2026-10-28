@@ -18,7 +18,8 @@ const validate_token = _common.validate_token,
       load_settings = _common.load_settings,
       list_instances = _common.list_instances,
       cache_file_path = _common.cache_file_path;
-const status = require('nordvpn.status').status;
+const _status = require('nordvpn.status');
+const status = _status.status;
 const _apply = require('nordvpn.apply');
 const apply = _apply.apply,
       set_credentials = _apply.set_credentials,
@@ -38,6 +39,8 @@ const read_events = require('nordvpn.history').read_events;
 const parse_insights = require('nordvpn.api').parse_insights;
 const list_clients = require('nordvpn.clients').clients;
 const detect_routing = require('nordvpn.routing').detect;
+const probes = require('nordvpn.probes');
+const probe_state = require('nordvpn.probe_state').store;
 const _creds = require('nordvpn.credentials');
 const _cache = require('nordvpn.cache');
 const read_cache = _cache.read_cache,
@@ -74,9 +77,10 @@ function req_instance(uci, request) {
 
 // The page polls this for every instance every few seconds, so the settings
 // and the per-instance state file are each read once per instance.
-function build_status(uci, name) {
-	let s = load_settings(uci, name);
-	let st = status(uci, name, s);
+function build_status(uci, name, s, snapshot, generations) {
+	s = s || load_settings(uci, name);
+	snapshot = snapshot || _status.collect_runtime([ s ]);
+	let st = status(uci, name, s, snapshot);
 	let state = read_state(name);
 	if (state && state.last_success)
 		st.rotation.last_success = state.last_success;
@@ -85,8 +89,9 @@ function build_status(uci, name) {
 	st.state = effective_state(s, st.state, state, st.gateway);
 	st.egress = egress_report(s, state, st.gateway);
 	let last = (state && type(state.last_attempt) == 'int') ? state.last_attempt : 0;
-	st.rotation.next_run = next_rotation(s, last, time());
-	st.routing = detect_routing(uci, s, true);
+	st.rotation.next_run = next_rotation(s, last, snapshot.at);
+	st.routing = detect_routing(uci, s, true, snapshot);
+	st.probe_generation = probes.context(uci, name, probe_state.version(generations || probe_state.load(), name), s).generation;
 	return st;
 }
 
@@ -107,8 +112,10 @@ methods.instances = {
 	call: function() {
 		let uci = cursor();
 		let out = [];
-		for (let name in list_instances(uci))
-			push(out, build_status(uci, name));
+		let settings = map(list_instances(uci), (name) => load_settings(uci, name));
+		let snapshot = _status.collect_runtime(settings), generations = probe_state.load();
+		for (let s in settings)
+			push(out, build_status(uci, s.name, s, snapshot, generations));
 		return { instances: out };
 	}
 };
@@ -121,9 +128,11 @@ methods.overview = {
 	call: function() {
 		let uci = cursor();
 		let out = [];
-		for (let name in list_instances(uci)) {
-			let s = load_settings(uci, name);
-			let st = status(uci, name, s);
+		let settings = map(list_instances(uci), (name) => load_settings(uci, name));
+		let snapshot = _status.collect_runtime(settings);
+		for (let s in settings) {
+			let name = s.name;
+			let st = status(uci, name, s, snapshot);
 			push(out, {
 				instance: st.instance,
 				state: effective_state(s, st.state, read_state(name), st.gateway),
@@ -287,8 +296,9 @@ methods.clients = {
 
 // A refresh whose worker died reads as an error, not as forever 'running'.
 methods.refresh_status = {
-	call: function() {
-		return fetch_status_report() || { state: 'idle' };
+	args: { id: '' },
+	call: function(request) {
+		return fetch_status_report(null, ((request || {}).args || {}).id) || { state: 'idle' };
 	}
 };
 
@@ -330,6 +340,23 @@ methods.external_ip = {
 	}
 };
 
+// Additive asynchronous API. These handlers never make remote requests.
+// The legacy external_ip above remains synchronous for existing callers.
+methods.external_ip_status = {
+	args: { instance: '', id: '' },
+	call: function(request) {
+		let name = req_instance(cursor(), request);
+		return name ? probes.service.status(name, ((request || {}).args || {}).id) : { error: 'no such instance' };
+	}
+};
+methods.external_ip_start = {
+	args: { instance: '' },
+	call: function(request) {
+		let name = req_instance(cursor(), request);
+		return name ? probes.service.start(name) : { error: 'no such instance' };
+	}
+};
+
 // ── Write methods ────────────────────────────────────────────────────
 
 // Store a token's key in the credential bank. `credential` replaces that
@@ -343,7 +370,6 @@ methods.set_credentials = {
 			return { error: 'invalid token format' };
 		let uci = cursor();
 		if ((a.credential != null && a.credential != '') || (a.name != null && a.name != '')) {
-			_creds.migrate(uci);
 			return _creds.set(uci, a.token, a.credential, a.name, null);
 		}
 		let name = req_instance(uci, request);
@@ -362,7 +388,7 @@ methods.apply = {
 		let name = req_instance(uci, request);
 		if (!name)
 			return { error: 'no such instance' };
-		return apply(uci, name, req_source(request));
+		return apply(uci, name, req_source(request), 0);
 	}
 };
 
@@ -400,19 +426,23 @@ methods.apply_routing = {
 
 // Apply progress/outcome for the UI.
 methods.apply_status = {
+	args: { id: '' },
 	call: function(request) {
-		return _apply.apply_status_report() || { state: 'idle' };
+		return _apply.apply_status_report(null, (request.args || {}).id) || { state: 'idle' };
 	}
 };
 
 methods.refresh_locations = {
 	call: function() {
-		let running = fetch_status_report();
-		if (running && running.state == 'running')
-			return { job: running.started_at, already_running: true };
-		// Detached one-shot worker; fixed command, no user input, no shell injection.
-		system('/usr/bin/nordvpn-cache-update >/dev/null 2>&1 &');
-		return { job: '' + time(), started: true };
+		let path = cache_file_path(load_settings(cursor()));
+		let result = _cache.spawn_refresh(path, function(st) {
+			let r = _common.run([ 'sh', '-c', '/usr/bin/nordvpn-cache-update --job-id ' +
+				st.id + ' >/dev/null 2>&1 & echo $!' ]);
+			let out = trim(r.stdout || '');
+			return r.code == 0 && _common.full_match(out, /^[0-9]+$/) && int(out) > 0
+				? { pid: int(out) } : { error: 'could not start the server list worker' };
+		});
+		return { ...result, job: result.apply ? result.apply.id : null };
 	}
 };
 
@@ -450,7 +480,6 @@ methods.remove_credentials = {
 	call: function(request) {
 		let a = request.args || {};
 		let uci = cursor();
-		_creds.migrate(uci);
 		return _creds.remove(uci, a.credential);
 	}
 };
@@ -461,7 +490,6 @@ methods.clear_credentials = {
 		let uci = cursor();
 		let a = request.args || {};
 		if (a.credential != null && a.credential != '') {
-			_creds.migrate(uci);
 			return _creds.clear_key(uci, a.credential);
 		}
 		let name = req_instance(uci, request);
@@ -506,7 +534,7 @@ methods.rotate_now = {
 		let name = req_instance(uci, request);
 		if (!name)
 			return { error: 'no such instance' };
-		return rotate(uci, name, 'manual');
+		return rotate(uci, name, 'manual', 0);
 	}
 };
 

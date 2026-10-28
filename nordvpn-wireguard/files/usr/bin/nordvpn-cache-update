@@ -1,7 +1,7 @@
 #!/usr/bin/ucode -S
 // SPDX-License-Identifier: MIT
 // One-shot NordVPN server-list cache updater. Invoked by the nordvpn procd
-// service and safe to run manually. Any CLI arguments are ignored.
+// service and safe to run manually. Optional --job-id claims a reservation.
 
 'use strict';
 
@@ -16,7 +16,10 @@ let uci = cursor();
 let settings = load_settings(uci);
 let path = cache_file_path(settings);
 
-let res = fetch_and_build(path);
+let job_index = index(ARGV, '--job-id');
+let job_id = job_index >= 0 ? ARGV[job_index + 1] : null;
+if (job_index >= 0 && !job_id) exit(1);
+let res = fetch_and_build(path, job_id);
 if (!res || res.error) {
 	log('cache update failed: ' + (res ? res.error : 'unknown error'));
 	exit(1);

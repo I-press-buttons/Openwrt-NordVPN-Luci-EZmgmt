@@ -17,6 +17,7 @@ const load_settings = _common.load_settings,
       list_instances = _common.list_instances,
       cache_file_path = _common.cache_file_path,
       log = _common.log;
+const tasks = require('nordvpn.task_guard').create(uloop, { log: log });
 const _cache = require('nordvpn.cache');
 const fetch_and_build = _cache.fetch_and_build,
       read_cache = _cache.read_cache,
@@ -44,10 +45,8 @@ const record_event = require('nordvpn.history').record_event;
 
 // uloop only calls a task's result callback for a result the child actually
 // sent, so a child that is killed (the OOM killer, a stray `kill`) never
-// reports back. A job in flight for longer than this is presumed dead and may
-// be started again. Generous on purpose: a refresh is dozens of paged API
-// calls, a probe a few pings.
-const REFRESH_STUCK = 1800;
+// reports back. Probe children have a bounded age fallback. Cache refreshes
+// instead recover from their persisted process identity and ownership.
 const PROBE_STUCK = 120;
 
 function errmsg(e) {
@@ -66,12 +65,11 @@ uloop.init();
 
 // Server-list refresh clock: epoch of the last refresh (attempt), seeded from
 // the cache file on the first tick; the cache path it belongs to; consecutive
-// failed attempts (retry backoff); and the start of a refresh still in flight
-// (0 = none).
+// failed attempts (retry backoff). Persisted refresh ownership handles overlap.
 let last_cache = null;
 let cache_path = null;
 let refresh_fails = 0;
-let refreshing = 0;
+let refresh_job = null;
 // Start of the child reading the cache's age to seed that clock (0 = none).
 let seeding = 0;
 // Instances with a probe child in flight, by start epoch: a slow probe (every
@@ -88,8 +86,9 @@ function in_flight(since, now, ceiling) {
 // probe fields when it returns. Only transitions reach the event history.
 function start_probe(inst, dev, gateway, targets) {
 	probing[inst] = time();
-	uloop.task(
+	tasks.start(
 		function() {
+			_common.drop_inherited_locks();
 			try {
 				return egress_probe(dev, targets);
 			} catch (e) {
@@ -116,6 +115,22 @@ function start_probe(inst, dev, gateway, targets) {
 	);
 }
 
+// Fold a particular reservation once. A late callback cannot reset the retry
+// clock or failure streak of a newer refresh. Death recovery uses this same
+// path even when uloop receives no result from the child.
+function refresh_result(id, path, res) {
+	if (refresh_job != id) return;
+	let latest = _cache.read_fetch_status();
+	refresh_job = null;
+	if (latest && latest.id != id) return;
+	if (cache_path != path) return;
+	last_cache = time();
+	if (type(res) == 'object' && res.ok) { refresh_fails = 0; return; }
+	refresh_fails++;
+	log('server list refresh failed: ' +
+		((type(res) == 'object' && res.error) ? res.error : 'unknown error') + '; retrying with backoff');
+}
+
 // The server-list cache is shared by all instances; refresh it once.
 function refresh_step(uci, now) {
 	let shared = load_settings(uci);
@@ -133,8 +148,9 @@ function refresh_step(uci, now) {
 		if (in_flight(seeding, now, PROBE_STUCK))
 			return;
 		seeding = now;
-		uloop.task(
+		tasks.start(
 			function() {
+				_common.drop_inherited_locks();
 				try {
 					let c = read_cache(path);
 					return { cached_at: c ? c.cached_at : null, stale: is_stale(c, time()) };
@@ -174,40 +190,44 @@ function refresh_step(uci, now) {
 		}
 	}
 
-	if (in_flight(refreshing, now, REFRESH_STUCK) ||
+	// Status recovers dead workers by PID/start identity. Live pagination has
+	// no age cutoff and cannot accumulate duplicate scheduler tasks.
+	let current = _cache.fetch_status_report();
+	if (current && current.id == refresh_job && current.state != 'running')
+		refresh_result(refresh_job, path, { ok: current.state == 'done', error: current.message || current.error });
+	if ((current && current.state == 'running') ||
 	    !should_refresh(shared, last_cache, now, refresh_fails))
 		return;
+	let reservation = _cache.reserve_refresh(path);
+	if (!reservation.started) return;
 	last_cache = now;
-	refreshing = now;
-	uloop.task(
-		function() {
-			// Only the outcome crosses the pipe, never the server list.
-			try {
-				let r = fetch_and_build(path);
-				return (r && !r.error) ? { ok: true } : { ok: false, error: r ? r.error : 'fetch failed' };
-			} catch (e) {
-				return { ok: false, error: errmsg(e) };
-			}
-		},
-		function(res) {
-			refreshing = 0;
-			if (type(res) == 'object' && res.ok) {
-				refresh_fails = 0;
-				return;
-			}
-			// Another refresh (the UI's) holding the lock is not a failure.
-			if (type(res) == 'object' && res.error == 'refresh already in progress')
-				return;
-			refresh_fails++;
-			log('server list refresh failed: ' +
-				((type(res) == 'object' && res.error) ? res.error : 'unknown error') +
-				'; retrying with backoff');
+	let refresh_id = reservation.apply.id;
+	refresh_job = refresh_id;
+	try {
+		let task = tasks.start(
+			function() {
+				_common.drop_inherited_locks();
+				// Only the outcome crosses the pipe, never the server list.
+				try {
+					let r = fetch_and_build(path, refresh_id);
+					return (r && !r.error) ? { ok: true } : { ok: false, error: r ? r.error : 'fetch failed' };
+				} catch (e) {
+					return { ok: false, error: errmsg(e) };
+				}
+			},
+			function(res) { refresh_result(refresh_id, path, res); }
+		);
+		if (!task) {
+			_cache.fail_refresh(refresh_id, 'could not start the server list worker');
+			refresh_result(refresh_id, path, { error: 'could not start the server list worker' });
 		}
-	);
+	} catch (e) {
+		_cache.fail_refresh(refresh_id, 'could not start the server list worker: ' + errmsg(e));
+		refresh_result(refresh_id, path, { error: errmsg(e) });
+	}
 }
 
-function instance_step(uci, inst, now, hm) {
-	let s = load_settings(uci, inst);
+function instance_step(uci, inst, now, hm, s, runtime) {
 	// One read of the per-instance state serves the rotation clock and the
 	// watchdog below (mark_attempt only adds the clock field).
 	let st = read_state(inst) || {};
@@ -222,7 +242,7 @@ function instance_step(uci, inst, now, hm) {
 		mark_attempt(now, inst);
 	} else if (should_rotate(s, last, now, hm)) {
 		mark_attempt(now, inst);
-		uloop.task(function() { rotate(null, inst, 'schedule'); });
+		tasks.start(function() { _common.drop_inherited_locks(); rotate(null, inst, 'schedule'); });
 	}
 
 	// Watchdog timers persist in the per-instance rotate state across daemon
@@ -254,7 +274,7 @@ function instance_step(uci, inst, now, hm) {
 			return;
 	}
 
-	let cur = status(uci, inst, s);
+	let cur = status(uci, inst, s, runtime());
 	if (should_probe(s, cur.state) && cur.device && cur.gateway &&
 	    !in_flight(probing[inst] || 0, now, PROBE_STUCK))
 		start_probe(inst, cur.device, cur.gateway, s.probe_targets);
@@ -283,8 +303,9 @@ function instance_step(uci, inst, now, hm) {
 		record({ last_recover: now }, inst);
 		record_event(inst, 'watchdog', { server: cur.gateway, reason: state,
 			detail: sprintf('unhealthy for %d s', now - ds) });
-		uloop.task(
+		tasks.start(
 			function() {
+				_common.drop_inherited_locks();
 				try {
 					return rotate(null, inst, 'watchdog');
 				} catch (e) {
@@ -321,9 +342,20 @@ function tick() {
 		} catch (e) {
 			log('scheduler: server list refresh: ' + errmsg(e));
 		}
+		let settings = [];
 		for (let name in list_instances(uci)) {
+			try { push(settings, load_settings(uci, name)); }
+			catch (e) { log('scheduler: instance ' + name + ': ' + errmsg(e)); }
+		}
+		let snapshot = null;
+		let runtime = function() {
+			if (!snapshot) snapshot = _status.collect_runtime(settings, now);
+			return snapshot;
+		};
+		for (let s in settings) {
+			let name = s.name;
 			try {
-				instance_step(uci, name, now, hm);
+				instance_step(uci, name, now, hm, s, runtime);
 			} catch (e) {
 				log('scheduler: instance ' + name + ': ' + errmsg(e));
 			}
@@ -334,6 +366,6 @@ function tick() {
 }
 
 // Re-check every 30s; run once immediately at startup.
-uloop.interval(30000, tick);
+uloop.interval(30000, function() { tasks.check(); tick(); });
 tick();
 uloop.run();

@@ -33,8 +33,7 @@ This project does all of that from one LuCI page:
 - **No LuCI required.** The backend works from the command line and over
   ubus too, so scripts and headless routers can use it.
 
-This is a fork of [**Aladex/nordvpn-luci**](https://github.com/Aladex/nordvpn-luci)
-that adds the extra features marked **(fork)** below.
+Extra features developed for this project are marked **(fork)** below.
 
 ## Features
 
@@ -193,7 +192,8 @@ at most once a day and only when something was merged. It is tagged
 `v<version>-r<date>` (for example `v1.7.0-r20260930`), and the packages carry
 the same version, so `apk upgrade` picks up each new nightly. Download both
 architecture-independent `.apk` files from the newest release.
-Pull request builds are available as the `nordvpn-packages` artifact on the
+To build packages on demand, run the CI workflow manually; its
+`nordvpn-packages` artifact is available on the
 [Actions page](https://github.com/I-press-buttons/Openwrt-NordVPN-Luci-EZmgmt/actions).
 Then, on the router:
 
@@ -236,10 +236,6 @@ wait a few seconds and reload the page. VPN configuration is retained by apk.
 
 Log out of LuCI and back in, then open **VPN → NordVPN**. Installing only
 `nordvpn-wireguard` gives you a headless CLI/ubus service.
-
-> The signed package feed at `aladex.github.io/nordvpn-luci` belongs to the
-> original project and serves the **upstream** packages, without this fork's
-> additions.
 
 ### Build from source
 
@@ -484,7 +480,10 @@ and secrets are never returned.
 ubus call nordvpn status            # runtime state, location, handshake age
 ubus call nordvpn instances         # status of every configured VPN instance
 ubus call nordvpn overview          # lightweight per-instance summary (Status page card)
-ubus call nordvpn external_ip       # NordVPN's view: protected, public IP, city, ISP
+ubus call nordvpn external_ip_status '{"instance":"main"}' # read cached protection/freshness (no HTTP)
+ubus call nordvpn external_ip_start '{"instance":"main"}'  # start/deduplicate background check (write access)
+ubus call nordvpn external_ip_status '{"instance":"main","id":"<returned-id>"}' # poll that exact check
+ubus call nordvpn external_ip       # legacy synchronous compatibility endpoint (may block rpcd for 8–16 seconds)
 ubus call nordvpn history '{"instance":"main"}'  # recent events, newest first
 ubus call nordvpn disconnect        # take the tunnel down, pause rotation
 ubus call nordvpn credentials       # credential bank: names, status, which instances use each
@@ -500,6 +499,11 @@ ubus call nordvpn rotate_now        # one-shot rotation (waits for the result)
 ubus call nordvpn rotate_start      # the same in the background; poll apply_status
 ubus call nordvpn refresh_locations # start an async server-list refresh
 ```
+
+LuCI uses the asynchronous protection check. Only `state: fresh` carries a current
+provider verdict; pending, stale and failed checks remain visible. Read-only users
+can inspect cached observations. See [probe API and validation](docs/development/async-probes.md)
+for expiry, retry limits and the retained synchronous endpoint's limitations.
 
 `status`, `apply`, `apply_routing`, `rotate_now`, `rotate_start` and
 `set_credentials` accept an `instance` argument (default `main`).
@@ -722,9 +726,6 @@ supported.
 
 ## Related projects
 
-- [**Aladex/nordvpn-luci**](https://github.com/Aladex/nordvpn-luci) is the
-  original project this fork is based on, and it has its own signed package
-  feed at <https://aladex.github.io/nordvpn-luci/>.
 - [**NordVPN Lite**](https://nordvpn.com/blog/nordvpn-for-openwrt-routers/) is
   the official, deliberately minimal OpenWrt client: one NordLynx connection
   with a basic setup.
@@ -745,12 +746,16 @@ sh nordvpn-wireguard/tests/run.sh
 ```
 
 CI (`.github/workflows/build.yml`) runs shell and JSON checks, ESLint on the
-LuCI view, the ucode tests, and a snapshot-SDK build of both packages on pull
-requests and branch pushes. Pushing a feature branch opens a PR to `master`;
-once all checks pass, CI squash-merges it and deletes the branch. A failed run
-leaves the PR open. GitHub's branch protection and review rules still apply.
-Pushes to `master` don't open PRs. CI runs on them but doesn't publish anything
-unless the nightly or tagged release conditions below are met.
+LuCI view, and the ucode tests on every pull request and branch push (except
+`gh-pages`). Pushing a feature branch opens a PR to `master`; once those checks
+pass, CI squash-merges the exact tested commit and deletes the branch. Failed
+checks leave the PR open. GitHub's branch protection and review rules still
+apply. Pushes to `master` do not open PRs.
+
+Package builds run only for changed nightlies, deliberate version tags, or a
+manual workflow run. A manual run with *nightly* unticked builds both packages
+with the snapshot SDK and uploads the `nordvpn-packages` artifact without
+publishing a release.
 
 Releases come from two places:
 

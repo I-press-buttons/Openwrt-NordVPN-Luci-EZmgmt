@@ -1,7 +1,7 @@
 #!/bin/sh
 # SPDX-License-Identifier: MIT
 # Offline ucode unit/fixture tests for nordvpn-wireguard. No network or account.
-# Requires ucode + ucode-mod-fs + ucode-mod-math. 'uci'/'ubus' are mocked and
+# Requires python3 and ucode + ucode-mod-fs + ucode-mod-math. 'uci'/'ubus' are mocked and
 # forced ahead of the real modules on the search path, so no device is needed.
 #
 # Dev overrides for a locally-built ucode:
@@ -32,6 +32,12 @@ for t in "$here"/test_*.uc; do
 			-D fixture="$fixture" -D KEY="$key" -D RPCD="$rpcd" -S "$t" || status=1
 	fi
 done
+
+UCODE="$UCODE" UCODE_EXTRA_L="$UCODE_EXTRA_L" python3 "$here/test_mutation_process.py" || status=1
+UCODE="$UCODE" UCODE_EXTRA_L="$UCODE_EXTRA_L" python3 "$here/test_jobs_process.py" || status=1
+
+UCODE="$UCODE" UCODE_EXTRA_L="$UCODE_EXTRA_L" python3 "$here/test_cache_process.py" || status=1
+UCODE="$UCODE" UCODE_EXTRA_L="$UCODE_EXTRA_L" python3 "$here/test_probes_process.py" || status=1
 
 [ "$status" = 0 ] && echo "ALL TESTS PASSED" || echo "TESTS FAILED"
 exit "$status"

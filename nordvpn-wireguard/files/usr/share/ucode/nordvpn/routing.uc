@@ -11,8 +11,7 @@
 
 import { readfile } from 'fs';
 const _common = require('nordvpn.common');
-const run = _common.run,
-      atomic_write = _common.atomic_write;
+const run = _common.run;
 const _clients = require('nordvpn.clients');
 
 const MARK = 'nordvpn_managed';
@@ -430,10 +429,10 @@ function reconcile_local_routes(uci, iface, table, desired) {
 // unregistered name makes ip4table and lookup rules silently inert. Register
 // the instance's table with a stamped line (best effort). Numeric tables and
 // already-registered names need nothing.
-function ensure_rt_table(name) {
+function ensure_rt_table(name, state) {
 	if (_common.full_match(name, /^[0-9]+$/))
 		return true;
-	let data = readfile(RT_TABLES) || '';
+	let data = state.data;
 	let used = {};
 	for (let line in split(data, '\n')) {
 		let m = match(line, /^[ \t]*([0-9]+)[ \t]+([^ \t#]+)/);
@@ -446,22 +445,22 @@ function ensure_rt_table(name) {
 	for (let n = 100; n <= 252; n++) {
 		if (used['' + n])
 			continue;
-		return atomic_write(RT_TABLES,
-			data + (length(data) && substr(data, -1) != '\n' ? '\n' : '') +
-			sprintf('%d\t%s # %s\n', n, name, MARK));
+		state.data = data + (length(data) && substr(data, -1) != '\n' ? '\n' : '') +
+			sprintf('%d\t%s # %s\n', n, name, MARK);
+		return true;
 	}
 	return false;
 }
 
 // Numeric id of a routing table (a number, a builtin name, or a name
 // registered in rt_tables), or null when it cannot be resolved.
-function rt_table_id(name) {
+function rt_table_id(name, state) {
 	if (_common.full_match(name, /^[0-9]+$/))
 		return int(name);
 	let builtin = { main: 254, 'default': 253 };
 	if (builtin[name])
 		return builtin[name];
-	for (let line in split(readfile(RT_TABLES) || '', '\n')) {
+	for (let line in split(state ? state.data : (readfile(RT_TABLES) || ''), '\n')) {
 		let m = match(line, /^[ \t]*([0-9]+)[ \t]+([^ \t#]+)/);
 		if (m && m[2] == name)
 			return int(m[1]);
@@ -556,10 +555,10 @@ function device_owners(uci) {
 }
 
 // Remove ONLY a stamped rt_tables line for `name`; user entries are kept.
-function drop_rt_table(name) {
+function drop_rt_table(name, state) {
 	if (name == null || name == '' || _common.full_match(name, /^[0-9]+$/))
 		return;
-	let data = readfile(RT_TABLES);
+	let data = state.data;
 	if (!data || index(data, MARK) < 0)
 		return;
 	let kept = [];
@@ -573,7 +572,7 @@ function drop_rt_table(name) {
 		push(kept, line);
 	}
 	if (changed)
-		atomic_write(RT_TABLES, join('\n', kept));
+		state.data = join('\n', kept);
 }
 
 // Is routing table `name` any instance's (effective) table? `skip` names an
@@ -630,7 +629,7 @@ function dev_mtu(dev) {
 // the endpoint — NOT the tunnel). Found via the WAN firewall zone's networks so
 // an active auto-routing default through the tunnel does not mislead us. Returns
 // the smallest MTU across WAN devices, or null when it cannot be determined.
-function wan_l3_mtu_probe(uci) {
+function wan_l3_mtu_probe(uci, snapshot) {
 	let wannets = {};
 	uci.foreach('firewall', 'zone', function(sec) {
 		if (sec[MARK] == '1')
@@ -639,18 +638,15 @@ function wan_l3_mtu_probe(uci) {
 			for (let n in as_list(sec.network))
 				wannets[n] = 1;
 	});
-	let d = run([ 'ubus', 'call', 'network.interface', 'dump' ]);
-	if (d.code != 0)
-		return null;
-	let data;
-	try {
-		data = json(d.stdout);
-	} catch (e) {
-		return null;
+	let interfaces = snapshot ? (snapshot.netifd || []) : null;
+	if (interfaces == null) {
+		let d = run([ 'ubus', 'call', 'network.interface', 'dump' ]);
+		if (d.code != 0) return null;
+		try { interfaces = json(d.stdout)?.interface; } catch (e) { return null; }
 	}
 	let best = null;
-	for (let ifc in ((data ? data.interface : null) || [])) {
-		if (!ifc.up || !ifc.l3_device || !wannets[ifc.interface])
+	for (let ifc in (interfaces || [])) {
+		if (type(ifc) != 'object' || !ifc.up || !ifc.l3_device || !wannets[ifc.interface])
 			continue;
 		// Never count a WireGuard tunnel as the WAN uplink: it is the path
 		// WireGuard's UDP rides ON, not the uplink itself. Counting it creates
@@ -665,8 +661,8 @@ function wan_l3_mtu_probe(uci) {
 	return best;
 }
 
-function wan_l3_mtu(uci) {
-	return memo('wan_mtu', function() { return wan_l3_mtu_probe(uci); });
+function wan_l3_mtu(uci, snapshot) {
+	return memo('wan_mtu', function() { return wan_l3_mtu_probe(uci, snapshot); });
 }
 
 // Recommended WireGuard interface MTU for a given WAN MTU: subtract 80 (60 bytes
@@ -949,7 +945,7 @@ function device_zones(uci, macs) {
 //        'auto'    — route everything (auto_routing);
 //        'steered' — route the configured source networks via the instance table;
 //        'none'    — tunnel only, no managed routing.
-function detect(uci, s, runtime) {
+function detect(uci, s, runtime, snapshot) {
 	let iface = s.interface;
 	let zone = find_zone_of(uci, iface);
 	let peer = find_peer(uci, iface);
@@ -976,7 +972,7 @@ function detect(uci, s, runtime) {
 	// panel into the hands-off view, so the table can be used for steered mode.
 	let manual = user_routes > 0;
 
-	let wanmtu = runtime ? wan_l3_mtu(uci) : null;
+	let wanmtu = runtime ? wan_l3_mtu(uci, snapshot) : null;
 	return {
 		mode: manual ? 'manual' : (auto ? 'auto' : (steering ? 'steered' : 'none')),
 		all_lan_owner: owner,
@@ -1017,6 +1013,7 @@ function detect(uci, s, runtime) {
 // (tests). Returns { changed_network, changed_firewall, changed_dhcp,
 // domains_active, notes }.
 function enforce(uci, s, opts) {
+	let tables = opts?.rt_tables || { data: readfile(RT_TABLES) || '' };
 	let notes = [];
 	let cn = false, cf = false, cd = false;
 	let iface = s.interface;
@@ -1089,14 +1086,14 @@ function enforce(uci, s, opts) {
 	let steer_nets = steer ? (all_lan || s.source_networks) : [];
 	let table = s.routing_table;
 	if (steer) {
-		if (!ensure_rt_table(table))
-			push(notes, 'could not register routing table ' + table + ' in ' + RT_TABLES);
+		if (!ensure_rt_table(table, tables))
+			die('could not register routing table ' + table + ' in ' + RT_TABLES);
 	} else {
-		drop_rt_table(s.routing_table);
+		drop_rt_table(s.routing_table, tables);
 		// The implicit table of all-LAN exceptions is named after the
 		// interface; release it too once no other instance uses that name.
 		if (s.routing_table != iface && !table_in_use(uci, iface, s.name))
-			drop_rt_table(iface);
+			drop_rt_table(iface, tables);
 	}
 	if (reconcile_rules(uci, 'rule', 'steer_lookup', iface, steer_nets, function(net) {
 		return { 'in': net, lookup: table, priority: '20000' };
@@ -1117,7 +1114,7 @@ function enforce(uci, s, opts) {
 		});
 	for (let t in old_tables)
 		if (!table_in_use(uci, t))
-			drop_rt_table(t);
+			drop_rt_table(t, tables);
 	if (reconcile_rules(uci, 'rule', 'steer_ks', iface, (steer && s.killswitch) ? steer_nets : [], function(net) {
 		return { 'in': net, action: 'prohibit', priority: '21000' };
 	}))
@@ -1144,7 +1141,7 @@ function enforce(uci, s, opts) {
 			else
 				push(steer_devs, mac);
 		}
-		mark = device_mark(rt_table_id(table));
+		mark = device_mark(rt_table_id(table, tables));
 		if (!mark && length(steer_devs)) {
 			push(notes, 'device steering needs a routing table with an id of 1-255; ' + table + ' has none');
 			steer_devs = [];
@@ -1164,7 +1161,7 @@ function enforce(uci, s, opts) {
 	if (steer && !all_lan && length(s.source_domains || []) > 0) {
 		let supported = (opts && opts.nftset != null) ? !!opts.nftset : nftset_supported();
 		if (!mark)
-			mark = device_mark(rt_table_id(table));
+			mark = device_mark(rt_table_id(table, tables));
 		if (!supported)
 			push(notes, 'domain steering needs dnsmasq with nftset support (dnsmasq-full)');
 		else if (!det.lan_zone)
@@ -1185,11 +1182,9 @@ function enforce(uci, s, opts) {
 			proto: 'all', target: 'MARK', set_xmark: mark };
 	}, 'ipset', 'firewall'))
 		cf = true;
-	// A firewall reload empties the dnsmasq-filled sets, and connections to
-	// those addresses would switch path mid-flow until a client looks the
-	// name up again. Sets whose domains were all kept are restored after the
-	// reload (see nordvpn.apply.commit_routing); a set that lost a domain is
-	// left to refill, so the removed domain's addresses leave it.
+	// Retain this per-instance hint for compatibility. The transaction executor
+	// independently inventories before/after snapshots for every instance at
+	// the global reload boundary; it does not rely on this local list.
 	let keep_sets = [];
 	if (no_domain_removed(set_domains(uci, iface, 'domain_dns'), steer_doms))
 		push(keep_sets, setname);
@@ -1202,7 +1197,7 @@ function enforce(uci, s, opts) {
 	let steer_ips = [];
 	if (steer && !all_lan && length(s.source_ips || []) > 0) {
 		if (!mark)
-			mark = device_mark(rt_table_id(table));
+			mark = device_mark(rt_table_id(table, tables));
 		if (!det.lan_zone)
 			push(notes, 'address steering: could not determine the LAN zone');
 		else if (!mark)
@@ -1257,7 +1252,7 @@ function enforce(uci, s, opts) {
 	let byp_devs = [], byp_doms = [], byp_ips = [];
 	let bmark = device_mark(BYPASS_TABLE_ID);
 	if (steer && det.exceptions) {
-		if (rt_table_id(table) == BYPASS_TABLE_ID)
+		if (rt_table_id(table, tables) == BYPASS_TABLE_ID)
 			push(notes, 'exceptions need a routing table other than main');
 		else {
 			byp_devs = s.bypass_devices || [];
@@ -1721,7 +1716,7 @@ function enforce(uci, s, opts) {
 	}, 'nordvpn_key', 'firewall'))
 		cf = true;
 
-	return { changed_network: cn, changed_firewall: cf, changed_dhcp: cd,
+	return { interface: iface, instance: s.name, routing_policy: true, changed_network: cn, changed_firewall: cf, changed_dhcp: cd,
 		domains_active: length(steer_doms) > 0 || length(byp_doms) > 0, keep_sets: keep_sets,
 		dns_locked: lock != null, notes: notes };
 }

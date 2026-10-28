@@ -11,13 +11,14 @@
 
 'use strict';
 
-import { readfile, writefile, unlink, stat, mkdir } from 'fs';
+import { readfile, writefile, unlink, mkdir } from 'fs';
 import { cursor } from 'uci';
 const _common = require('nordvpn.common');
 const _apply = require('nordvpn.apply');
+require('routing_adapter').install(_apply.routing_adapters);
 const _history = require('nordvpn.history');
 const APPLY_STATUS_FILE = _common.APPLY_STATUS_FILE,
-      APPLY_LOCK_FILE = _common.APPLY_LOCK_FILE,
+      APPLY_LOCK_FILE = _common.APPLY_STATUS_FILE + '.execution.lock',
       APPLY_MAX_RUNTIME = _common.APPLY_MAX_RUNTIME;
 
 let fails = 0;
@@ -29,11 +30,18 @@ function eq(l, g, w) {
 		printf('       got:  %s\n       want: %s\n', gs, ws);
 }
 
+function execution_available() {
+	let token = _common.acquire_advisory(APPLY_LOCK_FILE);
+	if (!token) return false;
+	_common.release_advisory(token);
+	return true;
+}
+
 // The suite shares /tmp; start from a known-clean state so the branches taken
 // below are the ones under test.
 unlink(APPLY_STATUS_FILE);
-unlink(APPLY_LOCK_FILE);
 
+// Stable advisory lock files are never unlinked.
 // Our own pid is the one process guaranteed to be alive for the liveness
 // checks; anything above pid_max is guaranteed not to be.
 let live_pid = null;
@@ -157,7 +165,6 @@ const DEAD_PID = 1073741824;
 	ok('a stale record does not block a new apply',
 		_apply.start_apply('main').already_running == null);
 	unlink(APPLY_STATUS_FILE);
-	unlink(APPLY_LOCK_FILE);
 }
 
 // 5. run_apply() is the worker body: it takes the lock, records the outcome
@@ -185,7 +192,7 @@ const DEAD_PID = 1073741824;
 	eq('the finished record carries no pid', st.pid, null);
 	// A finished record must not read as running, or the next apply is refused.
 	ok('a finished record is not running', _apply.apply_running(st) == false);
-	ok('the worker released its lock', stat(APPLY_LOCK_FILE) == null);
+	ok('the worker released its lock', execution_available());
 
 	// An unknown/invalid instance name falls back to 'main', like the rotation
 	// worker does — the CLI must never act on a section it made up.
@@ -210,7 +217,7 @@ const DEAD_PID = 1073741824;
 //    a second worker started while the lock is held must skip and leave the
 //    running apply's record alone.
 {
-	let token = _common.acquire_lock(APPLY_LOCK_FILE, APPLY_MAX_RUNTIME);
+	let token = _common.acquire_advisory(APPLY_LOCK_FILE);
 	ok('the apply lock is takeable', token != null);
 	let now = time();
 	_apply.write_apply_status({ instance: 'other', state: 'running',
@@ -222,25 +229,27 @@ const DEAD_PID = 1073741824;
 	eq('the skipped worker did not touch the record',
 		_apply.read_apply_status().instance, 'other');
 
-	// ...but a lock left behind by a killed worker must not outlive the record
-	// that proves it is dead, or the retry the user just pressed would be
-	// refused for the whole runtime ceiling.
+	// A dead status pid never justifies stealing a live descriptor owner.
+	// Once that descriptor closes, recovery is immediate.
 	_apply.write_apply_status({ instance: 'main', state: 'running', pid: DEAD_PID,
 		started_at: _common.iso_ts(now), started_at_epoch: now });
+	eq('a live execution holder cannot be stolen despite a dead status pid',
+		_apply.run_apply('main').skipped, true);
+	_common.release_advisory(token);
 	let after = _apply.run_apply('main');
 	ok('an orphaned lock is reclaimed', after.skipped == null);
 	eq('the reclaiming worker records its own run',
 		_apply.read_apply_status().state, 'failed');
-	ok('the reclaiming worker released the lock', stat(APPLY_LOCK_FILE) == null);
+	ok('the reclaiming worker released the lock', execution_available());
 
 	// A record that is merely absent is NOT evidence of a dead worker: that is
 	// also what a worker which took the lock a millisecond ago looks like.
-	token = _common.acquire_lock(APPLY_LOCK_FILE, APPLY_MAX_RUNTIME);
+	token = _common.acquire_advisory(APPLY_LOCK_FILE);
 	unlink(APPLY_STATUS_FILE);
 	eq('a held lock with no record is left alone',
 		_apply.run_apply('main').skipped, true);
 
-	_common.release_lock(token);
+	_common.release_advisory(token);
 	unlink(APPLY_STATUS_FILE);
 }
 
@@ -271,7 +280,6 @@ const DEAD_PID = 1073741824;
 			zwan: { '.type': 'zone', name: 'wan', masq: '1', network: [ 'wan' ] }
 		}, dhcp: {} };
 	};
-	unlink(APPLY_LOCK_FILE);
 
 	seed();
 	let res = _apply.apply_routing(cursor(), 'main');
@@ -283,7 +291,7 @@ const DEAD_PID = 1073741824;
 		count('firewall', 'bypass_mark')[0].src_mac == 'aa:bb:cc:dd:ee:01');
 	eq('the peer is untouched', global.MOCK_UCI.network.peer0.endpoint_host, 'de1.nordvpn.com');
 	eq('the interface is not re-stamped', global.MOCK_UCI.network.nv_media.nordvpn_last_applied, 'then');
-	ok('the apply lock is released', stat(APPLY_LOCK_FILE) == null);
+	ok('the apply lock is released', execution_available());
 
 	global.MOCK_UCI.nordvpn.main.bypass_device = [];
 	res = _apply.apply_routing(cursor(), 'main');
@@ -346,21 +354,19 @@ const DEAD_PID = 1073741824;
 	ok('then the WAN default is no longer at risk', _apply.wan_default_at_risk(cursor()) == false);
 
 	seed();
-	let token = _common.acquire_lock(APPLY_LOCK_FILE, APPLY_MAX_RUNTIME);
+	let token = _common.acquire_advisory(_common.tunnel_lock_path('main'));
 	res = _apply.apply_routing(cursor(), 'main');
-	ok('a running apply is not interleaved', res.needs_reconnect == true &&
-		res.reason == 'apply already running');
-	_common.release_lock(token);
+	ok('a running apply is not interleaved', res.busy == true && index(res.error, 'running') >= 0);
+	_common.release_advisory(token);
 
 	// A rotation job may hold the lock past APPLY_MAX_RUNTIME; while its
 	// worker is alive the lock is not stale and must not be taken over.
 	seed();
-	writefile(APPLY_LOCK_FILE, sprintf('%d %d\n', time(), live_pid));
-	system([ 'touch', '-d', '@' + (time() - APPLY_MAX_RUNTIME - 60), APPLY_LOCK_FILE ]);
+	token = _common.acquire_advisory(_common.tunnel_lock_path('main'));
+	system([ 'touch', '-d', '@' + (time() - APPLY_MAX_RUNTIME - 60), _common.tunnel_lock_path('main') ]);
 	res = _apply.apply_routing(cursor(), 'main');
-	ok('a long rotation job keeps its lock', res.needs_reconnect == true &&
-		res.reason == 'apply already running' && stat(APPLY_LOCK_FILE) != null);
-	unlink(APPLY_LOCK_FILE);
+	ok('a long rotation job keeps its lock', res.busy == true && index(res.error, 'running') >= 0);
+	_common.release_advisory(token);
 
 	seed();
 	global.MOCK_UCI.network.nv_media.vpn_type = null;
@@ -371,9 +377,8 @@ const DEAD_PID = 1073741824;
 // 7b. Saving anything but the location keeps the connected server: a full
 //     apply tries it first and, when nothing the tunnel is built from
 //     changed and its handshake is fresh, does not restart it at all. Off
-//     the router `wg` is missing (a handshake reads as fresh, as in
-//     verify_handshake) and `ifup` fails, so a restart shows up as a failed
-//     connect. The tunnel lock keeps applies and rotations apart.
+//     the router an explicit adapter supplies a fresh handshake and failed
+//     ifup, so a restart shows up as a failed connect. The tunnel lock keeps applies and rotations apart.
 {
 	let _cache = require('nordvpn.cache');
 	let cdir = '/tmp/nvtest_apply_' + time();
@@ -395,7 +400,6 @@ const DEAD_PID = 1073741824;
 			'default': { '.type': 'credential', private_key: KEY }, _state: { '.type': 'state', migrated: '1' }
 		} };
 	};
-	unlink(APPLY_LOCK_FILE);
 	seed({ enabled: '0' });
 	let disabled_save = _apply.apply(cursor(), 'main', 'save', 0);
 	eq('a full save does not enable a disabled instance',
@@ -433,7 +437,7 @@ const DEAD_PID = 1073741824;
 	seed({ mtu: '1400' });
 	res = _apply.apply(cursor(), 'main', 'save', 0);
 	ok('save: an MTU change restarts the tunnel', res.restarted !== false && res.state != 'success');
-	eq('save: ... and writes the MTU', global.MOCK_UCI.network.nordvpn.mtu, '1400');
+	eq('save: failed activation restores the previous MTU', global.MOCK_UCI.network.nordvpn.mtu, null);
 
 	seed({ locations: [ 'us' ] });
 	res = _apply.apply(cursor(), 'main', 'save', 0);
@@ -441,16 +445,18 @@ const DEAD_PID = 1073741824;
 
 	// A rotation holding the tunnel lock: the apply does not run alongside it.
 	seed();
-	writefile(_common.tunnel_lock_path('main'), sprintf('%d %d\n', time(), live_pid));
+	let owner = _common.acquire_advisory(_common.tunnel_lock_path('main'));
 	res = _apply.apply(cursor(), 'main', 'save', 0);
-	ok('a running rotation blocks the apply', res.state == 'failure' && index(res.error, 'rotation') >= 0);
+	ok('a running rotation blocks the apply', res.state == 'failure' && res.busy == true);
 	eq('... which leaves the peer alone', global.MOCK_UCI.network.peer0.endpoint_host, 'ee70.nordvpn.com');
 	let _rotate = require('nordvpn.rotate');
 	eq('and an apply (or rotation) holding it blocks a rotation',
 		_rotate.rotate(cursor(), 'main', 'watchdog').reason, 'rotation already running');
-	unlink(_common.tunnel_lock_path('main'));
-	ok('apply releases the tunnel lock', (_apply.apply(cursor(), 'main', 'save', 0).state == 'success') &&
-		stat(_common.tunnel_lock_path('main')) == null);
+	_common.release_advisory(owner);
+	let applied = _apply.apply(cursor(), 'main', 'save', 0);
+	owner = _common.acquire_advisory(_common.tunnel_lock_path('main'));
+	ok('apply releases the tunnel lock', applied.state == 'success' && owner != null);
+	_common.release_advisory(owner);
 
 	// A rotation only changes the server: a table or MTU saved but not
 	// applied yet is left for the apply that also sets up its routing.
@@ -525,7 +531,7 @@ const DEAD_PID = 1073741824;
 	eq('the rotation job is recorded with its kind', [ st.kind, st.instance ], [ 'rotate', 'main' ]);
 	eq('a skipped rotation is a finished job', st.state, 'done');
 	eq('the rotation job states its ceiling', st.max_runtime, 300);
-	ok('the rotation job released the lock', stat(APPLY_LOCK_FILE) == null);
+	ok('the rotation job released the lock', execution_available());
 	unlink(APPLY_STATUS_FILE);
 	unlink('/tmp/nordvpn_events.json');
 }
@@ -546,6 +552,5 @@ const DEAD_PID = 1073741824;
 }
 
 unlink(APPLY_STATUS_FILE);
-unlink(APPLY_LOCK_FILE);
 printf('\n%s\n', fails ? ('FAILURES: ' + fails) : 'ALL APPLY TESTS PASSED');
 exit(fails ? 1 : 0);

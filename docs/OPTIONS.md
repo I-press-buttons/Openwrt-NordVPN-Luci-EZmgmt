@@ -86,7 +86,6 @@ For the details and limits of DNS, IPv6 and kill-switch protection, see the
 | --- | --- |
 | **Status** | Shows configuration and live tunnel state separately. Connected means a recent WireGuard handshake; the page also displays selected/connected location, public IP/protection information when available, uptime and traffic. |
 | **Reconnect** | Reapply this instance's settings and choose a server if needed. The current server is retained when it still matches the configuration. |
-| **Disconnect** | Bring the interface down and pause rotation. Managed routing policy remains configured for the instance. |
 | **Recent events** | Shows recent connects, rotations, recoveries and errors recorded by the backend. |
 | **Package updates** | Downloads and installs both packages from a GitHub release. Choose the latest release or a specific version/tag. Save or discard pending settings first; LuCI services restart after installation, then reload the page. |
 

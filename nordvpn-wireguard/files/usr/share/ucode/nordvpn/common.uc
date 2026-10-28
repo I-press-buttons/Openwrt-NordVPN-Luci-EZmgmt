@@ -643,36 +643,6 @@ function log(msg) {
 
 // ── Filesystem helpers ───────────────────────────────────────────────
 
-// Write data to `path` atomically: create a unique temp file in the same
-// directory, write it, then rename over the target so readers never observe a
-// half-written file. Returns true on success.
-function atomic_write(path, data) {
-	let fh = null;
-	let tmp = null;
-	let n = 0;
-	while (n < 1000) {
-		tmp = path + '.tmp.' + time() + '.' + n;
-		fh = open(tmp, 'wx'); // exclusive create; retry on collision
-		if (fh)
-			break;
-		n++;
-	}
-	if (!fh)
-		return false;
-
-	let ok = fh.write(data);
-	fh.close();
-	if (ok == null) {
-		unlink(tmp);
-		return false;
-	}
-	if (!rename(tmp, path)) {
-		unlink(tmp);
-		return false;
-	}
-	return true;
-}
-
 // Own pid — the first field of /proc/self/stat — or null when /proc is
 // unavailable. Read every time rather than cached: a uloop.task child is a
 // fork and must not report its parent's pid.
@@ -682,6 +652,33 @@ function self_pid() {
 		return null;
 	let first = split(trim(raw), ' ')[0];
 	return full_match(first, /^[0-9]+$/) ? int(first) : null;
+}
+
+// Write data to `path` atomically: create a unique temp file in the same
+// directory, write it, then rename over the target so readers never observe a
+// half-written file. Returns true on success.
+function atomic_write(path, data, adapters) {
+	// Explicit adapters support failure injection without treating missing
+	// production filesystem support as success.
+	let a = adapters || {}, create = a.open || open;
+	let replace = a.rename || rename, remove = a.unlink || unlink;
+	let fh = null, tmp = null;
+	try {
+		for (let n = 0; n < 100; n++) {
+			tmp = path + '.tmp.' + self_pid() + '.' + n;
+			fh = create(tmp, 'wxe', 0600);
+			if (fh) break;
+		}
+		if (!fh) return false;
+		let complete = fh.write(data) == length(data);
+		let closed = fh.close();
+		fh = null;
+		if (complete && closed && replace(tmp, path)) return true;
+	} catch (e) {
+		if (fh) { try { fh.close(); } catch (ignored) {} }
+	}
+	if (tmp) { try { remove(tmp); } catch (ignored) {} }
+	return false;
 }
 
 // Is the lock file at `path` abandoned? Either older than `max_age` seconds,
@@ -720,6 +717,47 @@ function acquire_lock(path, max_age) {
 	return path;
 }
 
+// Advisory locks use stable inodes. Never unlink these files: replacing a
+// locked inode permits a second owner. fs.file.lock() is available in the
+// ucode fs module; fail closed if unavailable on a target package.
+// 'e' closes descriptors on exec (including run()/detached workers). A fork
+// without exec must close inherited descriptors; see drop_inherited_locks().
+let held_locks = [];
+
+function acquire_advisory(path) {
+	let fh = open(path, 'ae', 0600);
+	if (!fh)
+		return null;
+	if (type(fh.lock) != 'function' || !fh.lock('xn')) {
+		fh.close();
+		return null;
+	}
+	let token = { file: fh, pid: self_pid(), path: path };
+	push(held_locks, token);
+	return token;
+}
+
+// A uloop.task fork shares flock's open file description. Close the child's
+// copy WITHOUT LOCK_UN, which would also unlock the parent's ownership.
+function drop_inherited_locks() {
+	let pid = self_pid();
+	for (let token in held_locks)
+		if (token.file && token.pid != pid) {
+			token.file.close();
+			token.file = null;
+		}
+	held_locks = filter(held_locks, (t) => t.file != null);
+}
+
+function release_advisory(token) {
+	if (type(token) != 'object' || !token.file)
+		return;
+	// close(), rather than explicit unlock, also handles forked descriptors.
+	token.file.close();
+	token.file = null;
+	held_locks = filter(held_locks, (t) => t.file != null);
+}
+
 // How long one rotation of an instance with settings `s` may plausibly take:
 // every candidate rewrites the peer, restarts the interface and waits up to
 // verify_timeout for a handshake, then the WAN default route is re-checked.
@@ -739,14 +777,11 @@ function release_lock(token) {
 		unlink(token);
 }
 
-// Per-instance lock held by everything that rewrites an instance's peer and
-// restarts its tunnel: a rotation (scheduled, watchdog or manual) and a full
-// apply. Two of them at once would interleave peer writes and `ifup`s, and
-// a rotation could even bring back a tunnel an apply just replaced. 'main'
-// keeps the historical rotation lock name so an upgrade sees a held lock.
+// Stable advisory ownership paths, distinct from the legacy removable token
+// files. Upgrade with old workers stopped; old/new coordinators cannot coexist.
 function tunnel_lock_path(instance) {
 	let n = validate_instance(instance) || 'main';
-	return (n == 'main') ? '/tmp/nordvpn_rotate.lock' : '/tmp/nordvpn_rotate_' + n + '.lock';
+	return '/tmp/nordvpn_operation_' + n + '.lock';
 }
 
 // Single-quote a value for safe inclusion in a /bin/sh command line.
@@ -795,6 +830,6 @@ return {
 	validate_country_code, validate_location_code, validate_instance, validate_routing_table, validate_dir,
 	validate_mac, validate_domain, validate_cidr4, clean_label, validate_ipv4,
 	managed_interface, load_settings, list_instances, globals_section, cache_file_path, iso_ts, redact, log,
-	atomic_write, self_pid, lock_stale, acquire_lock, release_lock, tunnel_lock_path, rotation_max_runtime,
+	atomic_write, acquire_advisory, release_advisory, drop_inherited_locks, self_pid, lock_stale, acquire_lock, release_lock, tunnel_lock_path, rotation_max_runtime,
 	sh_quote, open_cmd, run
 };

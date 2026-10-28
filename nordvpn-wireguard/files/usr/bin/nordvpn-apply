@@ -23,7 +23,11 @@ if (length(ARGV) > 0 && ARGV[0] == '--restore-wan') {
 // Optional arguments: the instance to apply (default 'main') and what started
 // the apply, for the event history (default 'external', i.e. not the UI).
 let instance = (length(ARGV) > 0 ? validate_instance(ARGV[0]) : null) || 'main';
-let res = _apply.run_apply(instance, length(ARGV) > 1 ? ARGV[1] : null);
+let job_index = index(ARGV, '--job-id');
+let job_id = job_index >= 0 ? ARGV[job_index + 1] : null;
+if (job_index >= 0 && !job_id) exit(1);
+let source = length(ARGV) > 1 && ARGV[1] != '--job-id' ? ARGV[1] : null;
+let res = _apply.run_apply(instance, source, job_id);
 
 if (res.skipped) {
 	printf('nordvpn-apply: skipped (%s)\n', res.reason);

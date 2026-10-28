@@ -31,7 +31,7 @@ var callLocations = rpc.declare({ object: 'nordvpn', method: 'locations' });
 var callServers = rpc.declare({ object: 'nordvpn', method: 'servers', params: [ 'locations', 'hop_mode', 'server_group' ] });
 var callUpdateStatus = rpc.declare({ object: 'nordvpn', method: 'update_status' });
 var callUpdateStart = rpc.declare({ object: 'nordvpn', method: 'update_start', params: [ 'version' ] });
-var callRefreshStatus = rpc.declare({ object: 'nordvpn', method: 'refresh_status' });
+var callRefreshStatus = rpc.declare({ object: 'nordvpn', method: 'refresh_status', params: [ 'id' ] });
 var callSetCredentials = rpc.declare({ object: 'nordvpn', method: 'set_credentials', params: [ 'token', 'instance', 'credential', 'name' ] });
 var callCredentials = rpc.declare({ object: 'nordvpn', method: 'credentials' });
 var callRemoveCredentials = rpc.declare({ object: 'nordvpn', method: 'remove_credentials', params: [ 'credential' ] });
@@ -65,7 +65,7 @@ var callUciCommit = rpc.declare({
 // therefore starts the job and watches it; the synchronous `apply` stays in the
 // backend for the CLI only.
 var callApplyStart = rpc.declare({ object: 'nordvpn', method: 'apply_start', params: [ 'instance', 'source' ] });
-var callApplyStatus = rpc.declare({ object: 'nordvpn', method: 'apply_status' });
+var callApplyStatus = rpc.declare({ object: 'nordvpn', method: 'apply_status', params: [ 'id' ] });
 // Routing-only apply: reconciles the steering/exception rules without touching
 // the tunnel. Quick (no handshake wait), so it is a plain call.
 var callApplyRouting = rpc.declare({ object: 'nordvpn', method: 'apply_routing', params: [ 'instance' ] });
@@ -74,7 +74,8 @@ var callRefreshLocations = rpc.declare({ object: 'nordvpn', method: 'refresh_loc
 // it runs as a job exactly like an apply (see callApplyStart) and is watched
 // through apply_status. `rotate_now` stays in the backend for the CLI only.
 var callRotateStart = rpc.declare({ object: 'nordvpn', method: 'rotate_start', params: [ 'instance' ] });
-var callExternalIp = rpc.declare({ object: 'nordvpn', method: 'external_ip', params: [ 'instance' ] });
+var callExternalIpStatus = rpc.declare({ object: 'nordvpn', method: 'external_ip_status', params: [ 'instance', 'id' ] });
+var callExternalIpStart = rpc.declare({ object: 'nordvpn', method: 'external_ip_start', params: [ 'instance' ] });
 var callClients = rpc.declare({ object: 'nordvpn', method: 'clients' });
 var callDisconnect = rpc.declare({ object: 'nordvpn', method: 'disconnect', params: [ 'instance' ] });
 var callDisableAll = rpc.declare({ object: 'nordvpn', method: 'disable_all' });
@@ -121,6 +122,29 @@ var OPTION_DEFAULTS = { hop_mode: 'single', selection: 'balanced' };
 var HISTORY_LIMIT = 25;
 // A probe target: a dotted-quad IPv4 literal (the backend accepts nothing else).
 var IPV4_RE = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
+
+// One collator per view module, reused only when a server dataset changes.
+// Older browsers without numeric collation use a deterministic natural order.
+var srvCompareName = (function() {
+	try {
+		var collator = new Intl.Collator(undefined, { numeric: true });
+		if (collator.compare('2', '10') < 0)
+			return collator.compare;
+	} catch (e) {}
+	return function(a, b) {
+		var aa = a.toLowerCase().match(/\d+|\D+/g) || [], bb = b.toLowerCase().match(/\d+|\D+/g) || [];
+		for (var i = 0; i < Math.min(aa.length, bb.length); i++) {
+			var x = aa[i], y = bb[i];
+			if (/^\d+$/.test(x) && /^\d+$/.test(y)) {
+				x = x.replace(/^0+(?=\d)/, ''); y = y.replace(/^0+(?=\d)/, '');
+				if (x.length !== y.length) return x.length - y.length;
+			}
+			if (x !== y) return x < y ? -1 : 1;
+		}
+		return aa.length - bb.length;
+	};
+})();
+var SRV_PAGE_SIZE = 50;
 
 var STYLE = '' +
 	'.nv-status-main{display:flex;flex-wrap:wrap;align-items:baseline;gap:.75em;font-size:1.05em}' +
@@ -202,6 +226,8 @@ var STYLE = '' +
 	'.nv-srv-tag{flex:none;font-size:.8em;padding:0 .4em;border:1px solid currentColor;border-radius:3px;color:var(--text-color-medium,#888)}' +
 	'.nv-srv-grp{font-weight:600;padding:.35em .5em .15em;color:var(--text-color-medium,#888)}' +
 	'.nv-pool-row.nv-srv-quick{font-weight:600}' +
+	'.nv-srv-action{border:0;background:transparent;font:inherit;color:inherit;text-align:left;width:100%}' +
+	'.nv-srv-summary{padding:.3em .5em;overflow-wrap:anywhere}' +
 	// Plain flex rows (no LuCI .table classes), so the theme's own responsive
 	// table stacking can never apply; wraps naturally down to ~340 px.
 	'.nv-inst-row{display:flex;align-items:center;gap:.8em;padding:.55em 0;border-bottom:1px solid var(--border-color-medium,#ccc);cursor:pointer}' +
@@ -244,6 +270,8 @@ return view.extend({
 		this.locations = data[2] || { available: false };
 		this.credentials = (data[4] && data[4].credentials) || [];
 		this.dirty = false;
+		this._otherDirty = false;
+		this._connectionState = null;
 		this.refs = {};
 
 		this.instancesNode = E('div');
@@ -401,6 +429,8 @@ return view.extend({
 		if (this.dirty && !window.confirm(_('Discard unsaved changes?')))
 			return;
 		this.instance = name;
+		this._connectionState = null;
+		this._otherDirty = false;
 		this.dirty = false;
 		if (this.saveBtn) this.saveBtn.disabled = true;
 		if (this.discardBtn) this.discardBtn.disabled = true;
@@ -481,6 +511,7 @@ return view.extend({
 		ui.hideModal();
 		var n = this.notice(_('Deleting instance "%s"…').format(name), 'info');
 		return callDeleteInstance(name).then(L.bind(function(res) {
+			res = this.operationResult(res, name);
 			this.dismiss(n);
 			if (res && res.error) {
 				this.notice(_('Delete failed: %s').format(res.error), 'error');
@@ -491,12 +522,17 @@ return view.extend({
 				: _('Instance "%s" deleted.').format(name), 'info', 4000);
 			uci.unload('nordvpn');
 			return uci.load('nordvpn').then(L.bind(function() {
-				if (this.instance === name)
+				if (this.instance === name) {
 					this.instance = 'main';
+					this._connectionState = null;
+					this._otherDirty = false;
+					this.dirty = false;
+				}
 				return this.refreshStatus().then(L.bind(function() {
 					this.status = this.statusOf(this.instance) || {};
 					this.updateStatusBand();
-					dom.content(this.formNode, this.buildFormSections());
+					if (!this.dirty && !this._saving)
+						dom.content(this.formNode, this.buildFormSections());
 				}, this));
 			}, this));
 		}, this)).catch(L.bind(function(e) {
@@ -683,15 +719,15 @@ return view.extend({
 		}
 		if (s.gateway && /^[a-z]{2}-onion/.test(s.gateway))
 			details.push(_('🧅 Onion over VPN'));
-		if (s.state !== 'connected' && s.state !== 'no_egress' && s.routing && s.routing.killswitch)
+		if (this.routingUnconfirmed(s))
+			details.push(_('Routing protection is unconfirmed. Retry Apply and check any reported errors.'));
+		else if (s.state !== 'connected' && s.state !== 'no_egress' && s.routing && s.routing.killswitch)
 			details.push(_('Kill switch is blocking LAN traffic'));
 		var protLine = null;
 		if (s.state === 'connected') {
-			var ipKey = this.instance + '|' + (s.gateway || '');
-			if (this.extIp && this.extIp.key === ipKey)
-				protLine = this.protectionLine(this.extIp.res);
-			else
-				this.maybeFetchExternalIp(ipKey);
+			var ipKey = this.externalIpKey();
+			protLine = this.externalIpLine(ipKey);
+			this.maybeFetchExternalIp(ipKey);
 		}
 		if (s.rotation && s.rotation.enabled)
 			details.push(_('Automatic rotation is on'));
@@ -716,23 +752,69 @@ return view.extend({
 		]));
 	},
 
-	// Ask NordVPN how it sees the tunnel once per instance+gateway combination
-	// (the status poll runs every 5 s; the API would rate-limit that). A
-	// failed lookup is remembered too, so it is not retried on every poll.
+	externalIpKey: function() {
+		return this.instance + '|' + ((this.status || {}).probe_generation || '');
+	},
+
+	// A pending, expired or failed observation never retains protected styling.
+	externalIpLine: function(key) {
+		var observation = this.extIp && this.extIp.key === key ? this.extIp.observation : null;
+		var state = observation ? observation.state : 'pending';
+		if (state === 'fresh' && Date.now() < this.extIp.expires)
+			return this.protectionLine(observation.result);
+		if (state === 'fresh') state = 'stale';
+		var text = state === 'failed' ? _('Protection check failed: %s').format(observation.error || _('unknown error')) :
+			(state === 'pending' ? _('Protection check pending') : _('Protection check is stale'));
+		return E('div', { class: 'nv-status-details' }, text);
+	},
+
+	// Only local cache/status and launch RPCs. Normal status polling drives
+	// exact-ID probe polling independently; no remote timeout holds rpcd or UI.
 	maybeFetchExternalIp: function(key) {
-		if (this._extIpPending === key)
-			return;
-		this._extIpPending = key;
-		callExternalIp(this.instance).then(L.bind(function(res) {
-			if (this._extIpPending !== key)
+		var instance = this.instance, form = this._formGeneration, now = Date.now();
+		if (this._extIpPending && this._extIpPending.key === key && this._extIpPending.form === form)
+			return this._extIpPending.promise;
+		if (this._extIpLastCheck && this._extIpLastCheck.key === key && now - this._extIpLastCheck.at < 4000)
+			return Promise.resolve();
+		var request = { key: key, form: form }, self = this;
+		this._extIpPending = request;
+		this._extIpLastCheck = { key: key, at: now };
+		function current() {
+			return self._extIpPending === request && instance === self.instance && form === self._formGeneration &&
+				key === self.externalIpKey() && (self.status || {}).state === 'connected';
+		}
+		function accept(res) {
+			if (!current()) return false;
+			if (res && res.generation && res.generation !== (self.status || {}).probe_generation) {
+				self.extIp = { key: key, observation: { state: 'stale' } };
+				return false;
+			}
+			res = res || { state: 'failed', error: _('Protection check unavailable') };
+			self.extIp = { key: key, observation: res, expires: Date.now() + Math.max(0, res.ttl_seconds || 0) * 1000 };
+			return true;
+		}
+		var previous = this.extIp && this.extIp.key === key ? this.extIp.observation : null;
+		var id = previous && previous.state === 'pending' ? previous.id : null;
+		request.promise = callExternalIpStatus(instance, id).then(function(res) {
+			if (id && (!res || res.id !== id)) {
+				accept({ state: 'failed', error: _('Protection check returned another job') });
 				return;
-			this._extIpPending = null;
-			this.extIp = { key: key, res: (res && !res.error) ? res : null };
-			if (this.extIp.res)
-				this.updateStatusBand();
-		}, this)).catch(L.bind(function() {
-			this._extIpPending = null;
-		}, this));
+			}
+			if (!accept(res)) return;
+			var writable = !L.hasViewPermission || L.hasViewPermission();
+			if (writable && (!self._extIpRetryAt || Date.now() >= self._extIpRetryAt) &&
+				(res.state === 'stale' || res.state === 'missing' || (res.state === 'failed' && !res.retry_after_seconds)))
+				return callExternalIpStart(instance).then(function(started) { accept(started); });
+		}).catch(function(error) {
+			if (!current()) return;
+			self._extIpRetryAt = Date.now() + 30000;
+			accept({ state: 'failed', error: String(error) });
+		}).then(function() {
+			if (!current()) return;
+			self._extIpPending = null;
+			self.updateStatusBand();
+		});
+		return request.promise;
 	},
 
 	// NordVPN's own verdict on the tunnel's exit (and, with "Route all LAN
@@ -765,6 +847,9 @@ return view.extend({
 	// (through the tunnel), or the router's upstream, usually the ISP's, which
 	// sees every name looked up. Only shown while the tunnel carries traffic.
 	dnsLine: function(s) {
+		if (this.routingUnconfirmed(s))
+			return E('div', { class: 'nv-status-details', style: 'color:var(--warning-color,#b8860b)' },
+				_('DNS policy is unconfirmed. Retry Apply and check any reported errors.'));
 		var rt = s.routing || {};
 		if (s.enabled === false || (s.state !== 'connected' && s.state !== 'no_egress') ||
 		    (rt.mode !== 'auto' && rt.mode !== 'steered'))
@@ -904,7 +989,7 @@ return view.extend({
 			// unsaved edits), rebuild it — the panel's shape depends on the mode,
 			// so it must not go stale until a manual page refresh.
 			var mode = (this.status.routing || {}).mode;
-			if (!this.dirty && this._routingMode != null && mode !== this._routingMode)
+			if (!this.dirty && !this._saving && this._routingMode != null && mode !== this._routingMode)
 				dom.content(this.formNode, this.buildFormSections());
 			this._routingMode = mode;
 		}, this)).catch(function() {});
@@ -928,23 +1013,46 @@ return view.extend({
 			poll.add(this._statusPoll, STATUS_POLL_S);
 	},
 
+	routingUnconfirmed: function(s) {
+		return !!((s && s.routing_application && s.routing_application.confirmed === false) ||
+			(this._routingUnconfirmed && this._routingUnconfirmed[this.instance]));
+	},
+
+	// Remember a failed application until this instance has a confirmed result.
+	// Saved preferences alone must not be displayed as installed DNS/protection.
+	operationResult: function(res, instance) {
+		instance = instance || this.instance;
+		this._routingUnconfirmed = this._routingUnconfirmed || {};
+		if (res && (res.error || res.ok === false)) {
+			this._routingUnconfirmed[instance] = true;
+			if (!res.error)
+				res = Object.assign({}, res, { error: _('Application failed at %s.').format(res.stage || _('an unknown stage')) });
+		} else if (res && (res.ok === true || res.state === 'success')) {
+			delete this._routingUnconfirmed[instance];
+		}
+		return res;
+	},
+
 	// Starts an apply and resolves with the very object the old synchronous
 	// `apply` returned, so every call site keeps its result handling unchanged.
 	// Never rejects on a backend-reported failure — only on a watcher that cannot
 	// reach the router at all. `source` labels the history entry: 'reconnect',
 	// 'enable' or 'save'.
 	applyAsync: function(instance, source) {
-		return this.runJob(function(inst) { return callApplyStart(inst, source); }, instance, 'apply');
+		return this.runJob(function(inst) { return callApplyStart(inst, source); }, instance, 'apply')
+			.then(L.bind(function(res) { return this.operationResult(res, instance); }, this));
 	},
 
 	// Runs one backend job (`kind` 'apply' or 'rotate') through `start` and
 	// resolves with its result. The backend runs one job at a time and reports
-	// it through apply_status, so only a record of this very job (kind and
-	// instance) is taken as its outcome.
+	// it through apply_status. New backends return an immutable ID; older
+	// backends remain compatible through kind/instance matching.
 	runJob: function(start, instance, kind) {
 		var deadline = Date.now() + APPLY_TIMEOUT_MS;
+		var jobId = null;
 		var mine = function(st) {
-			return !!st && (st.kind || 'apply') === kind && st.instance === instance;
+			return !!st && (jobId ? st.id === jobId :
+				(st.kind || 'apply') === kind && st.instance === instance);
 		};
 		// A rotation may outlast an apply by far (max_retries candidates); the
 		// job record states its own ceiling.
@@ -955,19 +1063,11 @@ return view.extend({
 		this.pauseStatusPoll();
 		return start(instance).then(L.bind(function(res) {
 			if (!res || !res.error) {
+				jobId = res && res.apply && res.apply.id;
 				extend(res && res.apply);
-				return this.waitForApply(deadline, mine);
+				return this.waitForApply(deadline, mine, jobId);
 			}
-			// A refused start is usually "one is already running" — from the other
-			// button or another tab. Matching on the message would be brittle, so
-			// simply ask what the job queue is doing: if this very job is running,
-			// that is the one the user wanted anyway.
-			return callApplyStatus().then(L.bind(function(st) {
-				if (!(st && st.state === 'running' && mine(st)))
-					return { error: res.error };
-				extend(st);
-				return this.waitForApply(deadline, mine);
-			}, this), function() { return { error: res.error }; });
+			return { error: res.error };
 		}, this)).then(L.bind(function(result) {
 			this.resumeStatusPoll();
 			return result;
@@ -983,22 +1083,22 @@ return view.extend({
 	// finished job is turned into an `error` result rather than an optimistic
 	// success: a banner claiming a tunnel that never came up is worse than an
 	// honest "no idea". `mine` tells this job's record from another one's.
-	waitForApply: function(deadline, mine) {
+	waitForApply: function(deadline, mine, jobId) {
 		var since = Date.now();
 		return new Promise(function(resolve, reject) {
 			var probe = function() {
-				callApplyStatus().then(function(st) {
+				callApplyStatus(jobId || '').then(function(st) {
 					var state = st && st.state;
-					if ((state === 'done' || state === 'failed') && !mine(st))
+					if ((state === 'done' || state === 'failed' || state === 'running') && !mine(st))
 						// Another job ran after ours, so our own result is gone.
 						return resolve({ error: _('another operation replaced this one; check the recent events') });
 					if (state === 'done' || state === 'failed')
 						return resolve((st && st.result) ||
-							{ error: _('the operation finished without reporting a result') });
+							{ error: (st && st.error) || _('the operation finished without reporting a result') });
 					if (state !== 'running')
 						// 'idle' after a successful start means the job record is
 						// gone — an rpcd restart, or the backend died mid-apply.
-						return resolve({ error: _('the operation stopped reporting progress') });
+						return resolve({ error: (st && st.error) || _('the operation stopped reporting progress') });
 					if (Date.now() >= deadline)
 						return resolve({ error: _('the operation is still running after %d seconds — check the system log')
 							.format(Math.round((Date.now() - since) / 1000)) });
@@ -1013,7 +1113,7 @@ return view.extend({
 					window.setTimeout(probe, APPLY_POLL_MS);
 				});
 			};
-			// The start call already returned; nothing can be finished yet.
+			// The worker may already be finished when the start call returns.
 			window.setTimeout(probe, APPLY_POLL_MS);
 		});
 	},
@@ -1039,7 +1139,9 @@ return view.extend({
 
 	disconnect: function() {
 		var n = this.notice(_('Disabling…'), 'info');
-		return callDisconnect(this.instance).then(L.bind(function(res) {
+		var instance = this.instance;
+		return callDisconnect(instance).then(L.bind(function(res) {
+			res = this.operationResult(res, instance);
 			this.dismiss(n);
 			if (res && res.error)
 				this.notice(_('Disable failed: %s').format(res.error), 'error');
@@ -1115,6 +1217,10 @@ return view.extend({
 	/* ---- form sections ------------------------------------------------ */
 
 	buildFormSections: function() {
+		this.srvCancelFilter();
+		this._formGeneration = (this._formGeneration || 0) + 1;
+		this._serversReq = (this._serversReq || 0) + 1;
+		this.ensureConnectionState();
 		this.refs = {};
 		// Building the form fires the same change paths as user input; the
 		// guard keeps programmatic construction from marking the form dirty.
@@ -1123,6 +1229,8 @@ return view.extend({
 		// the selected instance, so they are rebuilt with it.
 		dom.content(this.credNode, this.buildCredentials());
 		var sections = [ this.buildConnection(), this.buildRoutingSection(), this.buildRotation(), this.buildAdvanced() ];
+		this.srvRenderTrigger();
+		this.updateRotationAvailability();
 		this._building = false;
 		return sections;
 	},
@@ -1212,18 +1320,19 @@ return view.extend({
 	},
 
 	buildConnection: function() {
-		// Server pin picker (custom panel, load-aware). _serverChosen is the
-		// source of truth: a hostname, or '' for automatic (rotation picks).
-		this._serversReq = 0;
-		this._serverChosen = '';
+		var draft = this.ensureConnectionState().draft;
+		// Widget fields mirror the draft; fetched server data never owns edits.
+		this._serverChosen = draft.fixed_server;
 		this._srvOpen = false;
+		this.srvReplaceData(null);
 		this._srvFilter = '';
 		this.srvTrigger = E('button', { type: 'button', class: 'cbi-button nv-pool-trigger nv-srv-trigger',
 			click: L.bind(function(ev) { ev.preventDefault(); ev.stopPropagation(); this.srvTogglePanel(); }, this) },
 			_('Automatic server'));
 		this.srvPanel = E('div', { class: 'nv-pool-panel hidden',
 			click: function(ev) { ev.stopPropagation(); } });
-		this.srvWrap = E('span', { class: 'nv-pool-wrap' }, [ this.srvTrigger, this.srvPanel ]);
+		this.srvError = E('div', { class: 'cbi-value-description', role: 'alert' });
+		this.srvWrap = E('span', { class: 'nv-pool-wrap' }, [ this.srvTrigger, this.srvPanel, this.srvError ]);
 		if (!this._srvOutsideBound) {
 			this._srvOutsideBound = true;
 			document.addEventListener('click', L.bind(function(ev) {
@@ -1232,7 +1341,7 @@ return view.extend({
 			}, this));
 		}
 
-		var hop = uci.get('nordvpn', this.instance, 'hop_mode') || 'single';
+		var hop = draft.hop_mode;
 		this.hopValue = (hop === 'multihop' || hop === 'onion') ? hop : 'single';
 		this.hopButtons = {};
 		var seg = E('div', { class: 'nv-seg' }, [
@@ -1248,7 +1357,7 @@ return view.extend({
 
 		// Server group (single hop only): P2P-optimised servers.
 		this.p2pBox = E('input', { type: 'checkbox', change: L.bind(this.onHopChange, this) });
-		this.p2pBox.checked = (uci.get('nordvpn', this.instance, 'server_group') === 'p2p');
+		this.p2pBox.checked = (draft.server_group === 'p2p');
 		this.p2pRow = this.row(_('Server type'), [
 			E('label', { class: 'nv-check' }, [ this.p2pBox, _('P2P servers only') ])
 		], _('Limits this instance to NordVPN servers optimised for peer-to-peer (file sharing). Single hop only.'));
@@ -1260,21 +1369,7 @@ return view.extend({
 		// configs see their choice here. Codes no longer in the server list
 		// are kept and shown dashed, never silently dropped.
 		this.poolEntries = [];
-		var locRaw = uci.get('nordvpn', this.instance, 'locations');
-		if (typeof locRaw === 'string')
-			locRaw = [ locRaw ];
-		var seed = Array.isArray(locRaw) ? locRaw.slice() : [];
-		if (!seed.length) {
-			// A legacy city implies its country, so seed the city alone (not both)
-			// or the whole country when no city was pinned. Seeding both would
-			// double-count and render the city hidden under the country chip.
-			var legacyCity = uci.get('nordvpn', this.instance, 'city_code') || '';
-			var legacyCc = uci.get('nordvpn', this.instance, 'country_code') || '';
-			if (legacyCity)
-				seed.push(legacyCity);
-			else if (legacyCc)
-				seed.push(legacyCc);
-		}
+		var seed = draft.locations;
 		seed.forEach(L.bind(function(code) {
 			var e = this.poolResolve(code);
 			if (e)
@@ -2003,7 +2098,7 @@ return view.extend({
 	},
 
 	_poolCommit: function() {
-		this.markDirty();
+		this.markConnectionDirty();
 		this.rebuildPoolWidget();
 		this.refreshServerList();
 	},
@@ -2556,26 +2651,28 @@ return view.extend({
 		if (!this.srvTrigger)
 			return;
 		var codes = (this.poolEntries || []).map(function(e) { return e.code; });
-		var req = ++this._serversReq;
-		this._serverData = null;
-		this.srvTrigger.disabled = !codes.length;
-		if (!codes.length) {
+		var req = this._serversReq = (this._serversReq || 0) + 1;
+		var instance = this.instance, form = this._formGeneration;
+		var active = L.bind(function() {
+			return req === this._serversReq && instance === this.instance && form === this._formGeneration;
+		}, this);
+		if (this.srvError) dom.content(this.srvError, '');
+		this.srvReplaceData(null);
+		this.srvTrigger.disabled = !codes.length && !this._serverChosen;
+		this.srvRenderTrigger();
+		if (!codes.length) return Promise.resolve();
+		return callServers(codes, this.hopMode(), this.serverGroup()).then(L.bind(function(res) {
+			if (!active())
+				return;
+			if (!res || res.error || !Array.isArray(res.relays))
+				throw new Error((res && res.error) || _('Server list unavailable.'));
+			this.srvReplaceData(res.relays);
 			this.srvRenderTrigger();
-			return;
-		}
-		callServers(codes, this.hopMode(), this.serverGroup()).then(L.bind(function(res) {
-			if (req !== this._serversReq)
-				return; // a newer rebuild superseded this response
-			this._serverData = { relays: ((res && res.relays) || []).slice() };
-			// Restoring the persisted pin is not a user edit.
-			this._serverChosen = uci.get('nordvpn', this.instance, 'fixed_server') || '';
-			this.srvRenderTrigger();
-			if (this._srvOpen)
-				this.srvRenderPanel();
-			this._building = true;
-			this.updateRotationAvailability();
-			this._building = false;
-		}, this)).catch(function() {});
+		}, this)).catch(L.bind(function(err) {
+			if (!active() || !this.srvError) return;
+			dom.content(this.srvError, [ _('Could not read server list: %s').format(err), ' ',
+				E('button', { type: 'button', class: 'cbi-button', click: L.bind(this.refreshServerList, this) }, _('Retry')) ]);
+		}, this));
 	},
 
 	srvLoadClass: function(load) {
@@ -2589,21 +2686,54 @@ return view.extend({
 		return (this.status && this.status.gateway) || '';
 	},
 
-	srvRelayByHost: function(host) {
-		var found = null;
-		((this._serverData && this._serverData.relays) || []).forEach(function(r) {
-			if (r.hostname === host) found = r;
+	srvBuildIndex: function(relays) {
+		var names = this._ccNames || {}, groups = [], byCode = Object.create(null), byHost = Object.create(null), best = null;
+		function compare(a, b) {
+			var al = typeof a.load === 'number' ? a.load : 999, bl = typeof b.load === 'number' ? b.load : 999;
+			return al - bl || srvCompareName(a.name || a.hostname || '', b.name || b.hostname || '') ||
+				srvCompareName(a.hostname || '', b.hostname || '');
+		}
+		relays.forEach(L.bind(function(value) {
+			var r = Object.freeze(Object.assign({}, value));
+			byHost[r.hostname] = r;
+			if (typeof r.load === 'number' && !r.dedicated && (!best || compare(r, best) < 0)) best = r;
+			var code = r.country_code || '', name = names[code] || code.toUpperCase();
+			var g = byCode[code];
+			if (!g) {
+				g = byCode[code] = { name: name, flag: this.countryFlag(code), rows: [] };
+				groups.push(g);
+			}
+			g.rows.push(Object.freeze({ relay: r,
+				search: (name + ' / ' + (r.city || '') + ' / ' + (r.name || '') + ' / ' + (r.hostname || '')).toLowerCase() }));
+		}, this));
+		groups.sort(function(a, b) { return srvCompareName(a.name, b.name); });
+		groups.forEach(function(g) {
+			g.rows.sort(function(a, b) { return compare(a.relay, b.relay); });
+			Object.freeze(g.rows); Object.freeze(g);
 		});
-		return found;
+		return Object.freeze({ byHost: Object.freeze(byHost), groups: Object.freeze(groups), lowest: best });
+	},
+
+	srvCancelFilter: function() {
+		if (this._srvFilterTimer != null) clearTimeout(this._srvFilterTimer);
+		this._srvFilterTimer = null;
+	},
+
+	srvReplaceData: function(relays) {
+		this.srvCancelFilter();
+		this._srvDataGeneration = (this._srvDataGeneration || 0) + 1;
+		this._serverData = relays ? { relays: relays.slice() } : null;
+		this._serverIndex = relays ? this.srvBuildIndex(relays) : null;
+		this._srvOffset = 0;
+		if (this._srvOpen) this.srvRenderList();
+	},
+
+	srvRelayByHost: function(host) {
+		return (this._serverIndex && this._serverIndex.byHost[host]) || null;
 	},
 
 	srvLowestLoad: function() {
-		var best = null;
-		((this._serverData && this._serverData.relays) || []).forEach(function(r) {
-			if (typeof r.load !== 'number' || r.dedicated) return;
-			if (!best || r.load < best.load) best = r;
-		});
-		return best;
+		return (this._serverIndex && this._serverIndex.lowest) || null;
 	},
 
 	// The trigger shows the current pin richly (load dot / flag / city / name),
@@ -2639,7 +2769,7 @@ return view.extend({
 	srvTogglePanel: function() {
 		if (this._srvOpen)
 			return this.srvClosePanel();
-		this._srvFilter = '';
+		this._srvOffset = 0;
 		this._srvOpen = true;
 		if (this.srvTrigger) this.srvTrigger.classList.add('hidden');
 		this.srvPanel.classList.remove('hidden');
@@ -2647,125 +2777,120 @@ return view.extend({
 	},
 
 	srvClosePanel: function() {
+		this.srvCancelFilter();
 		this._srvOpen = false;
 		if (this.srvPanel) this.srvPanel.classList.add('hidden');
-		if (this.srvTrigger) this.srvTrigger.classList.remove('hidden');
+		if (this.srvTrigger) {
+			this.srvTrigger.classList.remove('hidden');
+			if (this.srvTrigger.focus) this.srvTrigger.focus();
+		}
 	},
 
 	srvSetChosen: function(host) {
 		this._serverChosen = host || '';
-		this.markDirty();
+		this.markConnectionDirty();
 		this.updateRotationAvailability();
 		this.srvRenderTrigger();
 		this.srvClosePanel();
 	},
 
-	// Panel: header + filter, quick "Automatic" and "Lowest load" rows, then
-	// servers grouped by country and sorted by load (lowest first).
+	// Keep the filter DOM stable during data refreshes and page changes.
 	srvRenderPanel: function() {
 		var panel = this.srvPanel;
-		if (!panel)
-			return;
-		dom.content(panel, '');
-		panel.appendChild(E('div', { class: 'nv-pool-head' }, [
-			E('span', {}, _('Pick a server')),
-			E('button', { type: 'button', class: 'nv-pool-x', title: _('Close'),
-				click: L.bind(function(ev) { ev.stopPropagation(); this.srvClosePanel(); }, this) }, '✕')
-		]));
-		var filt = E('input', { type: 'text', class: 'cbi-input-text nv-pool-filter',
-			placeholder: _('Filter servers') + '…', value: this._srvFilter });
+		if (!panel) return;
+		this.srvCancelFilter();
+		var filt = this._srvFilterEl = E('input', { type: 'text', class: 'cbi-input-text nv-pool-filter',
+			'aria-label': _('Filter servers'), placeholder: _('Filter servers') + '…', value: this._srvFilter || '' });
 		filt.addEventListener('input', L.bind(function() {
 			this._srvFilter = filt.value;
-			this.srvRenderList();
+			this._srvOffset = 0;
+			this.srvCancelFilter();
+			var generation = this._srvDataGeneration, panel = this.srvPanel;
+			this._srvFilterTimer = setTimeout(L.bind(function() {
+				this._srvFilterTimer = null;
+				if (this._srvOpen && generation === this._srvDataGeneration && panel === this.srvPanel)
+					this.srvRenderList();
+			}, this), 100);
 		}, this));
 		filt.addEventListener('click', function(ev) { ev.stopPropagation(); });
-		panel.appendChild(filt);
+		panel.addEventListener('keydown', this._srvEscapeHandler || (this._srvEscapeHandler = L.bind(function(ev) {
+			if (ev.key === 'Escape') { ev.stopPropagation(); this.srvClosePanel(); }
+		}, this)));
 		this._srvListEl = E('div', {});
-		panel.appendChild(this._srvListEl);
+		dom.content(panel, [ E('div', { class: 'nv-pool-head' }, [ E('span', {}, _('Pick a server')),
+			E('button', { type: 'button', class: 'nv-pool-x', title: _('Close'),
+				click: L.bind(function(ev) { ev.stopPropagation(); this.srvClosePanel(); }, this) }, '✕') ]), filt, this._srvListEl ]);
 		this.srvRenderList();
-		setTimeout(function() { try { filt.focus(); } catch (e) {} }, 0);
+		filt.focus();
 	},
 
-	srvRenderList: function() {
+	srvRenderList: function(focusPage) {
 		var el = this._srvListEl;
-		if (!el)
-			return;
-		dom.content(el, '');
-		var names = this._ccNames || {};
-		var chosen = this._serverChosen;
-		var current = this.srvCurrentGateway();
-		var f = (this._srvFilter || '').toLowerCase();
-
-		el.appendChild(E('div', { class: 'nv-pool-row nv-srv-quick',
-			click: L.bind(function(ev) { ev.stopPropagation(); this.srvSetChosen(''); }, this) }, [
-				E('span', { class: 'box' }, chosen ? '' : '☑'),
-				E('span', { class: 'grow' }, _('Automatic (rotation picks)'))
-			]));
+		if (!el) return;
+		var names = this._ccNames || {}, chosen = this._serverChosen, current = this.srvCurrentGateway();
+		var f = (this._srvFilter || '').toLowerCase(), groups = (this._serverIndex && this._serverIndex.groups) || [];
+		var kids = [], firstRow = null, offset = this._srvOffset || 0, total = 0, shown = 0;
+		var active = document.activeElement;
+		var focusKey = active && el.contains && el.contains(active) ? active.getAttribute('data-server-key') : null;
+		var action = L.bind(function(host, attrs, children) {
+			return E('button', Object.assign({ type: 'button', class: 'nv-pool-row nv-srv-action', 'data-server-key': 'relay:' + host,
+				click: L.bind(function(ev) { ev.stopPropagation(); this.srvSetChosen(host); }, this) }, attrs), children);
+		}, this);
+		kids.push(action('', { class: 'nv-pool-row nv-srv-action nv-srv-quick', 'data-server-key': 'automatic' }, [
+			E('span', { class: 'box' }, chosen ? '' : '☑'), E('span', { class: 'grow' }, _('Automatic (rotation picks)')) ]));
 		var best = this.srvLowestLoad();
-		if (best) {
-			var bn = names[best.country_code] || (best.country_code || '').toUpperCase();
-			el.appendChild(E('div', { class: 'nv-pool-row nv-srv-quick',
-				click: L.bind(function(ev) { ev.stopPropagation(); this.srvSetChosen(best.hostname); }, this) }, [
-					E('span', { class: 'box' }, '⚡'),
-					E('span', { class: 'grow' }, _('Lowest load') + ' · ' + (best.city || bn) +
-						(best.load != null ? ' (%d%%)'.format(best.load) : '')),
-					E('span', { class: 'nv-dot ' + this.srvLoadClass(best.load) })
-				]));
-		}
-		el.appendChild(E('div', { class: 'nv-pool-sep' }));
-
-		var groups = [], byCode = {};
-		((this._serverData && this._serverData.relays) || []).forEach(L.bind(function(r) {
-			var cname = names[r.country_code] || (r.country_code || '').toUpperCase();
-			var hay = (cname + ' / ' + (r.city || '') + ' / ' + (r.name || r.hostname)).toLowerCase();
-			if (f && r.hostname !== chosen && hay.indexOf(f) < 0)
-				return;
-			var g = byCode[r.country_code];
-			if (!g) {
-				g = { name: cname, flag: this.countryFlag(r.country_code), rows: [] };
-				byCode[r.country_code] = g;
-				groups.push(g);
-			}
-			g.rows.push(r);
-		}, this));
+		kids.push(action(best ? best.hostname : '', { class: 'nv-pool-row nv-srv-action nv-srv-quick', 'data-server-key': 'lowest', disabled: best ? null : '' }, [
+			E('span', { class: 'box' }, '⚡'), E('span', { class: 'grow' }, _('Lowest load') + (best ? ' · ' +
+				(best.city || names[best.country_code] || best.country_code || '') + ' (%d%%)'.format(best.load) : '')) ]));
+		// Fixed text summaries keep off-page and filtered-out pins/current gateways visible.
+		if (chosen) kids.push(E('div', { class: 'nv-srv-summary' }, _('Selected: %s').format(chosen) +
+			(this.srvRelayByHost(chosen) ? '' : ' ' + _('(not in the set)'))));
+		if (current) kids.push(E('div', { class: 'nv-srv-summary' }, _('Current: %s').format(current)));
+		kids.push(E('div', { class: 'nv-pool-sep' }));
 		groups.forEach(L.bind(function(g) {
-			// Numeric-aware tiebreak on purpose: a plain string compare puts
-			// de#1027 before de#95, which reads as broken when a whole page of
-			// servers shares the same load — and at low load that is most of
-			// them.
-			g.rows.sort(function(a, b) {
-				var al = typeof a.load === 'number' ? a.load : 999;
-				var bl = typeof b.load === 'number' ? b.load : 999;
-				if (al !== bl)
-					return al - bl;
-				return (a.name || a.hostname || '').localeCompare(
-					b.name || b.hostname || '', undefined, { numeric: true });
-			});
-			el.appendChild(E('div', { class: 'nv-srv-grp' }, (g.flag ? g.flag + ' ' : '') +
-				'%s (%d)'.format(g.name, g.rows.length)));
-			g.rows.forEach(L.bind(function(r) {
-				var isCur = current && r.hostname === current;
-				var isPin = r.hostname === chosen;
-				el.appendChild(E('div', { class: 'nv-pool-row' + (isPin ? ' is-in' : ''),
-					click: L.bind(function(ev) { ev.stopPropagation(); this.srvSetChosen(r.hostname); }, this) }, [
-						E('span', { class: 'nv-dot ' + this.srvLoadClass(r.load) }),
-						E('span', { class: 'grow' }, '%s / %s'.format(r.city || '?', r.name || r.hostname)),
-						r.p2p ? E('span', { class: 'nv-srv-tag' }, _('P2P')) : '',
-						r.dedicated ? E('span', { class: 'nv-srv-tag', title: _('Only works for the account this Dedicated IP is assigned to') }, _('Dedicated IP')) : '',
-						isCur ? E('span', { class: 'nv-srv-cur' }, '● ' + _('current')) : '',
-						E('span', { class: 'nv-srv-load' }, r.load != null ? '%d%%'.format(r.load) : '')
-					]));
+			var header = false;
+			g.rows.forEach(L.bind(function(entry) {
+				if (f && entry.search.indexOf(f) < 0) return;
+				var position = total++;
+				if (position < offset || shown >= SRV_PAGE_SIZE) return;
+				if (!header) { kids.push(E('div', { class: 'nv-srv-grp' }, (g.flag ? g.flag + ' ' : '') + g.name)); header = true; }
+				var r = entry.relay, isPin = r.hostname === chosen;
+				var row = action(r.hostname, { class: 'nv-pool-row nv-srv-action nv-srv-relay' + (isPin ? ' is-in' : ''),
+					'aria-pressed': isPin ? 'true' : 'false' }, [
+					E('span', { class: 'nv-dot ' + this.srvLoadClass(r.load) }),
+					E('span', { class: 'grow' }, '%s / %s'.format(r.city || '?', r.name || r.hostname)),
+					r.p2p ? E('span', { class: 'nv-srv-tag' }, _('P2P')) : '',
+					r.dedicated ? E('span', { class: 'nv-srv-tag', title: _('Only works for the account this Dedicated IP is assigned to') }, _('Dedicated IP')) : '',
+					current && r.hostname === current ? E('span', { class: 'nv-srv-cur' }, '● ' + _('current')) : '',
+					E('span', { class: 'nv-srv-load' }, r.load != null ? '%d%%'.format(r.load) : '') ]);
+				kids.push(row); if (!firstRow) firstRow = row; shown++;
 			}, this));
 		}, this));
-
-		if (chosen && !this.srvRelayByHost(chosen))
-			el.appendChild(E('div', { class: 'nv-pool-row is-in' }, chosen + ' ' + _('(not in the set)')));
-		else if (!groups.length)
-			el.appendChild(E('div', { class: 'nv-pool-row is-in' }, _('No matches')));
+		this._srvMatchCount = total;
+		kids.push(E('div', { class: 'nv-srv-summary', role: 'status' }, _('%d–%d of %d matches').format(total ? offset + 1 : 0, offset + shown, total)));
+		if (!total) kids.push(E('div', { class: 'nv-srv-summary' }, _('No matches')));
+		var page = L.bind(function(delta) {
+			// A click before the debounce expires belongs to the newly typed filter.
+			var pendingFilter = this._srvFilterTimer != null;
+			this.srvCancelFilter();
+			this._srvOffset = pendingFilter ? 0 : Math.max(0, offset + delta * SRV_PAGE_SIZE);
+			this.srvRenderList(true);
+		}, this);
+		if (offset) kids.push(E('button', { type: 'button', class: 'cbi-button nv-srv-prev', 'data-server-key': 'previous', click: function(ev) { ev.stopPropagation(); page(-1); } }, _('Previous')));
+		if (offset + shown < total) kids.push(E('button', { type: 'button', class: 'cbi-button nv-srv-more', 'data-server-key': 'more', click: function(ev) { ev.stopPropagation(); page(1); } }, _('Show more')));
+		// Build the whole page off-DOM, then replace it in one batch.
+		dom.content(el, kids);
+		if (focusPage && firstRow) firstRow.focus();
+		else if (focusKey) {
+			var replacement = Array.prototype.find.call(el.querySelectorAll('[data-server-key]'), function(node) {
+				return node.getAttribute('data-server-key') === focusKey;
+			});
+			(replacement && !replacement.disabled ? replacement : this._srvFilterEl).focus();
+		}
 	},
 
 	onHopChange: function() {
-		this.markDirty();
+		this.markConnectionDirty();
 		this.updateHopButtons();
 		this.rebuildPoolWidget();
 		this.refreshServerList();
@@ -2775,8 +2900,10 @@ return view.extend({
 		var fixed = this._serverChosen;
 		if (this.rotEnable) {
 			this.rotEnable.disabled = !!fixed;
-			if (fixed)
+			if (fixed && this.rotEnable.checked) {
 				this.rotEnable.checked = false;
+				this.markDirty();
+			}
 		}
 		if (this.rotFixedNote)
 			this.rotFixedNote.classList.toggle('hidden', !fixed);
@@ -2788,7 +2915,10 @@ return view.extend({
 		// The watchdog never fires with a pinned server either.
 		if (this.wdRow)
 			this.wdRow.classList.toggle('hidden', !!fixed);
+		var building = this._building;
+		this._building = true;
 		this.onRotationToggle();
+		this._building = building;
 	},
 
 	onRotationToggle: function() {
@@ -2803,20 +2933,70 @@ return view.extend({
 
 	/* ---- dirty / save / discard --------------------------------------- */
 
+	// Persisted values and editable values have separate lifetimes. Keep the
+	// existing picker fields as widget adapters, never as RPC response targets.
+	ensureConnectionState: function() {
+		if (this._connectionState && this._connectionState.instance === this.instance)
+			return this._connectionState;
+		var loc = uci.get('nordvpn', this.instance, 'locations') || [];
+		if (typeof loc === 'string') loc = [ loc ];
+		if (!Array.isArray(loc)) loc = [];
+		if (!loc.length) {
+			var legacy = uci.get('nordvpn', this.instance, 'city_code') || uci.get('nordvpn', this.instance, 'country_code');
+			if (legacy) loc = [ legacy ];
+		}
+		var baseline = {
+			fixed_server: uci.get('nordvpn', this.instance, 'fixed_server') || '',
+			locations: loc.slice(),
+			hop_mode: uci.get('nordvpn', this.instance, 'hop_mode') || 'single',
+			server_group: uci.get('nordvpn', this.instance, 'server_group') || ''
+		};
+		this._connectionState = { instance: this.instance, baseline: baseline,
+			draft: JSON.parse(JSON.stringify(baseline)) };
+		return this._connectionState;
+	},
+
+	markConnectionDirty: function() {
+		if (this._building) return;
+		var state = this.ensureConnectionState();
+		state.draft = { fixed_server: this._serverChosen || '',
+			locations: (this.poolEntries || []).map(function(e) { return e.code; }),
+			hop_mode: this.hopMode(), server_group: this.serverGroup() };
+		this._editGeneration = (this._editGeneration || 0) + 1;
+		this.updateDirty();
+	},
+
+	updateDirty: function() {
+		var state = this._connectionState;
+		var comparable = function(value) {
+			return JSON.stringify([ value.fixed_server, value.locations.slice().sort(), value.hop_mode, value.server_group ]);
+		};
+		this.dirty = !!this._otherDirty || !!(state && comparable(state.draft) !== comparable(state.baseline));
+		if (this.saveBtn) this.saveBtn.disabled = !!this._saving || !this.dirty;
+		if (this.discardBtn) this.discardBtn.disabled = !!this._saving || !this.dirty;
+	},
+
 	markDirty: function() {
-		if (this._building)
-			return;
-		this.dirty = true;
-		if (this.saveBtn) this.saveBtn.disabled = false;
-		if (this.discardBtn) this.discardBtn.disabled = false;
+		if (this._building) return;
+		this._otherDirty = true;
+		this._otherEditGeneration = (this._otherEditGeneration || 0) + 1;
+		this._editGeneration = (this._editGeneration || 0) + 1;
+		this.updateDirty();
 	},
 
 	discard: function() {
+		this.srvCancelFilter();
+		// Invalidate synchronously: an already pending response cannot restore
+		// an edit while the config load below is still outstanding.
+		this._serversReq = (this._serversReq || 0) + 1;
+		this._formGeneration = (this._formGeneration || 0) + 1;
+		var instance = this.instance, generation = this._formGeneration, edits = this._editGeneration;
 		return uci.load('nordvpn').then(L.bind(function() {
+			if (instance !== this.instance || generation !== this._formGeneration || edits !== this._editGeneration) return;
+			this._connectionState = null;
+			this._otherDirty = false;
 			dom.content(this.formNode, this.buildFormSections());
-			this.dirty = false;
-			if (this.saveBtn) this.saveBtn.disabled = true;
-			if (this.discardBtn) this.discardBtn.disabled = true;
+			this.updateDirty();
 		}, this));
 	},
 
@@ -2991,11 +3171,12 @@ return view.extend({
 	// update first when the change allows it; the backend still refuses (and
 	// this falls back to a full apply) when the tunnel is not up with matching
 	// interface settings, e.g. the instance was disabled.
-	applySaved: function(routingOnly, p) {
+	applySaved: function(routingOnly, p, instance) {
+		instance = instance || this.instance;
 		if (!routingOnly) {
 			this.dismiss(p);
 			p = this.notice(_('Applying and reconnecting…'), 'info');
-			return this.applyAsync(this.instance, 'save').then(L.bind(function(res) {
+			return this.applyAsync(instance, 'save').then(L.bind(function(res) {
 				this.dismiss(p);
 				return res;
 			}, this), L.bind(function(e) {
@@ -3005,11 +3186,11 @@ return view.extend({
 		}
 		this.dismiss(p);
 		p = this.notice(_('Applying routing changes…'), 'info');
-		return callApplyRouting(this.instance).then(L.bind(function(res) {
+		return callApplyRouting(instance).then(L.bind(function(res) {
 			if (res && res.needs_reconnect)
-				return this.applySaved(false, p);
+				return this.applySaved(false, p, instance);
 			this.dismiss(p);
-			return res || { error: _('no response') };
+			return this.operationResult(res || { error: _('no response') }, instance);
 		}, this), L.bind(function(e) {
 			this.dismiss(p);
 			throw e;
@@ -3017,6 +3198,7 @@ return view.extend({
 	},
 
 	save: function() {
+		if (this._saving) return Promise.resolve();
 		// Require at least one location valid for the current hop mode; entries
 		// carried over from another mode (count null) do not count.
 		var validCount = (this.poolEntries || []).filter(function(e) { return e.count != null; }).length;
@@ -3029,9 +3211,21 @@ return view.extend({
 			this.notice(_('Internet check target "%s" is not an IPv4 address.').format(badTarget), 'error');
 			return Promise.resolve();
 		}
+		var instance = this.instance, state = this.ensureConnectionState();
+		var form = this._formGeneration, edits = this._editGeneration, otherEdits = this._otherEditGeneration;
+		var savedDraft = JSON.parse(JSON.stringify(state.draft));
+		var previous = JSON.parse(JSON.stringify(uci.get('nordvpn', instance) || {}));
+		var previousCache = uci.get('nordvpn', 'main', 'cache_dir');
+		var committed = false, disabled = this.status && this.status.enabled === false;
+		var active = L.bind(function() {
+			return this.instance === instance && this._formGeneration === form && this._connectionState === state;
+		}, this);
 		var before = this.optionSnapshot();
 		this.collectIntoUci();
+		var staged = JSON.parse(JSON.stringify(uci.get('nordvpn', instance) || {}));
+		var stagedCache = uci.get('nordvpn', 'main', 'cache_dir');
 		var routingOnly = this.routingOnlyChange(before, this.optionSnapshot());
+		this._saving = true;
 		this.saveBtn.disabled = true;
 		this.discardBtn.disabled = true;
 		var p = this.notice(_('Saving configuration…'), 'info');
@@ -3039,16 +3233,21 @@ return view.extend({
 		return uci.save()
 			.then(function() { return callUciCommit('nordvpn'); })
 			.then(L.bind(function() {
-				this.dirty = false;
+				committed = true;
+				if (active()) {
+					state.baseline = savedDraft;
+					if (otherEdits === this._otherEditGeneration) this._otherDirty = false;
+					this.updateDirty();
+				}
 				this.clearChangeIndicator();
 				var q = p;
 				p = null;
 				// Saving options on a disabled instance must not turn its tunnel back on.
-				if (this.status && this.status.enabled === false) {
+				if (disabled) {
 					this.dismiss(q);
 					return { saved_disabled: true };
 				}
-				return this.applySaved(routingOnly, q);
+				return this.applySaved(routingOnly, q, instance);
 			}, this))
 			.then(L.bind(function(res) {
 				if (res && res.error)
@@ -3070,13 +3269,37 @@ return view.extend({
 				// Rebuild the form, not just the status band: a saved change may
 				// have flipped the detected routing mode (e.g. clearing the table
 				// leaves manual), and the panel's shape depends on it.
+				if (!active()) return;
 				return this.refreshStatus().then(L.bind(function() {
-					dom.content(this.formNode, this.buildFormSections());
+					if (active() && !this.dirty && edits === this._editGeneration)
+						dom.content(this.formNode, this.buildFormSections());
 				}, this));
 			}, this))
 			.catch(L.bind(function(e) {
 				this.dismiss(p);
+				if (!committed) {
+					// Undo only this save's staging, and only while the value is
+					// still ours. Other actions may have loaded, changed or deleted
+					// the instance while this request was pending.
+					var equal = function(a, b) { return JSON.stringify(a) === JSON.stringify(b); };
+					var current = uci.get('nordvpn', instance);
+					if (current) {
+						Object.keys(previous).concat(Object.keys(staged)).forEach(function(k) {
+							if (k.charAt(0) === '.' || equal(previous[k], staged[k]) || !equal(current[k], staged[k])) return;
+							if (previous[k] == null) uci.unset('nordvpn', instance, k);
+							else uci.set('nordvpn', instance, k, previous[k]);
+						});
+					}
+					if (uci.get('nordvpn', 'main') && !equal(previousCache, stagedCache) &&
+					    equal(uci.get('nordvpn', 'main', 'cache_dir'), stagedCache)) {
+						if (previousCache == null) uci.unset('nordvpn', 'main', 'cache_dir');
+						else uci.set('nordvpn', 'main', 'cache_dir', previousCache);
+					}
+				}
 				this.notice(_('Save failed: %s').format(e), 'error');
+			}, this)).finally(L.bind(function() {
+				this._saving = false;
+				this.updateDirty();
 			}, this));
 	},
 
@@ -3178,7 +3401,7 @@ return view.extend({
 		return this.refreshCredentials().then(L.bind(function() {
 			return this.refreshStatus();
 		}, this)).then(L.bind(function() {
-			if (!this.dirty)
+			if (!this.dirty && !this._saving)
 				dom.content(this.formNode, this.buildFormSections());
 		}, this));
 	},
@@ -3189,29 +3412,43 @@ return view.extend({
 		var btn = ev.target;
 		btn.disabled = true;
 		dom.content(this.cacheRow, _('Refreshing…'));
-		return callRefreshLocations().then(L.bind(function() {
+		return callRefreshLocations().then(L.bind(function(result) {
+			if (result && result.error) throw new Error(result.error);
+			this._cacheJob = result && result.job;
 			this._cachePoll = L.bind(this.pollCacheOnce, this, btn);
 			poll.add(this._cachePoll, 2);
 		}, this)).catch(L.bind(function(e) {
 			btn.disabled = false;
+			dom.content(this.cacheRow, [ _('Refresh failed: %s').format(e), ' · ', this.cacheSummary() ]);
 			this.notice(_('Refresh failed: %s').format(e), 'error');
 		}, this));
 	},
 
 	pollCacheOnce: function(btn) {
-		return callRefreshStatus().then(L.bind(function(st) {
+		return callRefreshStatus(this._cacheJob || '').then(L.bind(function(st) {
+			if (this._cacheJob && st && st.id && st.id !== this._cacheJob) return;
 			var state = st ? st.state : 'idle';
 			if (state === 'running') {
-				dom.content(this.cacheRow, [ _('Loading… %d servers so far').format((st && st.gateways) || 0) ]);
+				dom.content(this.cacheRow, [ _('Loading… %d servers so far').format((st && st.gateways) || 0), ' · ', this.cacheSummary() ]);
 				return;
 			}
 			poll.remove(this._cachePoll);
 			btn.disabled = false;
+			var error = state !== 'done';
+			var message = error ? _('Refresh failed: %s').format((st && (st.message || st.error)) || _('refresh completion is unavailable')) : '';
+			// Render the terminal result immediately: a failed locations read
+			// must not hide it or remove the previous usable-cache context.
+			dom.content(this.cacheRow, [ message ? message + ' · ' : '', this.cacheSummary() ]);
+			if (error) this.notice(message, 'error');
 			return callLocations().then(L.bind(function(loc) {
 				this.locations = loc || { available: false };
-				dom.content(this.cacheRow, [ this.cacheSummary() ]);
+				dom.content(this.cacheRow, [ message ? message + ' · ' : '', this.cacheSummary() ]);
 				this.rebuildPoolWidget();
 				this.refreshServerList();
+			}, this)).catch(L.bind(function(e) {
+				var readError = _('Could not read server list: %s').format(e);
+				dom.content(this.cacheRow, [ message ? message + ' · ' : '', readError, ' · ', this.cacheSummary() ]);
+				this.notice(readError, 'error');
 			}, this));
 		}, this));
 	},
