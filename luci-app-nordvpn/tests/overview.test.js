@@ -57,7 +57,8 @@ var context = {
 			}
 		}[name];
 		},
-	L: { bind: function(fn, obj) { return fn.bind.apply(fn, Array.prototype.slice.call(arguments, 1)); } },
+	L: { bind: function(fn, obj) { return fn.bind.apply(fn, Array.prototype.slice.call(arguments, 1)); },
+		toArray: function(value) { return Array.isArray(value) ? value : value ? [value] : []; } },
 	setTimeout: function() {},
 	document: { addEventListener: function() {} }
 };
@@ -90,7 +91,8 @@ function deferred() {
 function pickerTests() {
 	context.dom.create = function(tag, attrs, children) {
 		return { tag: tag, attrs: attrs || {}, children: children || [], value: (attrs || {}).value || '', events: {},
-			classList: { add: function() {}, remove: function() {} },
+			classList: { add: function() {}, remove: function() {}, toggle: function() {} },
+			setAttribute: function(name, value) { this.attrs[name] = value; },
 			addEventListener: function(name, fn) { this.events[name] = fn; }, focus: function() { context.document.activeElement = this; },
 			appendChild: function(child) { this.children.push(child); } };
 	};
@@ -175,6 +177,7 @@ function pickerTests() {
 	assert.strictEqual(v.srvLowestLoad(), null);
 	var contextView = Object.assign({}, v, { credNode: {}, ensureConnectionState: function() {}, buildCredentials: function() {},
 		buildConnection: function() {}, buildRoutingSection: function() {}, buildRotation: function() {}, buildAdvanced: function() {},
+		buildRecovery: function() {}, buildSharedSettings: function() {},
 		srvRenderTrigger: function() {} });
 	contextView._srvFilterTimer = context.setTimeout(function() { throw new Error('old form callback'); });
 	contextView.buildFormSections();
@@ -197,6 +200,7 @@ async function draftTests() {
 	// form replacement, UCI collection and save/discard flows.
 	context.dom.create = function(tag, attrs, children) {
 		return { tag: tag, attrs: attrs || {}, children: children || [], value: (attrs || {}).value || '',
+			setAttribute: function(name, value) { this.attrs[name] = value; },
 			style: {}, events: {}, classList: { add: function() {}, remove: function() {}, toggle: function() {} },
 			addEventListener: function(name, fn) { this.events[name] = fn; },
 			appendChild: function(child) { if (!Array.isArray(this.children)) this.children = [this.children]; this.children.push(child); } };
@@ -235,6 +239,7 @@ async function draftTests() {
 					cities: [{ code: 'fr-paris', name: 'Paris', single: 2, multi: 2, onion: 2, p2p: 2 }] }] },
 			// Keep unrelated panels small; their ordinary input is a real view input.
 			buildCredentials: function() { return []; }, buildRoutingSection: function() { return []; },
+			buildRecovery: function() { return this.buildRotation(); }, buildSharedSettings: function() { return []; },
 			buildAdvanced: function() {
 				return [ this.input('mtu', 'text', uci.get('nordvpn', this.instance, 'mtu') || '1420'),
 					this.input('cache_dir', 'text', uci.get('nordvpn', 'main', 'cache_dir') || '') ];
@@ -552,7 +557,97 @@ async function probeTests() {
 	assert(renders > 0, 'accepted observations update the status band');
 }
 
+async function organizationTests() {
+	var previousValues = uciValues;
+	var focus = null;
+	context.dom.create = function(tag, attrs, children) {
+		return { tag: tag, attrs: attrs || {}, children: children || [], value: (attrs || {}).value || '',
+			setAttribute: function(name, value) { this.attrs[name] = value; },
+			appendChild: function(child) { this.children.push(child); },
+			classList: { hidden: false, toggle: function(name, enabled) { if (name === 'hidden') this.hidden = enabled; } },
+			addEventListener: function() {},
+			focus: function() { focus = this; } };
+	};
+	context.dom.content = function(node, value) { node.children = value; };
+	var builds = 0;
+	uciValues = { main: { interface: 'nordvpn', mtu: '1420', credential: 'default' } };
+	var v = Object.assign({}, app, { instance: 'main', status: { enabled: true }, credNode: {},
+		srvCancelFilter: function() {}, ensureConnectionState: function() {},
+		buildCredentials: function() { return []; }, buildConnection: function() { builds++; return {}; },
+		buildRoutingSection: function() { builds++; return {}; }, buildRecovery: function() { builds++; return {}; },
+		buildAdvanced: function() { builds++; this.refs.mtu = { value: '1420' }; return {}; },
+		buildSharedSettings: function() { builds++; this.refs.cache_dir = { value: '' }; return {}; },
+		srvRenderTrigger: function() {}, updateRotationAvailability: function() {} });
+	v.buildFormSections();
+	assert.strictEqual(Object.keys(v.tabPanels).join(','), 'connection,routing,recovery,advanced,global');
+	assert.strictEqual(v.tabButtons.connection.attrs['aria-selected'], 'true');
+	assert.strictEqual(v.tabPanels.routing.hidden, true);
+	var draftInput = v.refs.mtu;
+	draftInput.value = '1320'; v.dirty = true;
+	v.selectTab('routing'); v.selectTab('advanced');
+	assert.strictEqual(v.refs.mtu, draftInput, 'tab navigation retains the same input and its draft');
+	assert.strictEqual(v.refs.mtu.value, '1320');
+	assert.strictEqual(v.dirty, true, 'tab changes preserve pending changes');
+	assert.strictEqual(builds, 5, 'tabs do not rebuild form panels');
+	v.tabButtons.advanced.attrs.keydown({ key: 'ArrowRight', preventDefault: function() {} });
+	assert.strictEqual(v._activeTab, 'global');
+	assert.strictEqual(focus, v.tabButtons.global, 'arrow navigation moves keyboard focus');
+	assert.strictEqual(v.tabButtons.advanced.attrs.tabindex, '-1');
+	assert(v.pendingChangesText().includes('Reconnects on save'), 'MTU changes explain that save reconnects');
+	v.refs.mtu.value = '1420';
+	assert(v.pendingChangesText().includes('Applies without reconnecting'), 'non-connection changes explain live apply');
+	v.status.enabled = false;
+	assert(v.pendingChangesText().includes('tunnel stays disabled'), 'save preview respects disabled state');
+	v.refs.cache_dir.value = '/tmp/other-cache';
+	assert(v.pendingChangesText().includes('shared cache setting'), 'shared-setting changes are explicit');
+	v.managementDetails = {}; v.openManagement();
+	assert.strictEqual(v.managementDetails.open, true);
+	assert.strictEqual(v._activeTab, 'global');
+
+	uciValues.main.source_network = ['lan'];
+	var routing = Object.assign({}, app, { instance: 'main', instances: [{ instance: 'main' }],
+		status: { routing: { mode: 'steered', networks: ['lan'] } }, _building: true,
+		buildDevicePicker: function() { return context.dom.create('div'); },
+		buildDomainEditor: function() { return context.dom.create('div'); } });
+	routing.buildRoutingSection();
+	assert.strictEqual(routing.routingMode.value, 'selected');
+	routing.routingMode.value = 'all'; routing.routingMode.attrs.change();
+	assert.strictEqual(routing.autoRouting.checked, true);
+	assert.strictEqual(routing.steerRow.classList.hidden, true, 'all-LAN scope hides selected networks');
+	routing.routingMode.value = 'selected'; routing.routingMode.attrs.change();
+	assert.strictEqual(routing.autoRouting.checked, false);
+	assert.strictEqual(routing.steerRow.classList.hidden, false);
+	assert.strictEqual(routing.steerBoxes.lan.checked, true, 'scope preview preserves the unsaved network selection');
+	uciValues.other = { auto_routing: '1' }; routing.instances.push({ instance: 'other', enabled: true });
+	routing.buildRoutingSection();
+	assert.strictEqual(routing.routingMode.children[1].attrs.disabled, true, 'another owner prevents selecting all-LAN scope');
+
+	var submitted = 0, value = 'a'.repeat(64), reads = 0, notices = [];
+	v.notice = function(message) { notices.push(message); };
+	context.window.location = { protocol: 'http:', hostname: 'router.lan', pathname: '/cgi-bin/luci/admin/vpn/nordvpn' };
+	assert.strictEqual(v.httpsUrl(), 'https://router.lan/cgi-bin/luci/admin/vpn/nordvpn');
+	calls.set_credentials = function() { submitted++; return Promise.resolve({ error: 'synthetic rejection' }); };
+	var field = { getValue: function() { reads++; return value; }, setValue: function(next) { value = next; } };
+	v.showCredentialModal({ id: 'default' });
+	v.submitCredentials({ id: 'default' }, null, field, {}, { target: {} });
+	assert.strictEqual(reads, 0, 'HTTP submission is blocked before reading the token');
+	assert.strictEqual(submitted, 0, 'HTTP never sends credentials to RPC');
+	context.window.location.protocol = 'https:';
+	var pending = v.submitCredentials({ id: 'default' }, null, field, {}, { target: {} });
+	assert.strictEqual(value, '', 'HTTPS submission immediately clears the password field');
+	await pending;
+	assert.strictEqual(submitted, 1);
+	delete context.window.location;
+	var disabled = 0;
+	calls.disable_all = function() { disabled++; return Promise.resolve({ ok: true }); };
+	context.window.confirm = function() { return false; };
+	v.disableAll();
+	assert.strictEqual(disabled, 0, 'cancelling the WAN warning preserves all VPNs');
+	uciValues = previousValues;
+}
+
 async function run() {
+	await organizationTests();
 	pickerTests();
 	await draftTests();
 	await probeTests();

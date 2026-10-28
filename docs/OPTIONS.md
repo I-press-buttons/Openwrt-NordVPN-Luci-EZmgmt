@@ -6,11 +6,21 @@ shared. **Save** stores and applies edits; **Discard changes** restores the
 saved values. Routing edits are reconciled without reconnecting. Connection
 edits are verified with a WireGuard handshake before the new server is kept.
 
+The page starts with a tunnel selector and live status/protection summary.
+Settings tabs stay mounted when switching, so unsaved edits are preserved:
+**Connection**, **Routing & protection**, **Recovery**, **Advanced**, and
+**Global settings**. Credentials, server cache and updates are shared settings;
+instance management is also under Global settings. The sticky save bar names
+the selected tunnel and explains whether its pending changes reconnect it.
+
+Use HTTPS for administration. The credential dialog blocks token entry and
+submission on HTTP and clears the token field immediately after submission.
+
 ## Credentials and tunnels
 
 | Option | Purpose and what happens under the hood |
 | --- | --- |
-| **Credentials** | A NordVPN access token is exchanged once for a WireGuard private key. The token is not retained or returned to the browser; the key is stored in the router's network configuration for netifd. The **Default** entry is shared by all tunnels unless a tunnel selects another named entry. |
+| **Credentials** (Global settings) | A NordVPN access token is exchanged once for a WireGuard private key. The token is not retained or returned to the browser; the key is stored in the router's network configuration for netifd. The **Default** entry is shared by all tunnels unless a tunnel selects another named entry. |
 | **Add credentials / Replace token / Remove** | Add another account key, replace an entry's key, or remove an unused entry. Removing the Default key keeps the entry but clears its key. An entry in use cannot be removed. |
 | **Instances** | Each instance is an independent WireGuard tunnel with its own location, routing, rotation and health settings. Multiple instances can use different countries or credentials. Only one instance can route all LAN traffic; use steering for the others. |
 | **Enable / Disable / Delete instance** | Enable applies the saved tunnel settings. Disable takes down the tunnel and removes its managed routing/firewall rules. Delete also removes that instance's settings and generated interface. **Disable all VPNs** disables every instance and removes their kill switches, so affected traffic can use the WAN. |
@@ -54,7 +64,7 @@ mode and leaves routing and firewall configuration untouched.
 For the details and limits of DNS, IPv6 and kill-switch protection, see the
 [leak prevention guide](../README.md#preventing-leaks).
 
-## Automatic rotation and health
+## Recovery: automatic reconnect and scheduled rotation
 
 | Option | Purpose and what happens under the hood |
 | --- | --- |
@@ -77,8 +87,8 @@ For the details and limits of DNS, IPv6 and kill-switch protection, see the
 | **Server selection: Balanced** | Prefer lower-load servers while spreading choices among candidates. Load information comes from the server-list cache. |
 | **Server selection: Lowest load first** | Try the lowest reported-load eligible server first. |
 | **Server selection: Random** | Choose eligible servers randomly. |
-| **Cache directory** | Location of the downloaded NordVPN server list, shared by all instances. Empty uses `/tmp`. Persistent or system directories that are unsafe for this cache are rejected. |
-| **Server cache / Refresh server list** | Shows server-list age and server count; refresh fetches current locations, server metadata and load values from NordVPN for later selection. |
+| **Cache directory** (Global settings) | Location of the downloaded NordVPN server list, shared by all instances. Empty uses `/tmp`. Persistent or system directories that are unsafe for this cache are rejected. |
+| **Server cache / Refresh server list** (Global settings) | Shows server-list age and server count; refresh fetches current locations, server metadata and load values from NordVPN for later selection. |
 
 ## Status, actions, and updates
 

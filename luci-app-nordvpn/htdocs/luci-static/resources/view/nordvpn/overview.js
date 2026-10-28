@@ -246,6 +246,16 @@ var STYLE = '' +
 	'.nv-hist-time{flex:none;min-width:10.5em;color:var(--text-color-medium,#666);font-variant-numeric:tabular-nums}' +
 	'.nv-hist-what{flex:1 1 14em;min-width:0;overflow-wrap:anywhere}' +
 	'.nv-hist-detail{color:var(--text-color-medium,#666);font-size:.92em}' +
+	'.nv-tabs{display:flex;flex-wrap:wrap;gap:.4em;margin:1em 0;border-bottom:1px solid var(--border-color-medium,#888);padding-bottom:.5em}' +
+	'.nv-tabs button{padding:.65em .9em;background:transparent;color:inherit;border:1px solid transparent;border-radius:.3em;cursor:pointer;font:inherit}' +
+	'.nv-tabs button[aria-selected="true"]{background:#0069d6;color:#fff}' +
+	'.nv-tabs button:focus-visible{outline:2px solid #0069d6}' +
+	'[role="tabpanel"][hidden]{display:none!important}' +
+	'.nv-tunnel-selector,.nv-protection-summary{display:flex;align-items:center;gap:1em;flex-wrap:wrap;margin:.7em 0}' +
+	'.nv-protection-summary span{border:1px solid var(--border-color-medium,#888);border-radius:1em;padding:.2em .6em;font-size:.9em}' +
+	'.nv-sticky-actions{position:sticky;bottom:0;z-index:20;display:flex;align-items:center;gap:.7em;flex-wrap:wrap;padding:1em;background:var(--background-color-high,#fff);border-top:1px solid var(--border-color-medium,#888)}' +
+	'.nv-save-summary{flex:1 1 16em;text-align:left}' +
+	'.nv-help summary{cursor:pointer;font-size:.9em}.nv-help>div{margin-top:.4em;max-width:70em}' +
 	'.hidden{display:none!important}';
 
 return view.extend({
@@ -275,6 +285,8 @@ return view.extend({
 		this.refs = {};
 
 		this.instancesNode = E('div');
+		this.managementNode = E('div');
+		this.keyRemovalNode = E('div');
 		this.statusNode = E('div');
 		this.historyNode = this.buildHistory();
 		this.credNode = E('div');
@@ -284,18 +296,18 @@ return view.extend({
 		this.trackTransfer(this.instances);
 		this.updateInstancesTable();
 		this.updateStatusBand();
+		this.updaterNode = this.buildUpdater();
 		dom.content(this.formNode, this.buildFormSections());
 
 		var container = E('div', {}, [
 			E('style', {}, STYLE),
 			E('h2', {}, _('NordVPN')),
-			this.credNode,
+			this.transportNotice(),
 			this.instancesNode,
 			this.statusNode,
 			this.historyNode,
 			this.formNode,
 			this.buildActions(),
-			this.buildUpdater(),
 			E('p', { style: 'margin-top:1.5em;text-align:center' }, [
 				E('a', {
 					href: 'https://github.com/I-press-buttons/Openwrt-NordVPN-Luci-EZmgmt/blob/master/docs/OPTIONS.md',
@@ -402,12 +414,22 @@ return view.extend({
 				]),
 				E('span', { class: 'nv-inst-act' }, E('button', {
 					class: 'cbi-button cbi-button-remove',
-					click: L.bind(this.showDeleteInstanceModal, this, st.instance)
+					click: L.bind(function(name, ev) { ev.stopPropagation(); this.showDeleteInstanceModal(name, ev); }, this, st.instance)
 				}, st.instance === 'main' ? _('Reset') : _('Delete')))
 			]));
 		}, this));
 
-		dom.content(this.instancesNode, E('fieldset', { class: 'cbi-section' }, [
+		var selector = E('select', { class: 'cbi-input-select', 'aria-label': _('Selected VPN tunnel'),
+			change: L.bind(function(ev) { this.selectInstance(ev.target.value); ev.target.value = this.instance; }, this)
+		}, (this.instances || []).map(L.bind(function(st) {
+			return E('option', { value: st.instance, selected: st.instance === this.instance || null },
+				st.instance + ' · ' + this.stateInfo(this.dispState(st)).label);
+		}, this)));
+		dom.content(this.instancesNode, E('div', { class: 'nv-tunnel-selector' }, [
+			E('label', {}, [ _('Tunnel'), ' ', selector ]),
+			E('button', { type: 'button', class: 'cbi-button', click: L.bind(this.openManagement, this) }, _('Manage tunnels')) ]));
+		if (!this.managementNode) this.managementNode = E('div');
+		dom.content(this.managementNode, E('fieldset', { class: 'cbi-section' }, [
 			E('legend', {}, _('VPN instances')),
 			E('div', { class: 'cbi-section-node' }, [
 				E('div', {}, rows),
@@ -746,10 +768,19 @@ return view.extend({
 					E('div', { class: 'nv-status-details' }, details.join(' · ')),
 					protLine,
 					this.dnsLine(s),
+					this.protectionSummary(s),
 					E('div', { class: 'nv-status-actions' }, this.actionButtons(s))
 				])
 			])
 		]));
+	},
+
+	protectionSummary: function(s) {
+		var rt = s.routing || {}, known = rt.mode && rt.mode !== 'manual' && !this.routingUnconfirmed(s);
+		return E('div', { class: 'nv-protection-summary' }, [
+			E('span', {}, _('Kill switch: ') + (known ? (rt.killswitch ? _('Enabled') : _('Off')) : _('Unconfirmed'))),
+			E('span', {}, _('Direct IPv6: ') + (known ? (rt.ipv6_block ? _('Blocked') : _('Not blocked')) : _('Unconfirmed')))
+		]);
 	},
 
 	externalIpKey: function() {
@@ -1156,6 +1187,7 @@ return view.extend({
 
 	disableAll: function(ev) {
 		var btn = ev && ev.currentTarget;
+		if (!window.confirm(_('Disable every VPN and remove their kill switches? Affected traffic will use the WAN.'))) return;
 		if (this._disableAllRunning)
 			return Promise.resolve();
 		this._disableAllRunning = true;
@@ -1225,20 +1257,64 @@ return view.extend({
 		// Building the form fires the same change paths as user input; the
 		// guard keeps programmatic construction from marking the form dirty.
 		this._building = true;
-		// Credentials sit at the top of the page, apart from the form, but follow
-		// the selected instance, so they are rebuilt with it.
+		// Global credentials use a stable node; rebuilding the selected tunnel
+		// must keep shared account information current.
 		dom.content(this.credNode, this.buildCredentials());
-		var sections = [ this.buildConnection(), this.buildRoutingSection(), this.buildRotation(), this.buildAdvanced() ];
+		var connection = this.buildConnection(), routing = this.buildRoutingSection();
+		var advanced = this.buildAdvanced(), recovery = this.buildRecovery();
+		var sections = [
+			[ 'connection', _('Connection'), connection ],
+			[ 'routing', _('Routing & protection'), routing ],
+			[ 'recovery', _('Recovery'), recovery ],
+			[ 'advanced', _('Advanced'), advanced ],
+			[ 'global', _('Global settings'), this.buildSharedSettings() ]
+		];
+		this.tabButtons = {};
+		this.tabPanels = {};
+		var tabs = E('div', { class: 'nv-tabs', role: 'tablist', 'aria-label': _('VPN settings') }, sections.map(L.bind(function(item, index) {
+			var button = E('button', { type: 'button', role: 'tab', id: 'nv-tab-' + item[0],
+				'aria-controls': 'nv-panel-' + item[0], click: L.bind(this.selectTab, this, item[0]),
+				keydown: L.bind(function(ev) {
+					var next = ev.key === 'ArrowRight' ? (index + 1) % sections.length :
+						ev.key === 'ArrowLeft' ? (index + sections.length - 1) % sections.length :
+						ev.key === 'Home' ? 0 : ev.key === 'End' ? sections.length - 1 : -1;
+					if (next < 0) return;
+					ev.preventDefault(); this.selectTab(sections[next][0]); this.tabButtons[sections[next][0]].focus();
+				}, this) }, item[1]);
+			this.tabButtons[item[0]] = button;
+			this.tabPanels[item[0]] = E('div', { role: 'tabpanel', id: 'nv-panel-' + item[0],
+				'aria-labelledby': 'nv-tab-' + item[0], tabindex: '0' }, [ item[2] ]);
+			return button;
+		}, this)));
+		this.selectTab(this._activeTab || 'connection');
 		this.srvRenderTrigger();
 		this.updateRotationAvailability();
 		this._building = false;
-		return sections;
+		this.updateDirty();
+		return [ tabs ].concat(sections.map(L.bind(function(item) { return this.tabPanels[item[0]]; }, this)));
+	},
+
+	openManagement: function() {
+		this.selectTab('global');
+		this._managementOpen = true;
+		if (this.managementDetails) this.managementDetails.open = true;
+		if (this.managementNode && this.managementNode.scrollIntoView) this.managementNode.scrollIntoView({ block: 'nearest' });
+	},
+
+	selectTab: function(name) {
+		if (!this.tabPanels[name]) name = 'connection';
+		this._activeTab = name;
+		Object.keys(this.tabPanels).forEach(L.bind(function(key) {
+			this.tabPanels[key].hidden = key !== name;
+			this.tabButtons[key].setAttribute('aria-selected', key === name ? 'true' : 'false');
+			this.tabButtons[key].setAttribute('tabindex', key === name ? '0' : '-1');
+		}, this));
 	},
 
 	row: function(labelText, fieldNodes, descText) {
 		var field = E('div', { class: 'cbi-value-field' }, fieldNodes);
 		if (descText)
-			field.appendChild(E('div', { class: 'cbi-value-description' }, descText));
+			field.appendChild(E('details', { class: 'nv-help cbi-value-description' }, [ E('summary', {}, _('Details')), E('div', {}, descText) ]));
 		return E('div', { class: 'cbi-value' }, [
 			E('label', { class: 'cbi-value-title' }, labelText),
 			field
@@ -1262,7 +1338,6 @@ return view.extend({
 	buildCredentials: function() {
 		var creds = this.credentials || [];
 		var rows = creds.map(L.bind(function(c) {
-			var isDefault = (c.id === 'default');
 			return E('tr', { class: 'tr' }, [
 				E('td', { class: 'td' }, c.name),
 				E('td', { class: 'td' }, c.configured ? _('Configured') : _('Not configured')),
@@ -1270,13 +1345,21 @@ return view.extend({
 				E('td', { class: 'td nv-inline' }, [
 					E('button', { class: 'cbi-button', click: L.bind(this.showCredentialModal, this, c) },
 						c.configured ? _('Replace token') : _('Set token')),
-					(isDefault && !c.configured) ? '' : E('button', {
-						class: 'cbi-button cbi-button-remove',
-						click: L.bind(this.showClearCredentialsModal, this, c)
-					}, isDefault ? _('Remove key') : _('Remove'))
+
 				])
 			]);
 		}, this));
+
+		if (!this.keyRemovalNode) this.keyRemovalNode = E('div');
+		dom.content(this.keyRemovalNode, E('fieldset', { class: 'cbi-section' }, [
+			E('legend', {}, _('Remove saved credentials')),
+			E('p', { class: 'cbi-value-description' }, _('Removing a key can disconnect every tunnel that uses it.')),
+			E('div', {}, creds.filter(function(c) { return c.id !== 'default' || c.configured; }).map(L.bind(function(c) {
+				return E('div', { class: 'nv-inline' }, [ E('span', {}, c.name),
+					E('button', { class: 'cbi-button cbi-button-remove', click: L.bind(this.showClearCredentialsModal, this, c) },
+						c.id === 'default' ? _('Remove key') : _('Remove')) ]);
+			}, this)))
+		]));
 
 		return E('fieldset', { class: 'cbi-section' }, [
 			E('legend', {}, _('Credentials')),
@@ -1444,6 +1527,7 @@ return view.extend({
 		var rt = (this.status || {}).routing || {};
 		var body = E('div', { class: 'cbi-section-node' });
 		this.autoRouting = null;
+		this.routingMode = null;
 		this.steerBoxes = {};
 		this.steerRow = null;
 		this.devRow = null;
@@ -1536,10 +1620,15 @@ return view.extend({
 				routeNote = E('div', { class: 'cbi-value-description nv-inline-note' },
 					_('⚠ Not active: instance "%s" already routes all LAN traffic. Turn it off here or there.').format(owner));
 			}
-			body.appendChild(this.row(_('Traffic routing'), [
-				E('label', { class: 'nv-check' }, [ this.autoRouting, _('Route all LAN traffic through the VPN') ]),
-				routeNote || ''
-			], _('Routes every network of the LAN zone through the tunnel, using the tunnel\'s own routing table; other networks (a guest network) and the router itself keep the normal connection. Disabling removes exactly what was created.')));
+			this.routingMode = E('select', { class: 'cbi-input-select', 'aria-label': _('Traffic scope'), change: L.bind(function() {
+				this.autoRouting.checked = this.routingMode.value === 'all'; this.onRoutingToggle();
+			}, this) }, [
+				E('option', { value: 'selected' }, _('Selected traffic')),
+				E('option', { value: 'all', disabled: this.autoRouting.disabled || null }, _('All LAN traffic'))
+			]);
+			this.routingMode.value = this.autoRouting.checked ? 'all' : 'selected';
+			body.appendChild(this.row(_('Traffic scope'), [ this.routingMode, routeNote || '' ],
+				_('All LAN traffic covers the LAN firewall zone. Selected traffic uses the networks, devices and destinations chosen below. The router itself keeps its normal route.')));
 			this.steerRow = this.row(_('Steered networks'), [ this.steerWrap ],
 				_('Or route only these networks through this instance — policy rules send their traffic into its routing table.'));
 			if (nets.length)
@@ -1573,7 +1662,7 @@ return view.extend({
 		}
 
 		return E('fieldset', { class: 'cbi-section' }, [
-			E('legend', {}, _('Traffic routing')),
+			E('legend', {}, _('Routing & protection')),
 			body
 		]);
 	},
@@ -2461,9 +2550,6 @@ return view.extend({
 	buildAdvanced: function() {
 		var self = this;
 		var g = function(o, d) { return uci.get('nordvpn', self.instance, o) || d; };
-		// The server-list cache is shared between instances (owned by 'main').
-		var gm = function(o, d) { return uci.get('nordvpn', 'main', o) || d; };
-		this.cacheRow = E('span', {}, this.cacheSummary());
 
 		// MTU with a WAN-derived recommendation (backend computes WAN_MTU - 80).
 		var rtx = (this.status || {}).routing || {};
@@ -2500,16 +2586,6 @@ return view.extend({
 		if (!this.selSel.value)
 			this.selSel.value = 'balanced';
 
-		this.wdBox = E('input', { type: 'checkbox', change: L.bind(this.markDirty, this) });
-		this.wdBox.checked = (g('watchdog', '0') === '1');
-
-		this.probeBox = E('input', { type: 'checkbox', change: L.bind(function() {
-			this.markDirty();
-			this.probeTargetsRow.classList.toggle('hidden', !this.probeBox.checked);
-		}, this) });
-		this.probeBox.checked = (g('egress_probe', '0') === '1');
-		var targets = L.toArray(uci.get('nordvpn', this.instance, 'probe_target'));
-
 		var body = E('div', { class: 'cbi-section-node' }, [
 			this.row(_('Interface name'), [ this.input('interface', 'text', g('interface', 'nordvpn')) ],
 				_('Name of the managed WireGuard interface. ⚠ Changing it after setup recreates the tunnel under the new name and orphans the old interface’s firewall/routing objects.')),
@@ -2522,6 +2598,34 @@ return view.extend({
 				_('How many candidate servers a rotation may try')),
 			this.selRow = this.row(_('Server selection'), [ this.selSel ],
 				_('Order in which automatic connects and rotations try servers. Balanced favours lightly loaded servers but still spreads out; load figures come from the cached server list.')),
+		]);
+
+		// The connection section is built (and may restore a pinned server)
+		// before this row exists — sync the initial visibility.
+		if (this._serverChosen) {
+			this.maxRetriesRow.classList.add('hidden');
+			this.selRow.classList.add('hidden');
+		}
+
+		return E('fieldset', { class: 'cbi-section' }, [
+			E('legend', {}, _('Advanced settings')),
+			body
+		]);
+	},
+
+	buildRecovery: function() {
+		var g = L.bind(function(o, d) { return uci.get('nordvpn', this.instance, o) || d; }, this);
+		this.wdBox = E('input', { type: 'checkbox', change: L.bind(this.markDirty, this) });
+		this.wdBox.checked = (g('watchdog', '0') === '1');
+
+		this.probeBox = E('input', { type: 'checkbox', change: L.bind(function() {
+			this.markDirty();
+			this.probeTargetsRow.classList.toggle('hidden', !this.probeBox.checked);
+		}, this) });
+		this.probeBox.checked = (g('egress_probe', '0') === '1');
+		var targets = L.toArray(uci.get('nordvpn', this.instance, 'probe_target'));
+
+		var body = E('div', { class: 'cbi-section-node' }, [
 			this.wdRow = this.row(_('Auto-reconnect (watchdog)'), [
 				E('label', { class: 'nv-check' }, [ this.wdBox, _('Reconnect automatically when the tunnel goes stale') ])
 			], _('Switches to another server when the handshake goes stale — or, with the internet check on, when the tunnel stops forwarding traffic. Off when a specific server is pinned.')),
@@ -2531,6 +2635,21 @@ return view.extend({
 			this.probeTargetsRow = this.row(_('Check targets'), [
 				this.input('probe_target', 'text', targets.join(' '), { placeholder: '1.1.1.1 8.8.8.8', style: 'width:240px' })
 			], _('IPv4 addresses to ping through the tunnel, separated by spaces; a reply from any of them counts. Empty = 1.1.1.1 and 8.8.8.8.')),
+		]);
+		this.probeTargetsRow.classList.toggle('hidden', !this.probeBox.checked);
+		this.wdRow.classList.toggle('hidden', !!this._serverChosen);
+		return E('div', {}, [ E('fieldset', { class: 'cbi-section' }, [
+			E('legend', {}, _('Automatic recovery')), body ]),
+			E('details', { class: 'nv-advanced' }, [ E('summary', {}, _('Scheduled server changes (optional)')), this.buildRotation() ]) ]);
+	},
+
+	buildSharedSettings: function() {
+		var gm = function(o, d) { return uci.get('nordvpn', 'main', o) || d; };
+		this.cacheRow = E('span', {}, this.cacheSummary());
+		return E('div', {}, [
+			E('p', { class: 'nv-inline-note' }, _('Shared by all tunnels. Save applies the cache setting together with the selected tunnel’s edits.')),
+			this.credNode,
+			E('fieldset', { class: 'cbi-section' }, [ E('legend', {}, _('Server list')), E('div', {}, [
 			this.row(_('Cache directory'), [ this.input('cache_dir', 'text', gm('cache_dir', ''), { placeholder: '/tmp' }) ],
 				_('Where to store the downloaded server list, shared by all instances (leave empty for /tmp)')),
 			this.row(_('Server cache'), [
@@ -2539,22 +2658,30 @@ return view.extend({
 					E('button', { class: 'cbi-button', click: L.bind(this.refreshCache, this) }, _('Refresh server list'))
 				])
 			])
+			]) ]),
+			this.updaterNode || '',
+			this.managementDetails = E('details', { class: 'nv-advanced', open: this._managementOpen || null,
+				toggle: L.bind(function(ev) { this._managementOpen = ev.target.open; }, this) }, [
+				E('summary', {}, _('Instance and key management')), this.managementNode || '', this.keyRemovalNode || '' ])
 		]);
+	},
 
-		// The connection section is built (and may restore a pinned server)
-		// before this row exists — sync the initial visibility.
-		if (this._serverChosen) {
-			this.maxRetriesRow.classList.add('hidden');
-			this.selRow.classList.add('hidden');
-			this.wdRow.classList.add('hidden');
-		}
-		if (!this.probeBox.checked)
-			this.probeTargetsRow.classList.add('hidden');
+	transportNotice: function() {
+		if (!window.location || window.location.protocol === 'https:') return '';
+		return E('div', { class: 'alert-message warning', role: 'alert' }, [
+			_('This page uses HTTP. Open HTTPS before entering credentials.'), ' ',
+			E('a', { href: this.httpsUrl() }, _('Open secure connection')) ]);
+	},
 
-		return E('details', { class: 'nv-advanced cbi-section' }, [
-			E('summary', {}, _('Advanced settings')),
-			body
-		]);
+	httpsUrl: function() {
+		// Use the current router host and path; an HTTP port is not an HTTPS port.
+		return 'https://' + window.location.hostname + window.location.pathname;
+	},
+
+	credentialTransportSafe: function() {
+		if (!window.location || window.location.protocol === 'https:') return true;
+		this.notice(_('Open this router over HTTPS before entering or submitting a NordVPN token.'), 'error');
+		return false;
 	},
 
 	cacheSummary: function() {
@@ -2582,7 +2709,8 @@ return view.extend({
 			disabled: true,
 			click: L.bind(this.discard, this)
 		}, _('Discard changes'));
-		return E('div', { class: 'cbi-page-actions' }, [ this.saveBtn, ' ', this.discardBtn ]);
+		this.pendingSummary = E('span', { class: 'nv-save-summary', 'aria-live': 'polite' }, this.pendingChangesText());
+		return E('div', { class: 'cbi-page-actions nv-sticky-actions' }, [ this.pendingSummary, this.discardBtn, this.saveBtn ]);
 	},
 
 	/* ---- selection ---------------------------------------------------- */
@@ -2974,6 +3102,22 @@ return view.extend({
 		this.dirty = !!this._otherDirty || !!(state && comparable(state.draft) !== comparable(state.baseline));
 		if (this.saveBtn) this.saveBtn.disabled = !!this._saving || !this.dirty;
 		if (this.discardBtn) this.discardBtn.disabled = !!this._saving || !this.dirty;
+		if (this.pendingSummary) dom.content(this.pendingSummary, [ this.pendingChangesText() ]);
+	},
+
+	pendingChangesText: function() {
+		if (!this.dirty) return this.instance + ' · ' + _('No pending changes');
+		var st = this._connectionState, reconnect = st && (st.draft.fixed_server !== st.baseline.fixed_server ||
+			st.draft.hop_mode !== st.baseline.hop_mode || st.draft.server_group !== st.baseline.server_group ||
+			JSON.stringify(st.draft.locations.slice().sort()) !== JSON.stringify(st.baseline.locations.slice().sort()));
+		[ 'interface', 'mtu' ].forEach(L.bind(function(key) {
+			if (this.refs[key] && (this.refs[key].value || '').trim() !== (uci.get('nordvpn', this.instance, key) || (key === 'interface' ? 'nordvpn' : ''))) reconnect = true;
+		}, this));
+		if (this.credSel && this.credSel.value !== (uci.get('nordvpn', this.instance, 'credential') || 'default')) reconnect = true;
+		var message = this.status && this.status.enabled === false ? _('Saves settings; tunnel stays disabled') :
+			reconnect ? _('Reconnects on save') : _('Applies without reconnecting');
+		if (this.refs.cache_dir && (this.refs.cache_dir.value || '').trim() !== (uci.get('nordvpn', 'main', 'cache_dir') || '')) message += ' · ' + _('Includes shared cache setting');
+		return this.instance + ' · ' + message;
 	},
 
 	markDirty: function() {
@@ -3307,6 +3451,7 @@ return view.extend({
 
 	// Add a named set (`entry` null) or replace the token of `entry`.
 	showCredentialModal: function(entry) {
+		if (!this.credentialTransportSafe()) return;
 		// LuCI's password Textfield renders the input with an inline reveal
 		// button in one control-group row.
 		var field = new ui.Textfield('', {
@@ -3325,7 +3470,7 @@ return view.extend({
 			E('div', { class: 'cbi-value nv-token-field' }, [ field.render() ]),
 			err,
 			E('div', { class: 'right' }, [
-				E('button', { class: 'cbi-button', click: ui.hideModal }, _('Cancel')),
+				E('button', { class: 'cbi-button', click: function() { field.setValue(''); ui.hideModal(); } }, _('Cancel')),
 				' ',
 				E('button', { class: 'cbi-button cbi-button-action', click: L.bind(this.submitCredentials, this, entry, nameInput, field, err) }, _('Save credentials'))
 			])
@@ -3367,6 +3512,7 @@ return view.extend({
 	},
 
 	submitCredentials: function(entry, nameInput, field, err, ev) {
+		if (!this.credentialTransportSafe()) return;
 		var name = nameInput ? (nameInput.value || '').trim() : '';
 		if (nameInput && !name) {
 			dom.content(err, _('Enter a name for these credentials.'));
@@ -3380,7 +3526,10 @@ return view.extend({
 		var btn = ev.target;
 		btn.disabled = true;
 		dom.content(err, _('Verifying…'));
-		return callSetCredentials(token, '', entry ? entry.id : '', name).then(L.bind(function(res) {
+		var request = callSetCredentials(token, '', entry ? entry.id : '', name);
+		field.setValue('');
+		token = '';
+		return request.then(L.bind(function(res) {
 			if (res && res.error) {
 				btn.disabled = false;
 				dom.content(err, [ res.error ]);
