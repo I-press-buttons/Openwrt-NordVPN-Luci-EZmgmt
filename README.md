@@ -4,7 +4,7 @@ Manage NordVPN on your OpenWrt router from the LuCI web interface: sign in
 once, pick where you want to appear, and decide which devices, networks or
 websites go through the VPN. The router keeps the tunnel healthy by itself.
 
-![LuCI overview page](docs/screenshots/overview.png)
+![NordVPN overview with multiple instances, live protection status and connection settings](docs/screenshots/overview.jpg)
 
 > **Unofficial.** This project is not affiliated with, endorsed by, or supported
 > by Nord Security. "NordVPN" and "NordLynx" are trademarks of their respective
@@ -37,29 +37,35 @@ Extra features developed for this project are marked **(fork)** below.
 
 ## Features
 
+Screenshots captured from LuCI on October 28, 2026 (backend 1.8.0-r1).
+The hop-mode and rotation screenshots preview unsaved options; they do not
+indicate an active Tor connection or an enabled rotation schedule.
+
 ### Connecting
 
 - **One-time sign-in.** Your NordVPN token is exchanged for a WireGuard key
   once and is **never stored**. The browser never sees the token or the key.
 
-  ![Credentials dialog](docs/screenshots/credentials-modal.png)
+  ![Add named credentials with a one-time NordVPN access token](docs/screenshots/credentials-dialog.jpg)
 
 - **Location sets.** Pick whole countries or specific cities. The first
   connection and every rotation choose from this set.
 
-  ![Choosing locations](docs/screenshots/locations.gif)
+  ![Search countries in the location picker](docs/screenshots/locations.jpg)
+
+  ![Choose a whole country or individual cities](docs/screenshots/cities.jpg)
 
 - **Server picker.** It's grouped by country and sorted by load, with a
   one-click *Lowest load*, or you can leave it on *Automatic*. Pinning a
   server locks the tunnel to it.
 
-  ![Picking a server](docs/screenshots/server.gif)
+  ![Server picker with automatic selection, lowest load, P2P tags and the current server](docs/screenshots/server-picker.jpg)
 
 - **Hop modes.** *Single hop*, *Multihop* (Double VPN: enter in one country
   and exit in another), or *Onion over VPN* (exit through Tor). Tor servers
   are never picked unless you choose that mode.
 
-  ![Onion over VPN mode](docs/screenshots/onion-mode.png)
+  ![Single hop, Multihop and Onion over VPN controls, with the Onion option previewed](docs/screenshots/hop-modes.jpg)
 
 - **Load-aware server choice (fork).** Automatic connects and rotations
   prefer lightly loaded servers but still spread out, so several routers or
@@ -77,7 +83,7 @@ Extra features developed for this project are marked **(fork)** below.
 - **Scheduled rotation.** Rotate every N minutes or at a set time of day. The
   page shows when the next rotation will happen.
 
-  ![Automatic rotation](docs/screenshots/rotation.png)
+  ![Automatic rotation schedule controls previewing an unsaved six-hour interval](docs/screenshots/rotation.jpg)
 
 - **Watchdog.** It automatically switches servers when a tunnel goes stale,
   with backoff so a bad day doesn't hammer the servers.
@@ -92,6 +98,9 @@ Extra features developed for this project are marked **(fork)** below.
   also checks the path your devices take, and warns if their traffic is
   leaving through your ISP although the tunnel is up. A DNS line says whether
   lookups go to NordVPN or to your ISP's resolver.
+
+  ![Live tunnel status with traffic, internet check, NordVPN protection and DNS](docs/screenshots/status.jpg)
+
 - **Status page card (fork).** Every tunnel's state, location, server, uptime
   and traffic also appear on LuCI's main **Status → Overview** page.
 
@@ -105,7 +114,7 @@ Extra features developed for this project are marked **(fork)** below.
 - **Steered networks.** Only selected networks (for example a *media* or
   *guest* VLAN) use the tunnel. Local subnets stay reachable.
 
-  ![Steered networks](docs/screenshots/routing-steered.png)
+  ![Routing selected networks, devices, domains and addresses with exclusions](docs/screenshots/traffic-routing.jpg)
 
 - **Steered devices.** Pick single devices from a searchable list of known
   clients. They're matched by MAC address, so they stay on the VPN after a
@@ -134,11 +143,12 @@ Extra features developed for this project are marked **(fork)** below.
   the router's normal DNS. See [Preventing leaks](#preventing-leaks).
   Or choose **custom DNS servers (fork)**, such as Quad9 or your own Pi-hole; they
   are reached through the tunnel and get the same DNS lock and kill switch.
+
+  ![Kill switch, IP masquerading, IPv6 leak block and NordVPN DNS](docs/screenshots/leak-protection.jpg)
+
 - **Leaves your own setup alone.** If you already route traffic by hand, the
   app detects it and doesn't touch it. Everything it creates is tagged and
   removed cleanly.
-
-  ![Manual routing detected](docs/screenshots/routing-manual.png)
 
 ### Several tunnels at once
 
@@ -151,12 +161,22 @@ Extra features developed for this project are marked **(fork)** below.
   from several places at once. If a tunnel's key stops working while others
   use it, give that tunnel its own entry with a separate token.
 
-  ![VPN instances](docs/screenshots/instances.png)
+  ![Connected and disabled VPN instances with independent controls](docs/screenshots/instances.jpg)
+
+  ![Named credential bank shared between VPN instances](docs/screenshots/credentials.jpg)
 
 - **Advanced settings.** MTU (with a recommendation calculated from your WAN),
   connection timeout, server attempts, cache location and more.
 
-  ![Advanced settings](docs/screenshots/advanced.png)
+  ![Advanced interface, MTU, server selection, watchdog, internet check and cache settings](docs/screenshots/advanced.jpg)
+
+### Package updates
+
+Update both packages from LuCI using the latest GitHub release, or select a
+specific version. The page shows the installed backend version and provides a
+reload button after installation.
+
+![Package update controls for latest releases or a specific version](docs/screenshots/package-updates.jpg)
 
 ## How it works
 
