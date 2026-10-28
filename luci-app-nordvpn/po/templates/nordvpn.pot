@@ -105,3 +105,147 @@ msgstr ""
 #: htdocs/luci-static/resources/view/nordvpn/overview.js
 msgid "Show more"
 msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:422
+msgid "Selected VPN tunnel"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:429
+msgid "Tunnel"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:430
+msgid "Manage tunnels"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:781
+msgid "Kill switch: "
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:781
+msgid "Enabled"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:781
+msgid "Off"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:781
+msgid "Unconfirmed"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:782
+msgid "Direct IPv6: "
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:782
+msgid "Blocked"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:782
+msgid "Not blocked"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:1190
+msgid "Disable every VPN and remove their kill switches? Affected traffic will use the WAN."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:1267
+msgid "Routing & protection"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:1268
+msgid "Recovery"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:1269
+msgid "Advanced"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:1270
+msgid "Global settings"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:1274
+msgid "VPN settings"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:1317
+msgid "Details"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:1355
+msgid "Remove saved credentials"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:1356
+msgid "Removing a key can disconnect every tunnel that uses it."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:1623
+msgid "Traffic scope"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:1626
+msgid "Selected traffic"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:1627
+msgid "All LAN traffic"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:1631
+msgid "All LAN traffic covers the LAN firewall zone. Selected traffic uses the networks, devices and destinations chosen below. The router itself keeps its normal route."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:2642
+msgid "Automatic recovery"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:2643
+msgid "Scheduled server changes (optional)"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:2650
+msgid "Shared by all tunnels. Save applies the cache setting together with the selected tunnel’s edits."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:2652
+msgid "Server list"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:2665
+msgid "Instance and key management"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:2672
+msgid "This page uses HTTP. Open HTTPS before entering credentials."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:2673
+msgid "Open secure connection"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:2683
+msgid "Open this router over HTTPS before entering or submitting a NordVPN token."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:3109
+msgid "No pending changes"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:3117
+msgid "Saves settings; tunnel stays disabled"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:3118
+msgid "Reconnects on save"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:3118
+msgid "Applies without reconnecting"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/nordvpn/overview.js:3119
+msgid "Includes shared cache setting"
+msgstr ""

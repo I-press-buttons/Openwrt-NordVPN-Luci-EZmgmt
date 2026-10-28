@@ -254,6 +254,12 @@ unsigned. If installation fails, inspect the reported error and installed packag
 versions before retrying. After success, rpcd restarts to load the updated backend;
 wait a few seconds and reload the page. VPN configuration is retained by apk.
 
+Use **HTTPS** for LuCI before entering your router password or NordVPN token.
+The credentials dialog refuses token entry and submission on HTTP. Verify the
+router certificate before trusting it. On routers with HTTPS already working,
+you can redirect HTTP by setting `uhttpd.main.redirect_https` to `1` and
+reloading uhttpd; keep SSH available while changing access settings.
+
 Log out of LuCI and back in, then open **VPN → NordVPN**. Installing only
 `nordvpn-wireguard` gives you a headless CLI/ubus service.
 
@@ -755,6 +761,23 @@ supported.
   [NordVPN-WireGuard-Config-Generator](https://github.com/mustafachyi/NordVPN-WireGuard-Config-Generator)
   produce static `.conf` files and leave routing, rotation and recovery to
   you.
+
+## Finding settings
+
+The tunnel selector and live VPN status appear first, followed by Recent events.
+Per-tunnel settings are grouped into **Connection**, **Routing & protection**,
+**Recovery**, and **Advanced** tabs. Tabs preserve unsaved edits. **Recovery**
+groups the watchdog and internet checks; scheduled server changes are optional.
+
+**Global settings** holds credentials, the shared server list/cache, package
+updates, and instance management. **Manage tunnels** opens that management area.
+The sticky Save/Discard bar names the selected tunnel, explains whether saving
+reconnects it, and flags shared cache changes. Destructive actions retain their
+warnings; disabling all VPNs requires confirmation because it removes kill
+switches and releases affected traffic to the WAN.
+
+Detailed field help is expandable; the [options guide](docs/OPTIONS.md) describes
+the controls and their effects.
 
 ## Development
 

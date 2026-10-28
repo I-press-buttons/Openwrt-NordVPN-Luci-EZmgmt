@@ -630,11 +630,13 @@ function iso_ts(ts) {
 
 // ── Logging ──────────────────────────────────────────────────────────
 
-// Replace anything that looks like a 64-hex token with a placeholder.
+// Scrub token-shaped text and WireGuard's 32-byte base64 keys. Redacting
+// public keys too is intentional: errors should never need key material.
 function redact(str) {
 	if (type(str) != 'string')
 		return str;
-	return replace(str, /[0-9a-fA-F]{64}/g, '<redacted-token>');
+	str = replace(str, /[0-9a-fA-F]{64}/g, '<redacted-token>');
+	return replace(str, /[A-Za-z0-9+\/]{43}=/g, '<redacted-key>');
 }
 
 function log(msg) {
