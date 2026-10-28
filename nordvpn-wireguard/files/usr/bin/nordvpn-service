@@ -17,6 +17,7 @@ const load_settings = _common.load_settings,
       list_instances = _common.list_instances,
       cache_file_path = _common.cache_file_path,
       log = _common.log;
+const tasks = require('nordvpn.task_guard').create(uloop, { log: log });
 const _cache = require('nordvpn.cache');
 const fetch_and_build = _cache.fetch_and_build,
       read_cache = _cache.read_cache,
@@ -85,7 +86,7 @@ function in_flight(since, now, ceiling) {
 // probe fields when it returns. Only transitions reach the event history.
 function start_probe(inst, dev, gateway, targets) {
 	probing[inst] = time();
-	uloop.task(
+	tasks.start(
 		function() {
 			_common.drop_inherited_locks();
 			try {
@@ -147,7 +148,7 @@ function refresh_step(uci, now) {
 		if (in_flight(seeding, now, PROBE_STUCK))
 			return;
 		seeding = now;
-		uloop.task(
+		tasks.start(
 			function() {
 				_common.drop_inherited_locks();
 				try {
@@ -203,7 +204,7 @@ function refresh_step(uci, now) {
 	let refresh_id = reservation.apply.id;
 	refresh_job = refresh_id;
 	try {
-		let task = uloop.task(
+		let task = tasks.start(
 			function() {
 				_common.drop_inherited_locks();
 				// Only the outcome crosses the pipe, never the server list.
@@ -241,7 +242,7 @@ function instance_step(uci, inst, now, hm, s, runtime) {
 		mark_attempt(now, inst);
 	} else if (should_rotate(s, last, now, hm)) {
 		mark_attempt(now, inst);
-		uloop.task(function() { _common.drop_inherited_locks(); rotate(null, inst, 'schedule'); });
+		tasks.start(function() { _common.drop_inherited_locks(); rotate(null, inst, 'schedule'); });
 	}
 
 	// Watchdog timers persist in the per-instance rotate state across daemon
@@ -302,7 +303,7 @@ function instance_step(uci, inst, now, hm, s, runtime) {
 		record({ last_recover: now }, inst);
 		record_event(inst, 'watchdog', { server: cur.gateway, reason: state,
 			detail: sprintf('unhealthy for %d s', now - ds) });
-		uloop.task(
+		tasks.start(
 			function() {
 				_common.drop_inherited_locks();
 				try {
@@ -365,6 +366,6 @@ function tick() {
 }
 
 // Re-check every 30s; run once immediately at startup.
-uloop.interval(30000, tick);
+uloop.interval(30000, function() { tasks.check(); tick(); });
 tick();
 uloop.run();
