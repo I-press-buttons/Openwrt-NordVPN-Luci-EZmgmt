@@ -314,6 +314,9 @@ jobs:
       number: ${{ steps.pr.outputs.number }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # --fill compares the feature history with origin/master.
+          fetch-depth: 0
       - name: Create or find PR to master
         id: pr
         env:
