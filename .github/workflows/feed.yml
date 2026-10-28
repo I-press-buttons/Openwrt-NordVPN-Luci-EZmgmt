@@ -127,10 +127,10 @@ jobs:
           mkdir -p site/keys
           cp keys/* site/keys/
           cat > site/index.html <<'EOF'
-          <!doctype html><title>nordvpn-luci package feed</title>
-          <h1>nordvpn-luci package feed</h1>
+          <!doctype html><title>Openwrt-NordVPN-Luci-EZmgmt package feed</title>
+          <h1>Openwrt-NordVPN-Luci-EZmgmt package feed</h1>
           <p>Signed OpenWrt package feeds for
-          <a href="https://github.com/Aladex/nordvpn-luci">nordvpn-luci</a>.
+          <a href="https://github.com/I-press-buttons/Openwrt-NordVPN-Luci-EZmgmt">Openwrt-NordVPN-Luci-EZmgmt</a>.
           See the repository README for installation instructions.</p>
           EOF
       - name: Push to gh-pages
