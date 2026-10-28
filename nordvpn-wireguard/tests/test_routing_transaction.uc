@@ -8,6 +8,17 @@ const tx = require('nordvpn.routing_transaction');
 const apply = require('nordvpn.apply');
 let failures = 0;
 function ok(label, value) { printf('%s %s\n', value ? 'ok' : 'FAIL', label); if (!value) failures++; }
+ok('host route matches iproute2 output without /32', tx.route_present('192.0.2.10/32', 'wan', '192.0.2.10 via 192.0.2.1 dev wan proto static\n'));
+ok('host route also accepts explicit /32 output', tx.route_present('192.0.2.10/32', 'wan', '192.0.2.10/32 dev wan\n'));
+ok('subnet route preserves prefix length', tx.route_present('192.0.2.0/24', 'br-lan', '192.0.2.0/24 dev br-lan proto static\n'));
+ok('default route accepts the default keyword', tx.route_present('0.0.0.0/0', 'nv_media', 'default dev nv_media proto static\n'));
+ok('default route accepts numeric prefix output', tx.route_present('0.0.0.0/0', 'nv_media', '0.0.0.0/0 dev nv_media\n'));
+ok('destination and device must belong to one route', !tx.route_present('192.0.2.10/32', 'wan', '192.0.2.10 dev other\n198.51.100.1 dev wan\n'));
+ok('destination substrings do not match', !tx.route_present('92.0.2.10/32', 'wan', '192.0.2.10 dev wan\n'));
+ok('device names match exactly', !tx.route_present('192.0.2.10/32', 'wan', '192.0.2.10 dev wan6\n'));
+ok('different prefixes do not match', !tx.route_present('192.0.2.0/24', 'wan', '192.0.2.0/25 dev wan\n'));
+ok('unreachable routes cannot confirm forwarding', !tx.route_present('192.0.2.10/32', 'wan', 'unreachable 192.0.2.10 dev wan\n'));
+ok('missing destination or device fails closed', !tx.route_present(null, 'wan', 'default dev wan') && !tx.route_present('0.0.0.0/0', null, 'default dev wan'));
 function copy(v) { return v == null ? null : json(sprintf('%J', v)); }
 function equal(a, b) { return sprintf('%J', a) == sprintf('%J', b); }
 let events, fail_at, counts, tables, persisted, verify_result, during, store_failure;

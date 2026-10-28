@@ -519,6 +519,23 @@ function firewall_present(sec, text) {
 	}
 	return false;
 }
+
+// iproute2 prints IPv4 host routes without /32. Match destination and device
+// on the same route: separate substring matches can certify unrelated rows.
+function route_present(target, device, text) {
+	if (!target || !device) return false;
+	let normalize = function(value) {
+		return value == '0.0.0.0/0' ? 'default' : replace(value, /\/32$/, '');
+	};
+	for (let line in split(text || '', '\n')) {
+		let tokens = split(trim(line), /[ \t]+/);
+		let destination = tokens[0] == 'unicast' ? tokens[1] : tokens[0];
+		let at = index(tokens, 'dev');
+		if (normalize(destination || '') == normalize(target) && at >= 0 && tokens[at + 1] == device)
+			return true;
+	}
+	return false;
+}
 // Bounded convergence probes of installed policy rules, nft protections and
 // the running dnsmasq instance's generated config. A reload exit is insufficient.
 // This confirms installation, not end-to-end traffic or resolver reachability.
@@ -535,7 +552,7 @@ verify_runtime = function(p, desired, tables) {
 			for (let n, sec in desired.network) if (sec.interface == p.interface && sec.route_allowed_ips == '1') peer = sec;
 			if (peer) {
 				r = command([ 'ip', '-4', 'route', 'show', 'table', table_id(iface.ip4table || 'main', tables) || iface.ip4table, 'default' ]);
-				if (r.code != 0 || !st.l3_device || index(r.stdout || '', 'dev ' + st.l3_device) < 0) return false;
+				if (r.code != 0 || !route_present('0.0.0.0/0', st.l3_device, r.stdout)) return false;
 			}
 		}
 	}
@@ -563,7 +580,7 @@ verify_runtime = function(p, desired, tables) {
 			}
 			if (sec['.type'] == 'route' && devices[sec.interface]) {
 				r = command([ 'ip', '-4', 'route', 'show', 'table', table_id(sec.table, tables) || sec.table ]);
-				if (r.code != 0 || index(r.stdout, sec.target) < 0 || index(r.stdout, 'dev ' + devices[sec.interface]) < 0) return false;
+				if (r.code != 0 || !route_present(sec.target, devices[sec.interface], r.stdout)) return false;
 			}
 		}
 		if (devices[p.interface] && desired.network[p.interface]?.nordvpn_managed_routing == '1') {
@@ -572,7 +589,7 @@ verify_runtime = function(p, desired, tables) {
 			if (peer_routed) {
 				let table = desired.network[p.interface].ip4table || 'main';
 				let r = command([ 'ip', '-4', 'route', 'show', 'table', table_id(table, tables) || table, 'default' ]);
-				if (r.code != 0 || index(r.stdout || '', 'dev ' + devices[p.interface]) < 0) return false;
+				if (r.code != 0 || !route_present('0.0.0.0/0', devices[p.interface], r.stdout)) return false;
 			}
 		}
 		// Removed rules must disappear too (disable/delete must release them).
@@ -648,4 +665,4 @@ verify_runtime = function(p, desired, tables) {
 	}
 	return true;
 };
-return { plan, execute, adapters, verify_runtime, snapshot, merge_tables, confirmation, interface_state };
+return { plan, execute, adapters, verify_runtime, snapshot, merge_tables, confirmation, interface_state, route_present };

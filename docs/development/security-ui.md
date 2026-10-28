@@ -56,3 +56,10 @@ build. The backend declares `coreutils-timeout` explicitly so package installs
 include it. This dependency was discovered by the real-router routing apply
 check; mocked command execution in the offline suite cannot establish that a
 system utility is installed.
+
+Live verification also exposed IPv4 host-route formatting: iproute2 omits /32
+when listing host routes. The verifier now normalizes that form and matches the
+destination and device on the same route, preventing both false failures and
+substring/cross-row false positives. Regression cases cover host/subnet/default
+routes, exact device names, conflicting rows and unreachable routes. The fixed
+read-only verifier passed against the router's existing policy before deployment.
