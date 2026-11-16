@@ -171,6 +171,10 @@ function rotate_inner(uci, instance, lock_wait) {
 		// Keep the working tunnel; this is a no-op, not a failure.
 		return { skipped: true, reason: 'no other server for the current selection' };
 
+	// `switched`: a candidate was written, so the tunnel is no longer on the
+	// saved peer. From then on every way out of the loop but success must go
+	// through the restoration below.
+	let switched = false, failure = null;
 	for (let relay in plan) {
 		// Never rotate onto the current server: a successful rotation must change
 		// the gateway. plan_candidates already drops it; this guards the case
@@ -182,7 +186,15 @@ function rotate_inner(uci, instance, lock_wait) {
 		// Only the server changes: a routing table or MTU saved but not yet
 		// applied waits for the apply that also sets up its routing.
 		let connection = connect_one(uci, iface, relay, s, { keep_iface: true });
-		if (!connection.ok) return connection;
+		if (!connection.ok) {
+			// The failed transaction rolled back to what it found. Before any
+			// candidate went in that is the working peer; after one it is a
+			// candidate that never completed a handshake.
+			if (!switched) return connection;
+			failure = connection;
+			break;
+		}
+		switched = true;
 		// Verify the tunnel by its WireGuard handshake, not by a ping routed
 		// through it: NordVPN publishes dead endpoints, and a routed ping can
 		// fail on a perfectly good server, which made rotation cycle servers.
@@ -199,7 +211,7 @@ function rotate_inner(uci, instance, lock_wait) {
 	if (!still_enabled(instance))
 		return { skipped: true, reason: 'instance was disabled' };
 	let restored = saved ? _apply.restore_connection(iface, saved, lock_wait) : null;
-	return { error: (hint || 'no working server found') +
+	return { error: ((failure && failure.error) || hint || 'no working server found') +
 		(restored && !restored.ok ? '; restoration failed: ' + restored.error : ''),
 		restored: !!restored?.ok, rollback: restored };
 }

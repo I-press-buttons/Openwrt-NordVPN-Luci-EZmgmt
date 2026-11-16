@@ -10,7 +10,7 @@
 'use strict';
 
 import * as uloop from 'uloop';
-import { stat } from 'fs';
+import { stat, readfile } from 'fs';
 import { cursor } from 'uci';
 const _common = require('nordvpn.common');
 const load_settings = _common.load_settings,
@@ -48,6 +48,13 @@ const record_event = require('nordvpn.history').record_event;
 // reports back. Probe children have a bounded age fallback. Cache refreshes
 // instead recover from their persisted process identity and ownership.
 const PROBE_STUCK = 120;
+
+// System uptime in whole seconds, or null when /proc is unavailable.
+function system_uptime() {
+	let raw = readfile('/proc/uptime');
+	let up = raw ? int(split(raw, ' ')[0]) : null;
+	return (type(up) == 'int' && up >= 0) ? up : null;
+}
 
 function errmsg(e) {
 	return (type(e) == 'object' && e.message) ? e.message : ('' + e);
@@ -238,7 +245,15 @@ function instance_step(uci, inst, now, hm, s, runtime) {
 	// counter would reset to 0 each time and make should_rotate() fire on the
 	// next tick. The first time rotation is active we only start the clock, so
 	// enabling rotation waits a full interval instead of rotating immediately.
-	if (last == 0 && s.enabled && s.rotation_enabled && !(s.fixed_server && s.fixed_server != '')) {
+	// While rotation cannot run (instance disabled, rotation off, or a server
+	// pinned) the clock is cleared, so turning it back on starts a fresh
+	// interval too: a stale stamp from before made the daemon rotate a tunnel
+	// seconds after it was re-enabled.
+	let rotating = s.enabled && s.rotation_enabled && !(s.fixed_server && s.fixed_server != '');
+	if (!rotating) {
+		if (last != 0)
+			record({ last_attempt: 0 }, inst);
+	} else if (last == 0) {
 		mark_attempt(now, inst);
 	} else if (should_rotate(s, last, now, hm)) {
 		mark_attempt(now, inst);
@@ -288,7 +303,7 @@ function instance_step(uci, inst, now, hm, s, runtime) {
 		degraded_since: ds,
 		last_recover: last_recover,
 		recover_fails: fails
-	}, now, true);
+	}, now, true, system_uptime());
 	if (upd.degraded_since != ds || upd.last_recover != last_recover ||
 	    upd.recover_fails != fails) {
 		record(upd, inst);
