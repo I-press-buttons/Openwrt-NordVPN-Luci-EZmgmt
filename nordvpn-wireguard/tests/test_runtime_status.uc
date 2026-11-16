@@ -76,7 +76,7 @@ const status = _status.status, load_settings = _common.load_settings, list_insta
 const cursor = d.cursor, should_rotate = d.service.should_rotate, watchdog_update = d.service.watchdog_update;
 const effective_state = d.service.effective_state, should_probe = d.service.should_probe;
 const should_recover = d.service.should_recover, watchdog_result_update = d.service.watchdog_result_update;
-const probe_clear = d.service.probe_clear, PROBE_STUCK = 120;
+const probe_clear = d.service.probe_clear, PROBE_STUCK = 120, system_uptime = d.service.system_uptime;
 let probing = {};
 function read_state(name) { return {}; }
 function record(fields, name) {}

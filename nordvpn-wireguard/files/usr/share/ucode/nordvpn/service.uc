@@ -4,6 +4,7 @@
 
 'use strict';
 
+import { readfile } from 'fs';
 const _common = require('nordvpn.common');
 const WATCHDOG_GRACE = _common.WATCHDOG_GRACE,
       WATCHDOG_COOLDOWN_BASE = _common.WATCHDOG_COOLDOWN_BASE,
@@ -219,6 +220,14 @@ function watchdog_update(state, st, now, active, uptime) {
 	return { degraded_since: ds, last_recover: last, recover_fails: fails };
 }
 
+// System uptime in whole seconds (for watchdog_update), or null when /proc is
+// unavailable.
+function system_uptime() {
+	let raw = readfile('/proc/uptime');
+	let up = raw ? int(split(raw, ' ')[0]) : null;
+	return (type(up) == 'int' && up >= 0) ? up : null;
+}
+
 // Fold a completed recovery worker result into the failure counter. Losing the
 // rotation-lock race is not a recovery failure; the active worker owns it.
 function watchdog_result_update(result, fails) {
@@ -232,6 +241,6 @@ function watchdog_result_update(result, fails) {
 
 return {
 	REFRESH_RETRY_BASE, should_refresh, refresh_seed, should_rotate, next_rotation, should_recover,
-	watchdog_update, watchdog_result_update,
+	watchdog_update, watchdog_result_update, system_uptime,
 	should_probe, effective_state, probe_update, probe_clear, egress_report
 };
