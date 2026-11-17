@@ -19,7 +19,10 @@ function install(adapters) {
 		if (cmd[0] == 'wg') return { code: 0, stdout: 'key\t' + time() + '\n' };
 		// Existing connection-selection fixtures explicitly simulate failed
 		// bring-up, and a currently healthy peer for the no-restart path.
-		if (cmd[0] == 'ifup') return { code: 1, stdout: '' };
+		// The direct bounce (down/up without netifd's global reload) counts
+		// as a bring-up as well.
+		if (cmd[0] == 'ifup' || (cmd[0] == 'sh' && index(cmd[2] || '', 'network.interface up') >= 0))
+			return { code: 1, stdout: '' };
 		if (cmd[0] == 'ubus' && cmd[2] && index(cmd[2], 'network.interface.') == 0)
 			return { code: 0, stdout: '{"up":true,"l3_device":"nordvpn"}' };
 		return { code: 0, stdout: '' };
