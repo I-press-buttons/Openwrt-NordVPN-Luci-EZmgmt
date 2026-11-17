@@ -1421,8 +1421,9 @@ function enforce(uci, s, opts) {
 				}
 				// Steered devices: the zones of the networks they were last
 				// seen on, and the LAN zone for devices currently offline.
-				// Steered domains: any LAN client may resolve them.
-				if (length(steer_doms) && det.lan_zone && index(want_srcs, det.lan_zone) < 0)
+				// Steered domains and addresses: their MARK rules match
+				// LAN-zone traffic, so that zone must reach the VPN zone.
+				if ((length(steer_doms) || length(steer_ips)) && det.lan_zone && index(want_srcs, det.lan_zone) < 0)
 					push(want_srcs, det.lan_zone);
 				if (length(steer_devs)) {
 					let seen = device_zones(uci, steer_devs);
