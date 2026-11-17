@@ -968,6 +968,9 @@ write_cache(cache, cpath);
 	eq('mac: newline refused', _cmn.validate_mac('aa:bb:cc:dd:ee:ff\nx'), null);
 	eq('cidr4: address and network accepted', [ _cmn.validate_cidr4('198.51.100.7'), _cmn.validate_cidr4(' 198.51.100.0/24 ') ],
 		[ '198.51.100.7', '198.51.100.0/24' ]);
+	eq('cidr4: out-of-range octet, prefix and /0 refused', [ _cmn.validate_cidr4('999.1.1.1'),
+		_cmn.validate_cidr4('1.1.1.1/33'), _cmn.validate_cidr4('0.0.0.0/0') ], [ null, null, null ]);
+	eq('domain: an all-digit name is a mistyped address, not a domain', _cmn.validate_domain('999.1.1.1'), null);
 	eq('cidr4: newline refused', [ _cmn.validate_cidr4('198.51.100.7\nx'), _cmn.validate_cidr4('198.51.100.0/24\n; drop') ], [ null, null ]);
 
 	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', enabled: '1',

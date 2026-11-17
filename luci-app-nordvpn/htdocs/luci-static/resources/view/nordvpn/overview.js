@@ -1681,6 +1681,9 @@ return view.extend({
 		var d = String(s || '').trim().toLowerCase().replace(/^\*?\./, '').replace(/\.$/, '');
 		if (!d || d.length > 253)
 			return null;
+		// No top-level domain is all digits: '999.1.1.1' is a mistyped address.
+		if (/(^|\.)[0-9]+$/.test(d))
+			return null;
 		return /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$/.test(d) ? d : null;
 	},
 

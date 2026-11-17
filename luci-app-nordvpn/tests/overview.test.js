@@ -81,6 +81,9 @@ assert.strictEqual(app.routingOnlyChange({ killswitch: JSON.stringify('0') },
 	{ killswitch: JSON.stringify('1') }), true, 'routing changes do not reconnect');
 assert.strictEqual(app.routingOnlyChange({ fixed_server: JSON.stringify('old') },
 	{ fixed_server: JSON.stringify('new') }), false, 'server changes require reconnecting');
+assert.strictEqual(JSON.stringify(app.parseDomains({ area: { value: '999.1.1.1\n1.1.1.1/33\n0.0.0.0/0\nexample.com\n198.51.100.0/24' } })),
+	JSON.stringify({ valid: [ 'example.com' ], ips: [ '198.51.100.0/24' ], invalid: [ '999.1.1.1', '1.1.1.1/33', '0.0.0.0/0' ], capped: false }),
+	'malformed addresses are flagged, never taken for domain names');
 
 function deferred() {
 	var resolve, reject;
