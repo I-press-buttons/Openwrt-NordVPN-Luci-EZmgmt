@@ -537,8 +537,9 @@ for expiry, retry limits and the retained synchronous endpoint's limitations.
 a time, and `apply_status` reports its progress and result; the LuCI page
 uses these so that rpcd stays responsive while servers are verified.
 `create_instance` and `delete_instance` manage
-instances; a new instance uses the Default credentials unless
-`create_instance` gets a `credential` entry id. An instance's `credential`
+instances; a new instance starts disabled and uses the Default credentials
+unless `create_instance` gets a `credential` entry id. Instance names are
+unique regardless of case. An instance's `credential`
 option in `/etc/config/nordvpn` picks its bank entry. `nordvpn-rotate <name>`
 rotates one instance from the CLI.
 

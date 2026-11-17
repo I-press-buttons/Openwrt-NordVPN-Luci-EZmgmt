@@ -734,6 +734,20 @@ write_cache(cache, cpath);
 	eq('dns: off clears the stamp', global.MOCK_UCI.network.nordvpn.nordvpn_managed_dns, null);
 }
 
+// The steerable networks never include the WAN zone's (wan, wan6).
+{
+	global.MOCK_UCI = { network: {
+		lan: { '.type': 'interface', proto: 'static', ipaddr: '192.168.1.1/24' },
+		wan: { '.type': 'interface', proto: 'dhcp' }, wan6: { '.type': 'interface', proto: 'dhcpv6' },
+		nordvpn: { '.type': 'interface', proto: 'wireguard' }
+	}, firewall: {
+		zlan: { '.type': 'zone', name: 'lan', network: [ 'lan' ] },
+		zwan: { '.type': 'zone', name: 'wan', masq: '1', network: [ 'wan', 'wan6' ] }
+	} };
+	eq('steerable networks leave out the WAN zone and tunnels',
+		detect_routing(cursor(), { interface: 'nordvpn' }, false).networks, [ 'lan' ]);
+}
+
 // 8b. source-network steering: lookup/prohibit rules, reconciliation, teardown
 {
 	let ssteer = function(over) {
