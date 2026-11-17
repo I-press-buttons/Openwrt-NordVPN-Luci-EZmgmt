@@ -328,9 +328,15 @@ function wg_endpoints() {
 // netifd's host route to a tunnel's previous endpoint can outlive a server
 // change. Drop the main-table host route to an endpoint this tunnel left that
 // no WireGuard device still uses.
-function prune_endpoint_routes(dev, before) {
+//
+// Never for a tunnel whose default sits in the main table: there that host
+// route is all that keeps WireGuard's own packets out of the tunnel, and an
+// unconfirmed delete would cut it. Nor before the tunnel lists its endpoint
+// again (its setup is asynchronous): the current server is unknown until then.
+function prune_endpoint_routes(dev, before, table) {
+	if (table == null || table == '' || table == 'main' || table == '254') return;
 	let after = wg_endpoints();
-	if (!before || !after || !before[dev]) return;
+	if (!before || !after || !before[dev] || !length(after[dev] || [])) return;
 	let used = {}, stale = filter(before[dev], (ip) => common.validate_ipv4(ip) != null);
 	for (let d, ips in after) for (let ip in ips) used[ip] = true;
 	stale = filter(stale, (ip) => !used[ip]);
@@ -530,7 +536,7 @@ function execute_inner(uci, p, affected) {
 		if (p.activation || index(p.reloads, 'network') >= 0)
 			try { prune_lo_rules(p); } catch (e) {}
 		if (p.activation)
-			try { prune_endpoint_routes(p.interface, endpoints_before); } catch (e) {}
+			try { prune_endpoint_routes(p.interface, endpoints_before, p.after.network?.[p.interface]?.ip4table); } catch (e) {}
 		stage = 'verify:runtime';
 		must(confirm(p, p.after, p.tables.data), stage);
 		return { ok: true, changed, stage: 'complete', rollback: null };
