@@ -1305,6 +1305,8 @@ write_cache(cache, cpath);
 	ok('steer: a MARK rule per steered address', length(sip) == 2 && sip[0].dest_ip == '198.51.100.7' && sip[0].src == 'lan' &&
 		sip[0].dest == '*' && sip[0].target == 'MARK');
 	eq('steer: addresses use the tunnel table via the mark', length(count('network', 'dev_lookup')), 1);
+	eq('steer: addresses alone get a LAN forwarding into the VPN zone', length(filter(count('firewall', 'forwarding'),
+		(f) => f.src == 'lan' && f.dest == 'nordvpn')), 1);
 	enforce_routing(uci, ex({ auto_routing: false, bypass_devices: [], source_ips: [ '198.51.100.7' ] }), no);
 	eq('steer: dropped addresses lose their rule', length(count('firewall', 'ip_mark')), 1);
 
