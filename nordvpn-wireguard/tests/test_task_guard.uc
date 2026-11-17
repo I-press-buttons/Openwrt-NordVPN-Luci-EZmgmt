@@ -1,19 +1,25 @@
 // SPDX-License-Identifier: MIT
 'use strict';
 const create = require('nordvpn.task_guard').create;
-let fds = 20, restarts = 0, messages = [], done = false, fails = 0;
+let fds = 20, restarts = 0, messages = [], done = false, fails = 0, inputs = [];
 function ok(label, value) {
 	printf('%s %s\n', value ? 'ok  ' : 'FAIL', label);
 	if (!value) fails++;
 }
 const loop = {
-	task: function(worker, callback) { return { finished: function() { return done; } }; },
+	task: function(worker, callback, input) {
+		push(inputs, input);
+		return { finished: function() { return done; } };
+	},
 	error: function() { return 'test spawn failure'; }
 };
 let guard = create(loop, { count: function() { return fds; }, limit: 192,
 	recycle: function() { restarts++; }, log: function(message) { push(messages, message); } });
 ok('healthy scheduler stays running', !guard.check() && restarts == 0);
 guard.start(function() {}, function() {});
+guard.start(function() {});
+ok('every task gets an input callback (older uloop leaks the output pipe without one)',
+	length(inputs) == 2 && type(inputs[0]) == 'function' && type(inputs[1]) == 'function');
 fds = 192;
 ok('active worker prevents recycle even under pressure', !guard.check() && restarts == 0);
 done = true;
