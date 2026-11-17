@@ -520,6 +520,32 @@ function zone_networks(uci, zone) {
 	return nets;
 }
 
+// The IPv4 WAN network a tunnel's endpoint must be reached through: 'wan'
+// when the WAN zone holds it, else the zone's first network that is not
+// IPv6-only or a WireGuard tunnel. null when there is no WAN zone.
+//
+// netifd routes the endpoint host dependency of a WireGuard interface via
+// the interface owning the best matching route, and it also considers the
+// 0.0.0.0/0 routes other tunnels keep in their own tables. Those tie with
+// the WAN's default, so the endpoint could land inside another tunnel
+// (nesting one tunnel in another). Naming this network as the interface's
+// `tunlink` restricts the lookup to the WAN.
+function wan_link(uci) {
+	let zone = find_wan_zone(uci);
+	if (!zone)
+		return null;
+	let nets = zone_networks(uci, zone);
+	if (index(nets, 'wan') >= 0 && uci.get('network', 'wan') != null)
+		return 'wan';
+	for (let n in nets) {
+		let proto = uci.get('network', n, 'proto');
+		if (proto == null || proto == 'dhcpv6' || proto == 'wireguard' || proto == '6in4' || proto == '6to4')
+			continue;
+		return n;
+	}
+	return null;
+}
+
 // Whether the installed dnsmasq can fill nft sets (dnsmasq-full; the stock
 // dnsmasq is built without it). Same test as OpenWrt's dnsmasq init script:
 // 'nftset' among the compile-time options ('no-nftset' when absent). Cached
@@ -1723,4 +1749,4 @@ function enforce(uci, s, opts) {
 }
 
 return { detect, enforce, find_wan_zone, find_lan_zone, count_user_routes, recommend_mtu,
-	rt_table_id, device_mark, device_owners, all_lan_owner, domain_set_name, bypass_set_name, nftset_supported };
+	rt_table_id, device_mark, device_owners, wan_link, all_lan_owner, domain_set_name, bypass_set_name, nftset_supported };

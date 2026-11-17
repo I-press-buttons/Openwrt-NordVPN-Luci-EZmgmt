@@ -144,6 +144,21 @@ function write_relay(uci, iface, relay, s, opts) {
 			uci.delete('network', iface, 'mtu');
 	}
 
+	// Reach the endpoint through the WAN, never through another tunnel
+	// (see routing.wan_link). A tunlink the user set is left alone; ours
+	// carries a stamp so it follows WAN changes and can be dropped again.
+	let link = _routing.wan_link(uci);
+	let own_link = uci.get('network', iface, 'nordvpn_tunlink') == '1';
+	if (own_link || (uci.get('network', iface, 'tunlink') || '') == '') {
+		if (link) {
+			uci.set('network', iface, 'tunlink', link);
+			uci.set('network', iface, 'nordvpn_tunlink', '1');
+		} else if (own_link) {
+			uci.delete('network', iface, 'tunlink');
+			uci.delete('network', iface, 'nordvpn_tunlink');
+		}
+	}
+
 	uci.set('network', iface, 'nordvpn_location', relay.location);
 	// Stamp the ACTUAL server's country/city: with a location set the
 	// connected relay may sit in any of the set's countries, and the status
@@ -305,7 +320,7 @@ function restore_connection(iface, saved, wait) {
 // netifd and wireguard use (stamps such as the location are left out). Equal
 // fingerprints before and after writing a relay mean the tunnel would come
 // back exactly as it is, so restarting it would only drop connections.
-const IFACE_KEYS = [ 'proto', 'private_key', 'addresses', 'ip4table', 'ip6table', 'mtu' ];
+const IFACE_KEYS = [ 'proto', 'private_key', 'addresses', 'ip4table', 'ip6table', 'mtu', 'tunlink' ];
 const PEER_KEYS = [ 'public_key', 'endpoint_host', 'endpoint_port', 'persistent_keepalive',
 	'allowed_ips', 'route_allowed_ips' ];
 

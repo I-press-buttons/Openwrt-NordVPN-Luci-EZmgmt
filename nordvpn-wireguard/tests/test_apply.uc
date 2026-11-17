@@ -551,6 +551,40 @@ const DEAD_PID = 1073741824;
 	eq('no status needs no hint', _apply.netifd_hint(null), null);
 }
 
+// Endpoints are pinned to the WAN with `tunlink`: netifd otherwise routes a
+// tunnel's endpoint through any interface with a default route, including
+// another tunnel's table, nesting one tunnel inside another.
+{
+	let relay = { hostname: 'de1.nordvpn.com', public_key: KEY, port: 51820, location: 'de' };
+	let seed = function(wan_nets, extra) {
+		global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nv_x', enabled: '1' } },
+			network: { nv_x: { '.type': 'interface', proto: 'wireguard', ...(extra || {}) },
+				wan: { '.type': 'interface', proto: 'dhcp' }, wan6: { '.type': 'interface', proto: 'dhcpv6' },
+				pppoe: { '.type': 'interface', proto: 'pppoe' } },
+			firewall: { zwan: { '.type': 'zone', name: 'wan', masq: '1', network: wan_nets } }, dhcp: {} };
+	};
+	let s = { interface: 'nv_x' };
+	seed([ 'wan', 'wan6' ]);
+	ok('tunlink: relay written', _apply.write_relay(cursor(), 'nv_x', relay, s));
+	eq('tunlink: endpoint pinned to the WAN', [ global.MOCK_UCI.network.nv_x.tunlink,
+		global.MOCK_UCI.network.nv_x.nordvpn_tunlink ], [ 'wan', '1' ]);
+	seed([ 'wan6', 'pppoe' ]);
+	_apply.write_relay(cursor(), 'nv_x', relay, s);
+	eq('tunlink: the first IPv4 WAN network when there is no "wan"', global.MOCK_UCI.network.nv_x.tunlink, 'pppoe');
+	seed([ 'wan' ], { tunlink: 'wanb' });
+	_apply.write_relay(cursor(), 'nv_x', relay, s);
+	eq('tunlink: a user-set tunlink is kept', [ global.MOCK_UCI.network.nv_x.tunlink,
+		global.MOCK_UCI.network.nv_x.nordvpn_tunlink ], [ 'wanb', null ]);
+	seed([ 'wan6' ], { tunlink: 'wan', nordvpn_tunlink: '1' });
+	_apply.write_relay(cursor(), 'nv_x', relay, s);
+	eq('tunlink: ours is dropped when no IPv4 WAN remains', [ global.MOCK_UCI.network.nv_x.tunlink,
+		global.MOCK_UCI.network.nv_x.nordvpn_tunlink ], [ null, null ]);
+	seed([ 'wan' ]);
+	let before = _apply.tunnel_fingerprint(cursor(), 'nv_x');
+	_apply.write_relay(cursor(), 'nv_x', relay, s);
+	ok('tunlink: adding it restarts the tunnel once', _apply.tunnel_fingerprint(cursor(), 'nv_x') != before);
+}
+
 unlink(APPLY_STATUS_FILE);
 printf('\n%s\n', fails ? ('FAILURES: ' + fails) : 'ALL APPLY TESTS PASSED');
 exit(fails ? 1 : 0);
