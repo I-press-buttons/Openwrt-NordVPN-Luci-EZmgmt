@@ -92,6 +92,16 @@ function detached(data) {
 	};
 	return c;
 }
+function table_id(name, text) {
+	if (common.full_match(name, /^[0-9]+$/)) return '' + int(name);
+	if (name == 'main') return '254';
+	if (name == 'default') return '253';
+	for (let l in split(text || '', '\n')) {
+		let m = match(l, /^[ \t]*([0-9]+)[ \t]+([^ \t#]+)/);
+		if (m && m[2] == name) return '' + int(m[1]);
+	}
+	return null;
+}
 function list(v) { return type(v) == 'array' ? v : (v == null ? [] : [ v ]); }
 // Inventory the global reload boundary, never just the instance being edited.
 // A set name alone is not ownership: both stamped sections and the instance
@@ -261,6 +271,83 @@ function drop_zone_chains(zones) {
 				command([ 'nft', 'delete', 'chain', 'inet', 'fw4', prefix + '_' + z ], '3');
 }
 
+// netifd gives an up interface with an ip4table/ip6table an `iif lo lookup
+// <table>` rule at priority 90000 + ifindex, and leaks it: a table change
+// deletes with the new table (it updates the config first), and the IPv6 one
+// is never deleted. Leftovers send the router's own traffic into a tunnel's
+// table once the main table has no answer, and pile up as duplicates across
+// enable/disable. After a tunnel goes up or down, rules of that shape for a
+// table some nordvpn interface uses are kept only where they belong to an up
+// interface with that table at its current ifindex.
+const LO_RULE_BASE = 90000;
+function managed_tables(p, family) {
+	let out = {};
+	for (let img in [ p.before, p.after ])
+		for (let n, sec in img?.network || {}) {
+			let t = family == '6' ? sec.ip6table : sec.ip4table;
+			if (sec['.type'] != 'interface' || sec.vpn_type != 'nordvpn' || !t) continue;
+			let id = table_id(t, p.tables.data) || table_id(t, p.tables.before);
+			if (id && id != '254' && id != '253' && id != '255') out[id] = true;
+		}
+	return out;
+}
+function prune_lo_rules(p) {
+	let r = command([ 'ubus', 'call', 'network.interface', 'dump' ]), dump;
+	if (r.code != 0) return;
+	try { dump = json(r.stdout); } catch (e) { return; }
+	for (let f in [ '4', '6' ]) {
+		let tables = managed_tables(p, f);
+		if (!length(keys(tables))) continue;
+		let keep = {};
+		for (let d in (dump?.interface || [])) {
+			let sec = p.after.network?.[d.interface], t = sec ? (f == '6' ? sec.ip6table : sec.ip4table) : null;
+			let idx = (d.up && d.l3_device && t) ? adapters.ifindex(d.l3_device) : null;
+			if (idx) keep[(LO_RULE_BASE + int(idx)) + ' ' + table_id(t, p.tables.data)] = true;
+		}
+		r = command([ 'ip', '-' + f, 'rule', 'show' ]);
+		if (r.code != 0) continue;
+		for (let l in split(r.stdout || '', '\n')) {
+			let m = match(trim(l), /^([0-9]+):[ \t]+from all iif lo lookup ([^ \t]+)$/);
+			if (!m || int(m[1]) < LO_RULE_BASE || int(m[1]) >= LO_RULE_BASE + 100000) continue;
+			let id = table_id(m[2], p.tables.data);
+			if (!id || !tables[id] || keep[int(m[1]) + ' ' + id]) continue;
+			command([ 'ip', '-' + f, 'rule', 'del', 'priority', m[1], 'iif', 'lo', 'lookup', m[2] ]);
+		}
+	}
+}
+// Endpoint IPv4 addresses of every WireGuard device: { device: [ ip ] }.
+function wg_endpoints() {
+	let r = command([ 'wg', 'show', 'all', 'endpoints' ]), out = {};
+	if (r.code != 0) return null;
+	for (let l in split(r.stdout || '', '\n')) {
+		let m = match(trim(l), /^([^ \t]+)[ \t]+[^ \t]+[ \t]+([0-9.]+):[0-9]+$/);
+		if (m) push(out[m[1]] ||= [], m[2]);
+	}
+	return out;
+}
+// netifd's host route to a tunnel's previous endpoint can outlive a server
+// change. Drop the main-table host route to an endpoint this tunnel left that
+// no WireGuard device still uses.
+function prune_endpoint_routes(dev, before) {
+	let after = wg_endpoints();
+	if (!before || !after || !before[dev]) return;
+	let used = {}, stale = filter(before[dev], (ip) => common.validate_ipv4(ip) != null);
+	for (let d, ips in after) for (let ip in ips) used[ip] = true;
+	stale = filter(stale, (ip) => !used[ip]);
+	if (!length(stale)) return;
+	// A full listing: BusyBox ip has no `exact` selector.
+	let r = command([ 'ip', '-4', 'route', 'show', 'table', 'main' ]);
+	if (r.code != 0) return;
+	let present = {};
+	for (let l in split(r.stdout || '', '\n')) {
+		let t = split(trim(l), /[ \t]+/);
+		present[replace(t[0] || '', /\/32$/, '')] = true;
+	}
+	for (let ip in stale)
+		if (present[ip])
+			command([ 'ip', '-4', 'route', 'del', ip + '/32', 'table', 'main' ]);
+}
+
 function set_elements(sets) {
 	let out = {}, total = 0;
 	if (!length(keys(sets))) return out;
@@ -328,6 +415,10 @@ adapters = {
 	read_outcome: function(name) { return readfile(outcome_path(name)); },
 	write_outcome: function(name, record) { return checked_write(outcome_path(name), sprintf('%J', record)); },
 	verify: function(p, desired, tables) { return verify_runtime(p, desired, tables); },
+	ifindex: function(dev) {
+		let v = common.validate_interface(dev) ? trim(readfile('/sys/class/net/' + dev + '/ifindex') || '') : '';
+		return common.full_match(v, /^[0-9]+$/) ? v : null;
+	},
 	pause: function() { sleep(250); }
 };
 function confirm(p, desired, tables) {
@@ -381,6 +472,7 @@ function execute_inner(uci, p, affected) {
 		// An anonymous deletion must be restorable at its original position.
 		for (let ch in p.changes)
 			if (ch.kind == 'delete' && type(uci.reorder) != 'function') die('UCI section reordering is unavailable');
+		let endpoints_before = p.activation ? wg_endpoints() : null;
 		if (p.activation?.before_configuration) {
 			stage = p.activation.stage; push(attempted, 'activation');
 			must(command(p.activation.argv).code == 0, stage);
@@ -434,6 +526,11 @@ function execute_inner(uci, p, affected) {
 			stage = p.activation.stage; push(attempted, 'activation');
 			must(command(p.activation.argv).code == 0, stage);
 		}
+		// Best effort: leftovers of netifd, never a reason to roll back.
+		if (p.activation || index(p.reloads, 'network') >= 0)
+			try { prune_lo_rules(p); } catch (e) {}
+		if (p.activation)
+			try { prune_endpoint_routes(p.interface, endpoints_before); } catch (e) {}
 		stage = 'verify:runtime';
 		must(confirm(p, p.after, p.tables.data), stage);
 		return { ok: true, changed, stage: 'complete', rollback: null };
@@ -504,16 +601,6 @@ function execute(uci, p) {
 	return result;
 }
 
-function table_id(name, text) {
-	if (common.full_match(name, /^[0-9]+$/)) return '' + int(name);
-	if (name == 'main') return '254';
-	if (name == 'default') return '253';
-	for (let l in split(text || '', '\n')) {
-		let m = match(l, /^[ \t]*([0-9]+)[ \t]+([^ \t#]+)/);
-		if (m && m[2] == name) return '' + int(m[1]);
-	}
-	return null;
-}
 function number(s) { return int(s, index(s || '', '0x') == 0 ? 16 : 10); }
 function rule_signature(sec, tables) {
 	return sec ? sprintf('%J', [ sec['.type'], sec.priority || '0', sec['in'] || null, sec.mark || null, sec.action || null, sec.src || null, sec.dest || null, sec.lookup ? table_id(sec.lookup, tables) : null ]) : null;

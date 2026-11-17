@@ -167,6 +167,48 @@ fail_at = [ 'commit:network#1' ]; r = apply.apply_routing(cursor(), 'main');
 ok('public routing apply preserves legacy error and structured failure', !r.ok && !!r.error && r.stage == 'commit:network' && !!r.rollback);
 reset(); fail_at = [ 'commit:nordvpn#1' ]; r = apply.disconnect(cursor(), 'main');
 ok('disable cannot succeed after enabled-state commit fails', !r.ok && r.stage == 'commit:nordvpn' && global.MOCK_UCI.nordvpn.main.enabled == '1');
+// netifd leaks `iif lo lookup <table>` rules and endpoint host routes; a
+// transaction that takes a tunnel up or down prunes those of nordvpn tables.
+{
+	reset();
+	tables = '255 local\n100 nordvpn\n102 nv_x\n';
+	global.MOCK_UCI.network.nv_x = { '.type': 'interface', proto: 'wireguard', vpn_type: 'nordvpn', ip4table: '102' };
+	let base = tx.adapters.run, ran = [], wg = 'nv_media\tpk\t187.15.165.12:51820\nnv_x\tpk2\t10.0.0.9:51820\n';
+	tx.adapters.ifindex = function(dev) { return dev == 'nv_media' ? '16' : null; };
+	tx.adapters.run = function(argv) {
+		let a = argv[0] == 'timeout' ? slice(argv, 2) : argv;
+		if (a[0] == 'ip' && a[2] == 'rule' && a[3] == 'show')
+			return { code: 0, stdout: a[1] == '-4'
+				? '0:\tfrom all lookup local\n90016:\tfrom all iif lo lookup nordvpn\n90021:\tfrom all iif lo lookup nordvpn\n' +
+				  '90025:\tfrom all iif lo lookup nv_x\n90030:\tfrom all iif lo lookup 200\n32766:\tfrom all lookup main\n'
+				: '90016:\tfrom all iif lo lookup nordvpn\n' };
+		if (a[0] == 'ubus' && a[2] == 'network.interface' && a[3] == 'dump')
+			return { code: 0, stdout: '{"interface":[{"interface":"nv_media","up":true,"l3_device":"nv_media"}]}' };
+		if (a[0] == 'wg') {
+			let out = wg;
+			wg = 'nv_media\tpk\t187.15.165.32:51820\nnv_x\tpk2\t10.0.0.9:51820\n';
+			return { code: 0, stdout: out };
+		}
+		if (a[0] == 'ip' && a[2] == 'route' && a[3] == 'show')
+			return { code: 0, stdout: 'default via 192.0.2.1 dev wan\n187.15.165.12 via 192.0.2.1 dev wan proto static\n' +
+				'187.15.165.32 via 192.0.2.1 dev wan proto static\n10.0.0.9 via 192.0.2.1 dev wan proto static\n' };
+		if (a[0] == 'ip' && (a[3] == 'del')) { push(ran, join(' ', a)); return { code: 0, stdout: '' }; }
+		return base(argv);
+	};
+	let pp = tx.plan(cursor(), function(c) { c.set('network', 'nv_media', 'mtu', '1400'); return { interface: 'nv_media' }; });
+	pp.activation = { stage: 'ifup:nv_media', up: true, previous_up: true, argv: [ 'ifup', 'nv_media' ],
+		restore_argv: [ 'ifup', 'nv_media' ] };
+	r = tx.execute(cursor(), pp);
+	ok('lo rules: the transaction still succeeds', r.ok);
+	ok('lo rules: the up tunnel keeps its rule at its ifindex', index(ran, 'ip -4 rule del priority 90016 iif lo lookup nordvpn') < 0);
+	ok('lo rules: a duplicate at an old ifindex is deleted', index(ran, 'ip -4 rule del priority 90021 iif lo lookup nordvpn') >= 0);
+	ok('lo rules: a down tunnel\'s rule is deleted', index(ran, 'ip -4 rule del priority 90025 iif lo lookup nv_x') >= 0);
+	ok('lo rules: a table no nordvpn interface uses is left alone', length(filter(ran, (c) => index(c, 'lookup 200') >= 0)) == 0);
+	ok('host routes: the endpoint the tunnel left is dropped', index(ran, 'ip -4 route del 187.15.165.12/32 table main') >= 0);
+	ok('host routes: current endpoints keep theirs', length(filter(ran, (c) => index(c, '187.15.165.32') >= 0 || index(c, '10.0.0.9') >= 0)) == 0);
+	tx.adapters.run = base;
+	delete tx.adapters.ifindex;
+}
 // fw4's reload flushes but keeps chains: a removed zone's chains are deleted.
 reset();
 global.MOCK_UCI.nordvpn.main.auto_routing = '1';
