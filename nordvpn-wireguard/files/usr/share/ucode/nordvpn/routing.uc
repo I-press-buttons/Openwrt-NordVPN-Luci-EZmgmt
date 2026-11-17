@@ -580,6 +580,46 @@ function device_owners(uci) {
 	return owners;
 }
 
+// Network -> owning instance for the `iif <network>` steering lookups. Two
+// instances with a lookup for the same network at the same priority leave
+// one of them carrying nothing, silently. Like devices, a network belongs
+// to the first enabled instance (list_instances order, 'main' first) that
+// steers it: as a steered network, or as one of the LAN zone's networks
+// when it routes all LAN traffic through its own table.
+function network_owners(uci) {
+	let owners = {}, lan_nets = null;
+	for (let n in _common.list_instances(uci)) {
+		let st = _common.load_settings(uci, n);
+		if (!st.enabled)
+			continue;
+		let nets = st.source_networks || [];
+		if (st.auto_routing && !all_lan_owner(uci, n) && st.routing_table != null && st.routing_table != '') {
+			if (lan_nets == null) {
+				let lz = find_lan_zone(uci);
+				lan_nets = lz ? zone_networks(uci, lz) : [];
+			}
+			nets = lan_nets;
+		}
+		for (let net in nets)
+			if (!owners[net])
+				owners[net] = n;
+	}
+	return owners;
+}
+
+// Networks this instance would steer that an earlier instance already owns:
+// { network: owner }. Empty for a disabled instance.
+function network_conflicts(uci, s, nets) {
+	let out = {};
+	if (!s.name || (s.enabled != null && !s.enabled))
+		return out;
+	let owners = network_owners(uci);
+	for (let net in nets)
+		if (owners[net] && owners[net] != s.name)
+			out[net] = owners[net];
+	return out;
+}
+
 // Remove ONLY a stamped rt_tables line for `name`; user entries are kept.
 function drop_rt_table(name, state) {
 	if (name == null || name == '' || _common.full_match(name, /^[0-9]+$/))
@@ -999,9 +1039,13 @@ function detect(uci, s, runtime, snapshot) {
 	let manual = user_routes > 0;
 
 	let wanmtu = runtime ? wan_l3_mtu(uci, snapshot) : null;
+	let lz = find_lan_zone(uci);
+	let routed_nets = (auto && s.routing_table != null && s.routing_table != '')
+		? (lz ? zone_networks(uci, lz) : []) : (s.source_networks || []);
 	return {
 		mode: manual ? 'manual' : (auto ? 'auto' : (steering ? 'steered' : 'none')),
 		all_lan_owner: owner,
+		network_conflicts: manual ? {} : network_conflicts(uci, s, routed_nets),
 		zone: zone ? zone.name : null,
 		zone_managed: zone ? zone.managed : false,
 		user_routes: user_routes,
@@ -1109,7 +1153,20 @@ function enforce(uci, s, opts) {
 	//     enabled) and IPv6 leak block (the tunnel carries no IPv6). Prohibit
 	//     sits between the lookup and the main table, so it only fires when
 	//     the tunnel's table cannot serve the traffic.
-	let steer_nets = steer ? (all_lan || s.source_networks) : [];
+	let steer_nets = steer ? (all_lan || s.source_networks || []) : [];
+	// A network already steered by an earlier instance stays with it.
+	let taken = steer ? network_conflicts(uci, s, steer_nets) : {};
+	for (let net in sort(keys(taken)))
+		push(notes, 'network ' + net + ' is already steered by instance ' + taken[net] + '; not applied here');
+	if (length(keys(taken)))
+		steer_nets = filter(steer_nets, (n) => taken[n] == null);
+	// All of the LAN taken: fall back to the instance's own steering, as an
+	// instance does when another one routes all LAN traffic (all_lan_owner).
+	if (all_lan && !length(steer_nets)) {
+		all_lan = false;
+		let own = network_conflicts(uci, s, s.source_networks || []);
+		steer_nets = filter(s.source_networks || [], (n) => own[n] == null);
+	}
 	let table = s.routing_table;
 	if (steer) {
 		if (!ensure_rt_table(table, tables))
@@ -1749,4 +1806,4 @@ function enforce(uci, s, opts) {
 }
 
 return { detect, enforce, find_wan_zone, find_lan_zone, count_user_routes, recommend_mtu,
-	rt_table_id, device_mark, device_owners, wan_link, all_lan_owner, domain_set_name, bypass_set_name, nftset_supported };
+	rt_table_id, device_mark, device_owners, network_owners, wan_link, all_lan_owner, domain_set_name, bypass_set_name, nftset_supported };

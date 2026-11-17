@@ -743,6 +743,10 @@ return view.extend({
 		}
 		if (s.gateway && /^[a-z]{2}-onion/.test(s.gateway))
 			details.push(_('🧅 Onion over VPN'));
+		var taken = (s.routing && s.routing.network_conflicts) || {};
+		Object.keys(taken).sort().forEach(function(net) {
+			details.push(_('⚠ Network "%s" is not routed here: instance "%s" already steers it').format(net, taken[net]));
+		});
 		if (this.routingUnconfirmed(s))
 			details.push(_('Routing protection is unconfirmed. Retry Apply and check any reported errors.'));
 		else if (s.state !== 'connected' && s.state !== 'no_egress' && s.routing && s.routing.killswitch)
