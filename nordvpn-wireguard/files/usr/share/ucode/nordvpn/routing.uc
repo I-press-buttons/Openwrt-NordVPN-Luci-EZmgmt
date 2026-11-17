@@ -750,8 +750,11 @@ function recommend_mtu(wanmtu) {
 // section except loopback and WireGuard tunnels.
 function available_networks(uci) {
 	let out = [];
+	// The WAN zone's networks (wan, wan6) are the way out, not a source to steer.
+	let wz = find_wan_zone(uci);
+	let wan_nets = wz ? zone_networks(uci, wz) : [];
 	uci.foreach('network', 'interface', function(sec) {
-		if (sec['.name'] == 'loopback' || sec.proto == 'wireguard')
+		if (sec['.name'] == 'loopback' || sec.proto == 'wireguard' || index(wan_nets, sec['.name']) >= 0)
 			return;
 		push(out, sec['.name']);
 	});

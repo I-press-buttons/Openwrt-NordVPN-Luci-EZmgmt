@@ -412,6 +412,9 @@ eq('instances back to one', length(m.instances.call().instances), 1);
 	eq('its interface carries the default key', global.MOCK_UCI.network.nv_media.private_key, KEY);
 	eq('it is a managed wireguard interface',
 		[ global.MOCK_UCI.network.nv_media.proto, global.MOCK_UCI.network.nv_media.vpn_type ], [ 'wireguard', 'nordvpn' ]);
+	eq('a new instance starts disabled until it has a location', global.MOCK_UCI.nordvpn.media.enabled, '0');
+	ok('a case variant of an existing name is refused', index(m.create_instance.call({ args: { instance: 'MEDIA' } }).error || '',
+		'not case-sensitive') >= 0 && global.MOCK_UCI.nordvpn.MEDIA == null);
 	r = m.create_instance.call({ args: { instance: 'lab', credential: 'work' } });
 	ok('an instance can start on another entry', r.ok == true && global.MOCK_UCI.network.nv_lab.private_key == KEY2);
 	ok('an unknown entry is refused and nothing is created',

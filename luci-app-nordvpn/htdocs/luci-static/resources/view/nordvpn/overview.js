@@ -419,15 +419,33 @@ return view.extend({
 			]));
 		}, this));
 
-		var selector = E('select', { class: 'cbi-input-select', 'aria-label': _('Selected VPN tunnel'),
-			change: L.bind(function(ev) { this.selectInstance(ev.target.value); ev.target.value = this.instance; }, this)
-		}, (this.instances || []).map(L.bind(function(st) {
-			return E('option', { value: st.instance, selected: st.instance === this.instance || null },
-				st.instance + ' · ' + this.stateInfo(this.dispState(st)).label);
-		}, this)));
-		dom.content(this.instancesNode, E('div', { class: 'nv-tunnel-selector' }, [
-			E('label', {}, [ _('Tunnel'), ' ', selector ]),
-			E('button', { type: 'button', class: 'cbi-button', click: L.bind(this.openManagement, this) }, _('Manage tunnels')) ]));
+		// The status poll calls this every few seconds. Rebuilding the select
+		// would close it under the user's pointer, so while the tunnels are the
+		// same only the option labels and the selection are updated in place.
+		var names = (this.instances || []).map(function(st) { return st.instance; });
+		var selector = this.tunnelSelect;
+		var same = selector && selector.parentNode && this.instancesNode.contains(selector) &&
+			selector.options.length === names.length &&
+			names.every(function(n, i) { return selector.options[i].value === n; });
+		if (same) {
+			(this.instances || []).forEach(L.bind(function(st, i) {
+				var label = st.instance + ' · ' + this.stateInfo(this.dispState(st)).label;
+				if (selector.options[i].textContent !== label)
+					selector.options[i].textContent = label;
+			}, this));
+			if (selector.value !== this.instance)
+				selector.value = this.instance;
+		} else {
+			selector = this.tunnelSelect = E('select', { class: 'cbi-input-select', 'aria-label': _('Selected VPN tunnel'),
+				change: L.bind(function(ev) { this.selectInstance(ev.target.value); ev.target.value = this.instance; }, this)
+			}, (this.instances || []).map(L.bind(function(st) {
+				return E('option', { value: st.instance, selected: st.instance === this.instance || null },
+					st.instance + ' · ' + this.stateInfo(this.dispState(st)).label);
+			}, this)));
+			dom.content(this.instancesNode, E('div', { class: 'nv-tunnel-selector' }, [
+				E('label', {}, [ _('Tunnel'), ' ', selector ]),
+				E('button', { type: 'button', class: 'cbi-button', click: L.bind(this.openManagement, this) }, _('Manage tunnels')) ]));
+		}
 		if (!this.managementNode) this.managementNode = E('div');
 		dom.content(this.managementNode, E('fieldset', { class: 'cbi-section' }, [
 			E('legend', {}, _('VPN instances')),
@@ -466,10 +484,18 @@ return view.extend({
 	showAddInstanceModal: function() {
 		var input = E('input', { type: 'text', class: 'cbi-input-text', placeholder: _('e.g. media') });
 		var err = E('div', { class: 'cbi-value-description', style: 'color:var(--error-color,#c0392b)' });
+		var credSel0 = null;
+		input.addEventListener('keydown', L.bind(function(ev) {
+			if (ev.key === 'Enter') {
+				ev.preventDefault();
+				this.addInstance(input, credSel0, err);
+			}
+		}, this));
 		// New instances use the Default credentials; offer the others only when
 		// the bank has more than one entry.
 		var creds = this.credentials || [];
 		var credSel = (creds.length > 1) ? this.credentialSelect('default') : null;
+		credSel0 = credSel;
 
 		ui.showModal(_('Add VPN instance'), [
 			E('p', {}, _('A new instance runs its own tunnel on its own WireGuard interface with its own schedule.')),
@@ -504,8 +530,8 @@ return view.extend({
 			}, this)).then(L.bind(function() {
 				this.selectInstance(name);
 				this.notice((res && res.configured)
-					? _('Instance "%s" created with the "%s" credentials. Pick a country, then save.').format(name, this.credentialName(res.credential))
-					: _('Instance "%s" created. Add credentials and pick a country, then save.').format(name), 'info', 6000);
+					? _('Instance "%s" created with the "%s" credentials. Pick a country, save, then enable it.').format(name, this.credentialName(res.credential))
+					: _('Instance "%s" created. Add credentials and pick a country, save, then enable it.').format(name), 'info', 6000);
 			}, this));
 		}, this)).catch(L.bind(function(e) {
 			dom.content(err, [ '' + e ]);
@@ -772,8 +798,10 @@ return view.extend({
 						E('span', {}, locText || '')
 					]),
 					E('div', { class: 'nv-status-details' }, details.join(' · ')),
-					protLine,
-					this.dnsLine(s),
+					// LuCI's dom.append() renders a null array item as the
+					// text "null": pass '' for an absent line.
+					protLine || '',
+					this.dnsLine(s) || '',
 					this.protectionSummary(s),
 					E('div', { class: 'nv-status-actions' }, this.actionButtons(s))
 				])
@@ -1051,6 +1079,10 @@ return view.extend({
 	},
 
 	routingUnconfirmed: function(s) {
+		// A disabled tunnel has released its protections; there is nothing
+		// installed to confirm.
+		if (s && s.enabled === false)
+			return false;
 		return !!((s && s.routing_application && s.routing_application.confirmed === false) ||
 			(this._routingUnconfirmed && this._routingUnconfirmed[this.instance]));
 	},

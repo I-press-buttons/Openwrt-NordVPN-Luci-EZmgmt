@@ -84,6 +84,12 @@ assert.strictEqual(app.routingOnlyChange({ fixed_server: JSON.stringify('old') }
 assert.strictEqual(JSON.stringify(app.parseDomains({ area: { value: '999.1.1.1\n1.1.1.1/33\n0.0.0.0/0\nexample.com\n198.51.100.0/24' } })),
 	JSON.stringify({ valid: [ 'example.com' ], ips: [ '198.51.100.0/24' ], invalid: [ '999.1.1.1', '1.1.1.1/33', '0.0.0.0/0' ], capped: false }),
 	'malformed addresses are flagged, never taken for domain names');
+app._routingUnconfirmed = { main: true };
+assert.strictEqual(app.routingUnconfirmed({ enabled: false, routing_application: { confirmed: false } }), false,
+	'a disabled tunnel has no routing protection left to confirm');
+assert.strictEqual(app.routingUnconfirmed({ enabled: true, routing_application: { confirmed: false } }), true,
+	'an enabled tunnel with a failed application stays unconfirmed');
+app._routingUnconfirmed = {};
 
 function deferred() {
 	var resolve, reject;

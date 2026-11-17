@@ -846,6 +846,10 @@ function create_instance_inner(uci, name, credential) {
 		return { error: 'this name is reserved' };
 	if (uci.get('nordvpn', name) != null)
 		return { error: 'an instance with this name already exists' };
+	// 'MAIN' next to 'main' is legal for UCI but reads as the same tunnel.
+	for (let other in _common.list_instances(uci))
+		if (lc(other) == lc(name))
+			return { error: 'an instance named ' + other + ' already exists (names are not case-sensitive)' };
 
 	let iface = validate_interface('nv_' + name);
 	if (!iface)
@@ -866,7 +870,10 @@ function create_instance_inner(uci, name, credential) {
 	let p = _transaction.plan(uci, function(desired) {
 		desired.set('nordvpn', name, 'instance');
 		desired.set('nordvpn', name, 'interface', iface);
-		desired.set('nordvpn', name, 'enabled', '1');
+		// Disabled until it has a location and is enabled: an enabled tunnel
+		// without a server only reads as a failed "Disconnected" one, and the
+		// scheduler would keep trying to rotate or recover it.
+		desired.set('nordvpn', name, 'enabled', '0');
 		if (cred != _creds.DEFAULT_ID) desired.set('nordvpn', name, 'credential', cred);
 		if (key) {
 			desired.set('network', iface, 'interface');
