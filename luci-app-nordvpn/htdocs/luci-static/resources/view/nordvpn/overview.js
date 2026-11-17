@@ -3612,6 +3612,10 @@ return view.extend({
 
 	notice: function(text, kind, timeout) {
 		var node = ui.addNotification(null, E('p', {}, text), kind || 'info');
+		// Notifications render at the top of the page; an error raised by a
+		// button further down (Delete) would otherwise go unseen.
+		if (kind === 'error' && node && typeof node.scrollIntoView === 'function')
+			node.scrollIntoView({ behavior: 'smooth', block: 'start' });
 		if (timeout)
 			setTimeout(L.bind(this.dismiss, this, node), timeout);
 		return node;

@@ -169,6 +169,22 @@ reset(); fail_at = [ 'commit:nordvpn#1' ]; r = apply.disconnect(cursor(), 'main'
 ok('disable cannot succeed after enabled-state commit fails', !r.ok && r.stage == 'commit:nordvpn' && global.MOCK_UCI.nordvpn.main.enabled == '1');
 reset(); fail_at = [ 'ifdown#1' ]; r = apply.delete_instance(cursor(), 'main');
 ok('delete/reset cannot succeed after teardown fails', !r.ok && r.stage == 'ifdown:nv_media' && global.MOCK_UCI.nordvpn.main.interface == 'nv_media' && global.MOCK_UCI.network.nv_media != null);
+// OpenWrt 25.12: ubus exits 4 (NOT_FOUND) for an interface netifd does not
+// know, both for one never brought up and for one the delete just removed.
+function ubus_gone(known) {
+	let base = tx.adapters.run;
+	tx.adapters.run = function(argv) {
+		let a = argv[0] == 'timeout' ? slice(argv, 2) : argv;
+		if (a[0] == 'ubus' && index(a[2] || '', 'network.interface.') == 0 && !known())
+			return { code: 4, stdout: '' };
+		return base(argv);
+	};
+}
+reset(); global.MOCK_UCI.nordvpn.extra = { '.type': 'instance', enabled: '1', interface: 'nv_media' };
+delete global.MOCK_UCI.nordvpn.main;
+ubus_gone(() => false);
+r = apply.delete_instance(cursor(), 'extra');
+ok('a never-connected instance can be deleted', r.ok && global.MOCK_UCI.nordvpn.extra == null && global.MOCK_UCI.network.nv_media == null);
 // Compact confirmation survives new status cursors and never contains keys.
 reset(); p = multipackage(); r = tx.execute(cursor(), p);
 ok('successful routing records confirmation for a fresh status cursor', r.ok && tx.confirmation(cursor(), 'main').confirmed);
@@ -242,6 +258,10 @@ tx.adapters.run = function(argv) {
 	return a[1] == 'list' ? { code: 0, stdout: '' } : { code: 4, stdout: '' };
 };
 ok('successful empty ubus listing identifies absent new/deleted interface', tx.interface_state('nv_media').absent);
+tx.adapters.run = function(argv) { return { code: 4, stdout: '' }; };
+ok('ubus NOT_FOUND (exit 4, OpenWrt 25.12) identifies an absent interface', tx.interface_state('nv_media')?.absent == true);
+tx.adapters.run = function() { return { code: 124, stdout: '' }; };
+ok('a ubus timeout never establishes absence', tx.interface_state('nv_media') == null);
 tx.adapters.run = function() { return { code: 127, stdout: '' }; };
 ok('missing ubus is never mistaken for a safely down interface', tx.interface_state('nv_media') == null);
 reset(); global.MOCK_UCI.nordvpn_credentials = { _state: { '.type': 'state', migrated: '1' } };
