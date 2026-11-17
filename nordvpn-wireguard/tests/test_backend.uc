@@ -456,6 +456,16 @@ write_cache(cache, cpath);
 	u = watchdog_update('not_configured', stale, now, true);
 	eq('watchdog: not configured clears timers', [ u.degraded_since, u.last_recover, u.recover_fails ], [ 0, 0, 0 ]);
 
+	// A stamp taken before the clock was corrected (NTP after boot) cannot
+	// predate this boot: the grace period starts over instead of being used
+	// up by the jump. Stamps within the uptime are kept.
+	u = watchdog_update('degraded', { degraded_since: now - 1045487, last_recover: 0, recover_fails: 0 }, now, true, 57);
+	eq('watchdog: stamp older than uptime restarts the grace period', u.degraded_since, now);
+	u = watchdog_update('degraded', { degraded_since: now - 40, last_recover: 0, recover_fails: 0 }, now, true, 57);
+	eq('watchdog: stamp within uptime is kept', u.degraded_since, now - 40);
+	u = watchdog_update('degraded', { degraded_since: now + 500, last_recover: now + 500, recover_fails: 1 }, now, true, 57);
+	eq('watchdog: stamps from the future are dropped', [ u.degraded_since, u.last_recover, u.recover_fails ], [ now, 0, 1 ]);
+
 	// Only a completed failed recovery advances the backoff. A successful
 	// worker or one that merely lost the rotation-lock race does not.
 	eq('watchdog: failed result increments backoff',
@@ -956,6 +966,9 @@ write_cache(cache, cpath);
 	eq('mac: bare hex normalized', _cmn.validate_mac('AABBCCDDEEFF'), 'aa:bb:cc:dd:ee:ff');
 	eq('mac: short refused', _cmn.validate_mac('aa:bb:cc:dd:ee'), null);
 	eq('mac: newline refused', _cmn.validate_mac('aa:bb:cc:dd:ee:ff\nx'), null);
+	eq('cidr4: address and network accepted', [ _cmn.validate_cidr4('198.51.100.7'), _cmn.validate_cidr4(' 198.51.100.0/24 ') ],
+		[ '198.51.100.7', '198.51.100.0/24' ]);
+	eq('cidr4: newline refused', [ _cmn.validate_cidr4('198.51.100.7\nx'), _cmn.validate_cidr4('198.51.100.0/24\n; drop') ], [ null, null ]);
 
 	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', enabled: '1',
 		source_device: [ 'AA:BB:CC:DD:EE:01', 'aa-bb-cc-dd-ee-01', 'junk', 'aabbccddee02' ] } } };

@@ -383,17 +383,20 @@ function restore_wan_default() {
 						res = _mutation.configuration(function(fresh) {
 							let now = run([ 'ip', '-4', 'route', 'show', 'default' ]);
 							if (now.code != 0 || trim(now.stdout || '') != '')
-								return now;
-							return run([ 'ip', 'route', 'add', 'default', 'via', rt.nexthop, 'dev', ifc.l3_device ]);
+								return { code: now.code, added: false };
+							let add = run([ 'ip', 'route', 'add', 'default', 'via', rt.nexthop, 'dev', ifc.l3_device ]);
+							return { code: add.code, added: add.code == 0 };
 						}, TUNNEL_LOCK_WAIT);
 					} catch (e) {
 						return false;
 					}
 					if (res.code != 0)
 						return false;
-					// Only claim success once the route really went in.
-					_common.log('restored missing WAN default route via ' + rt.nexthop +
-						' on ' + ifc.l3_device);
+					// Only claim a restoration that this call made: with a second
+					// gateway route listed, the default is already back by then.
+					if (res.added)
+						_common.log('restored missing WAN default route via ' + rt.nexthop +
+							' on ' + ifc.l3_device);
 				}
 			}
 		}
@@ -545,10 +548,19 @@ function apply_inner(uci, instance, source, lock_wait) {
 	let tries = length(list);
 	if (tries > 4)
 		tries = 4;
+	// As in the rotation worker: once a candidate was written, a failed
+	// transaction leaves the tunnel on a server that never completed a
+	// handshake, so it must fall through to the restoration below.
+	let switched = false, failure = null;
 	for (let i = 0; i < tries; i++) {
 		let relay = list[i];
 		let connection = connect_one_result(uci, iface, relay, s);
-		if (!connection.ok) return { ...connection, state: 'failure', interface: iface };
+		if (!connection.ok) {
+			if (!switched) return { ...connection, state: 'failure', interface: iface };
+			failure = connection;
+			break;
+		}
+		switched = true;
 		if (verify_handshake(iface, s.verify_timeout))
 			return {
 				state: 'success', interface: iface, gateway: relay.hostname,
@@ -560,7 +572,7 @@ function apply_inner(uci, instance, source, lock_wait) {
 	let hint = tunnel_hint(iface);
 	let restored = saved ? restore_connection(iface, saved, lock_wait) : null;
 	return { state: 'failure', restored: !!restored?.ok, rollback: restored,
-		error: (hint || 'could not reach any server for the current selection') +
+		error: ((failure && failure.error) || hint || 'could not reach any server for the current selection') +
 			(restored ? (restored.ok ? '; restored the previous connection' : '; restoration failed: ' + restored.error) : '') };
 }
 

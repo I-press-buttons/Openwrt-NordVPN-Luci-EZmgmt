@@ -244,6 +244,9 @@ function validate_cidr4(c) {
 	if (type(c) != 'string')
 		return null;
 	c = trim(c);
+	// Anchors are per-line (see full_match): refuse an embedded newline.
+	if (index(c, '\n') >= 0)
+		return null;
 	let m = match(c, /^([0-9.]+)(\/([0-9]{1,2}))?$/);
 	if (!m || !validate_ipv4(m[1]))
 		return null;

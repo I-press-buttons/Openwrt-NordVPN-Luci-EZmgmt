@@ -4,6 +4,7 @@
 
 'use strict';
 
+import { readfile } from 'fs';
 const _common = require('nordvpn.common');
 const WATCHDOG_GRACE = _common.WATCHDOG_GRACE,
       WATCHDOG_COOLDOWN_BASE = _common.WATCHDOG_COOLDOWN_BASE,
@@ -196,15 +197,35 @@ function should_recover(settings, state, degraded_since, last_recover, fails, no
 // Next watchdog timers from the observed state transition. Inactive,
 // unconfigured, and connected instances start with a clean recovery episode.
 // `st` is { degraded_since, last_recover, recover_fails } from persisted state.
-function watchdog_update(state, st, now, active) {
+// `uptime` (optional) is the system's uptime in seconds. The timers are wall
+// clock stamps kept in /tmp, so none can predate this boot: a stamp that lies
+// in the future, or further back than the system has been up, was taken before
+// the clock was corrected (NTP on a router without an RTC jumps it by days a
+// minute after boot). Such a stamp says nothing about how long the tunnel has
+// been unhealthy; without this guard the jump alone used up the whole grace
+// period and the watchdog rotated a tunnel that had just come up.
+function watchdog_update(state, st, now, active, uptime) {
 	let ds = (st && st.degraded_since > 0) ? st.degraded_since : 0;
 	let last = (st && st.last_recover > 0) ? st.last_recover : 0;
 	let fails = (st && st.recover_fails > 0) ? st.recover_fails : 0;
+	let booted = (type(uptime) == 'int' && uptime >= 0) ? uptime : null;
+	if (ds > now || (booted != null && now - ds > booted))
+		ds = 0;
+	if (last > now)
+		last = 0;
 	if (!active || state == 'connected' || state == 'not_configured')
 		return { degraded_since: 0, last_recover: 0, recover_fails: 0 };
 	if (is_unhealthy(state) && ds == 0)
 		ds = now;
 	return { degraded_since: ds, last_recover: last, recover_fails: fails };
+}
+
+// System uptime in whole seconds (for watchdog_update), or null when /proc is
+// unavailable.
+function system_uptime() {
+	let raw = readfile('/proc/uptime');
+	let up = raw ? int(split(raw, ' ')[0]) : null;
+	return (type(up) == 'int' && up >= 0) ? up : null;
 }
 
 // Fold a completed recovery worker result into the failure counter. Losing the
@@ -220,6 +241,6 @@ function watchdog_result_update(result, fails) {
 
 return {
 	REFRESH_RETRY_BASE, should_refresh, refresh_seed, should_rotate, next_rotation, should_recover,
-	watchdog_update, watchdog_result_update,
+	watchdog_update, watchdog_result_update, system_uptime,
 	should_probe, effective_state, probe_update, probe_clear, egress_report
 };

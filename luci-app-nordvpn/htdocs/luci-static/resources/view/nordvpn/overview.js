@@ -592,7 +592,8 @@ return view.extend({
 			return null;
 		if (sec < 90)
 			return _('Handshake %d seconds ago').format(sec);
-		return _('Handshake %d minutes ago').format(Math.floor(sec / 60));
+		var min = Math.floor(sec / 60);
+		return min == 1 ? _('Handshake 1 minute ago') : _('Handshake %d minutes ago').format(min);
 	},
 
 	// Compact duration: "45 s", "12 min", "3 h 5 min", "2 d 4 h".
@@ -615,7 +616,8 @@ return view.extend({
 			n /= 1024;
 			i++;
 		}
-		return (i ? n.toFixed(n < 10 ? 1 : 0) : '' + n) + ' ' + units[i];
+		// Whole bytes: a rate is a quotient and would print all its decimals.
+		return (i ? n.toFixed(n < 10 ? 1 : 0) : '' + Math.round(n)) + ' ' + units[i];
 	},
 
 	// Remember each instance's byte counters between polls and derive a rate
