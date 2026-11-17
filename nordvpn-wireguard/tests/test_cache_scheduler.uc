@@ -63,4 +63,29 @@ g = guard([], true);
 ok('procd\'s plain start takes the daemon lock and continues', g.exit == null && g.locked == '/var/run/nordvpn-service.lock');
 g = guard([], false);
 ok('a second daemon refuses to start', g.exit == 1 && index(g.said, 'already running') >= 0);
+
+// The WAN default check: a missing main-table default starts one repair.
+let wbegin = index(source, 'let wan_heal = 0;');
+let wend = index(source, '// An exception escaping a uloop callback');
+ok('the WAN default check is part of the daemon', wbegin > 0 && wend > wbegin && index(source, 'wan_default_step(now);') > 0);
+global.WAN = { route: '', started: 0 };
+let wan = loadstring(`
+const PROBE_STUCK = 120;
+function in_flight(since, now, ceiling) { return since > 0 && now >= since && (now - since) < ceiling; }
+function errmsg(e) { return '' + e; }
+const _common = { run: function() { return { code: 0, stdout: global.WAN.route }; }, drop_inherited_locks: function() {} };
+const tasks = { start: function(work, done) { global.WAN.started++; global.WAN.done = done; return {}; } };
+` + substr(source, wbegin, wend - wbegin) + `
+return wan_default_step;`)();
+global.WAN.route = 'default via 192.0.2.1 dev wan\n';
+wan(1000);
+ok('a present default route needs nothing', global.WAN.started == 0);
+global.WAN.route = '';
+wan(1030);
+ok('a missing default route starts a repair', global.WAN.started == 1);
+wan(1060);
+ok('... only one at a time', global.WAN.started == 1);
+global.WAN.done({ ok: true });
+wan(1090);
+ok('a finished repair lets the next tick look again', global.WAN.started == 2);
 exit(fails ? 1 : 0);
