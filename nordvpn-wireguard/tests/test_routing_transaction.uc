@@ -206,6 +206,31 @@ ok('disable cannot succeed after enabled-state commit fails', !r.ok && r.stage =
 	ok('lo rules: a table no nordvpn interface uses is left alone', length(filter(ran, (c) => index(c, 'lookup 200') >= 0)) == 0);
 	ok('host routes: the endpoint the tunnel left is dropped', index(ran, 'ip -4 route del 187.15.165.12/32 table main') >= 0);
 	ok('host routes: current endpoints keep theirs', length(filter(ran, (c) => index(c, '187.15.165.32') >= 0 || index(c, '10.0.0.9') >= 0)) == 0);
+
+	// A same-server bounce whose device is not listed yet keeps the route,
+	// and a main-table tunnel never loses it (it keeps WireGuard's own UDP
+	// out of the tunnel there).
+	for (let c in [ { table: '100', wg2: '' }, { table: null, wg2: 'nv_media\tpk\t187.15.165.32:51820\n' } ]) {
+		reset();
+		if (c.table) global.MOCK_UCI.network.nv_media.ip4table = c.table;
+		else delete global.MOCK_UCI.network.nv_media.ip4table;
+		ran = []; let calls = 0;
+		tx.adapters.run = function(argv) {
+			let a = argv[0] == 'timeout' ? slice(argv, 2) : argv;
+			if (a[0] == 'wg') return { code: 0, stdout: calls++ ? c.wg2 : 'nv_media\tpk\t187.15.165.12:51820\n' };
+			if (a[0] == 'ip' && a[2] == 'route' && a[3] == 'show')
+				return { code: 0, stdout: '187.15.165.12 via 192.0.2.1 dev wan proto static\n' };
+			if (a[0] == 'ip' && a[3] == 'del') { push(ran, join(' ', a)); return { code: 0, stdout: '' }; }
+			return base(argv);
+		};
+		pp = tx.plan(cursor(), function(c2) { c2.set('network', 'nv_media', 'mtu', '1400'); return { interface: 'nv_media' }; });
+		pp.activation = { stage: 'ifup:nv_media', up: true, previous_up: true, argv: [ 'ifup', 'nv_media' ],
+			restore_argv: [ 'ifup', 'nv_media' ] };
+		r = tx.execute(cursor(), pp);
+		ok(c.table ? 'host routes: kept while the tunnel does not list its endpoint yet'
+			: 'host routes: never pruned for a main-table tunnel',
+			r.ok && length(filter(ran, (x) => index(x, 'route del') >= 0)) == 0);
+	}
 	tx.adapters.run = base;
 	delete tx.adapters.ifindex;
 }
