@@ -226,6 +226,41 @@ function interface_state(iface) {
 	return (r.code == 0 && trim(r.stdout || '') == '') || r.code == 4 ? { up: false, absent: true } : null;
 }
 
+// fw4's reload replaces the ruleset with `flush table inet fw4`, which empties
+// chains but never deletes them, so the chains of a removed zone linger until
+// a full firewall restart. Delete those of the managed zones this plan removed
+// once the reload no longer references them. Best effort: a chain still in
+// use, or already gone, is left to fw4.
+const ZONE_CHAINS = [ 'input', 'output', 'forward', 'helper', 'srcnat', 'dstnat',
+	'accept_from', 'accept_to', 'drop_from', 'drop_to', 'reject_from', 'reject_to' ];
+function removed_zones(p) {
+	let out = [];
+	for (let ch in p.changes) {
+		let z = ch.before;
+		if (ch.package != 'firewall' || ch.after || !z || z['.type'] != 'zone' || z.nordvpn_managed != '1' || !z.name)
+			continue;
+		let kept = false;
+		for (let n, sec in p.after.firewall || {})
+			if (sec['.type'] == 'zone' && sec.name == z.name) kept = true;
+		if (!kept && common.full_match(z.name, /^[A-Za-z0-9_]+$/)) push(out, z.name);
+	}
+	return out;
+}
+function drop_zone_chains(zones) {
+	if (!length(zones)) return;
+	let r = command([ 'nft', 'list', 'table', 'inet', 'fw4' ], '3');
+	if (r.code != 0) return;
+	let present = {};
+	for (let l in split(r.stdout || '', '\n')) {
+		let m = match(trim(l), /^chain ([A-Za-z0-9_]+) /);
+		if (m) present[m[1]] = true;
+	}
+	for (let z in zones)
+		for (let prefix in ZONE_CHAINS)
+			if (present[prefix + '_' + z])
+				command([ 'nft', 'delete', 'chain', 'inet', 'fw4', prefix + '_' + z ], '3');
+}
+
 function set_elements(sets) {
 	let out = {}, total = 0;
 	if (!length(keys(sets))) return out;
@@ -392,6 +427,7 @@ function execute_inner(uci, p, affected) {
 				let retained = {};
 				for (let n in p.domain_preservation.keep) if (saved[n] != null) retained[n] = saved[n];
 				restore_elements(retained);
+				drop_zone_chains(removed_zones(p));
 			}
 		}
 		if (p.activation && !p.activation.before_configuration) {

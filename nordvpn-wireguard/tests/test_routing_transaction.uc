@@ -167,6 +167,30 @@ fail_at = [ 'commit:network#1' ]; r = apply.apply_routing(cursor(), 'main');
 ok('public routing apply preserves legacy error and structured failure', !r.ok && !!r.error && r.stage == 'commit:network' && !!r.rollback);
 reset(); fail_at = [ 'commit:nordvpn#1' ]; r = apply.disconnect(cursor(), 'main');
 ok('disable cannot succeed after enabled-state commit fails', !r.ok && r.stage == 'commit:nordvpn' && global.MOCK_UCI.nordvpn.main.enabled == '1');
+// fw4's reload flushes but keeps chains: a removed zone's chains are deleted.
+reset();
+global.MOCK_UCI.nordvpn.main.auto_routing = '1';
+global.MOCK_UCI.network.peer = { '.type': 'wireguard_nv_media', interface: 'nv_media', endpoint_host: 'de1.nordvpn.com' };
+global.MOCK_UCI.firewall.zlan = { '.type': 'zone', name: 'lan', network: [ 'lan' ] };
+global.MOCK_UCI.firewall.zwan = { '.type': 'zone', name: 'wan', network: [ 'wan' ], masq: '1' };
+global.MOCK_UCI.firewall.zvpn = { '.type': 'zone', name: 'nv_media', network: [ 'nv_media' ],
+	nordvpn_managed: '1', nordvpn_role: 'zone', nordvpn_iface: 'nv_media' };
+{
+	let base = tx.adapters.run, deleted = [];
+	tx.adapters.run = function(argv) {
+		let a = argv[0] == 'timeout' ? slice(argv, 2) : argv;
+		if (a[0] == 'nft' && a[1] == 'list' && a[2] == 'table')
+			return { code: 0, stdout: 'table inet fw4 {\n\tchain input_lan {\n\t}\n\tchain accept_to_nv_media {\n\t}\n' +
+				'\tchain forward_nv_media {\n\t}\n\tchain srcnat_nv_media {\n\t}\n\tchain accept_to_nv_media_x {\n\t}\n}\n' };
+		if (a[0] == 'nft' && a[1] == 'delete') { push(deleted, a[5]); return { code: 0, stdout: '' }; }
+		return base(argv);
+	};
+	r = apply.disconnect(cursor(), 'main');
+	ok('disabling removes the managed zone', r.ok && global.MOCK_UCI.firewall.zvpn == null);
+	ok('... and deletes exactly its leftover nft chains',
+		equal(sort(deleted), [ 'accept_to_nv_media', 'forward_nv_media', 'srcnat_nv_media' ]));
+	tx.adapters.run = base;
+}
 reset(); fail_at = [ 'ifdown#1' ]; r = apply.delete_instance(cursor(), 'main');
 ok('delete/reset cannot succeed after teardown fails', !r.ok && r.stage == 'ifdown:nv_media' && global.MOCK_UCI.nordvpn.main.interface == 'nv_media' && global.MOCK_UCI.network.nv_media != null);
 // OpenWrt 25.12: ubus exits 4 (NOT_FOUND) for an interface netifd does not
