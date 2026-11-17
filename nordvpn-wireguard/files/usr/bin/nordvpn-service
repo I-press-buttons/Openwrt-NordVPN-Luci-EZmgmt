@@ -44,6 +44,24 @@ const status = _status.status,
       egress_probe = _status.egress_probe;
 const record_event = require('nordvpn.history').record_event;
 
+// procd starts the daemon without arguments. Anything else (`nordvpn-service
+// help`) prints the usage instead of starting a second scheduler.
+if (length(ARGV) > 0) {
+	warn('usage: nordvpn-service\n' +
+		'  The nordvpn-wireguard scheduler daemon. It takes no arguments and is\n' +
+		'  run by procd: use /etc/init.d/nordvpn start|stop|restart|status.\n');
+	exit(index([ 'help', '-h', '--help' ], ARGV[0]) >= 0 ? 0 : 2);
+}
+
+// One scheduler at a time: a copy started by hand next to procd's would run
+// every refresh, rotation and watchdog twice. The lock is held for the
+// daemon's lifetime; task children drop their inherited copy.
+const DAEMON_LOCK = '/var/run/nordvpn-service.lock';
+if (!_common.acquire_advisory(DAEMON_LOCK)) {
+	log('scheduler already running; not starting another');
+	exit(1);
+}
+
 // uloop only calls a task's result callback for a result the child actually
 // sent, so a child that is killed (the OOM killer, a stray `kill`) never
 // reports back. Probe children have a bounded age fallback. Cache refreshes

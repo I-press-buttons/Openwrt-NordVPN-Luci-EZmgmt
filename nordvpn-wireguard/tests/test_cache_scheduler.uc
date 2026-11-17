@@ -36,4 +36,31 @@ ok('same worker outcome is folded once', scheduler.snapshot().fails == 2);
 latest.id = 'third'; scheduler.watch('third');
 scheduler.result('third', 'cache', { ok: true });
 ok('successful publication resets failure streak at completion', scheduler.snapshot().fails == 0 && scheduler.snapshot().last >= first.last);
+
+// Startup guard: arguments print the usage, and a second copy never runs.
+let gbegin = index(source, '// procd starts the daemon without arguments.');
+let gend = index(source, '// One-time move of per-interface keys');
+ok('the startup guard runs before the first scheduler work', gbegin > 0 && gend > gbegin);
+let guard = function(argv, lock_free) {
+	let out = { exit: null, locked: false, said: '' };
+	global.GUARD_OUT = out;
+	try {
+		loadstring(`
+let ARGV = ` + sprintf('%J', argv) + `;
+function warn(m) { global.GUARD_OUT.said += m; }
+function log(m) { global.GUARD_OUT.said += m; }
+function exit(c) { global.GUARD_OUT.exit = c; die('exit'); }
+const _common = { acquire_advisory: function(p) { global.GUARD_OUT.locked = p; return ` + (lock_free ? '{}' : 'null') + `; } };
+` + substr(source, gbegin, gend - gbegin))();
+	} catch (e) {}
+	return out;
+};
+let g = guard([ 'help' ], true);
+ok('`help` prints the usage and exits 0 without starting', g.exit == 0 && index(g.said, 'usage') >= 0 && !g.locked);
+g = guard([ 'start' ], true);
+ok('an unknown argument exits 2 without starting', g.exit == 2 && !g.locked);
+g = guard([], true);
+ok('procd\'s plain start takes the daemon lock and continues', g.exit == null && g.locked == '/var/run/nordvpn-service.lock');
+g = guard([], false);
+ok('a second daemon refuses to start', g.exit == 1 && index(g.said, 'already running') >= 0);
 exit(fails ? 1 : 0);
