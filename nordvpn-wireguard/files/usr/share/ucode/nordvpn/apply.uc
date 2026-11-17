@@ -289,13 +289,43 @@ const TUNNEL_LOCK_WAIT = 60;
 function activation(iface, up) {
 	let st = _transaction.interface_state(iface);
 	if (!st) die('could not snapshot runtime state for ' + iface);
-	return { stage: (up ? 'ifup:' : 'ifdown:') + iface, up: !!up, previous_up: !!st.up,
+	return { stage: (up ? 'ifup:' : 'ifdown:') + iface, up: !!up, previous_up: !!st.up, absent: !!st.absent,
 		argv: [ up ? 'ifup' : 'ifdown', iface ], restore_argv: [ st.up ? 'ifup' : 'ifdown', iface ] };
+}
+// Whether netifd must re-read its configuration before `iface` comes back:
+// the plan adds or removes the interface, or changes an option of it netifd
+// reads. Our nordvpn_* stamps are not among those, and the peer sections
+// (wireguard_<iface>) are read by the WireGuard handler itself on setup.
+function needs_netifd_reload(p, iface) {
+	for (let ch in p.changes) {
+		if (ch.package != 'network' || ch.section != iface)
+			continue;
+		if (!ch.before || !ch.after)
+			return true;
+		let names = keys(ch.before);
+		for (let k in keys(ch.after)) if (index(names, k) < 0) push(names, k);
+		for (let k in names)
+			if (substr(k, 0, 1) != '.' && substr(k, 0, 8) != 'nordvpn_' &&
+			    sprintf('%J', ch.before[k]) != sprintf('%J', ch.after[k]))
+				return true;
+	}
+	return false;
+}
+// /sbin/ifup runs `ubus call network reload` before bouncing the interface,
+// and every netifd reload also reloads hostapd ("Reload all interfaces"),
+// interrupting Wi-Fi clients on each connect, rotation and watchdog
+// failover. When netifd's view of the interface is unchanged, bounce it
+// directly instead (exactly ifup's down/up, without the global reload).
+function bounce_argv(iface) {
+	let arg = sprintf('%J', { interface: iface });
+	return [ 'sh', '-c', 'ubus call network.interface down "$1" && ubus call network.interface up "$1"', 'sh', arg ];
 }
 function connection_plan(uci, iface, edit, up) {
 	let p = _transaction.plan(uci, function(desired) { edit(desired); return { interface: iface }; });
 	p.reloads = []; // ifup/ifdown applies this interface; no global netifd reload.
 	p.activation = activation(iface, up);
+	if (up && !p.activation.absent && !needs_netifd_reload(p, iface))
+		p.activation.argv = bounce_argv(iface);
 	return p;
 }
 function connect_one_result(uci, iface, relay, s, opts) {
@@ -1025,5 +1055,5 @@ function disable_all(uci) {
 	return { ok: length(errors) == 0, disabled, errors };
 }
 
-return { routing_adapters, routing_plan, set_credentials, clear_credentials, current_key, current_peer, restore_peer, restore_connection, write_relay, bring_up, verify_handshake, netifd_hint, tunnel_hint, connect_one, connect_one_result, tunnel_fingerprint, wan_default_at_risk, prefer_current, keep_running, parse_nft_elements, nft_set_elements, commit_routing, APPLY_SOURCES, apply_source, apply_event, apply, apply_routing, disconnect, disable_all, create_instance, delete_instance, restore_wan_default, restore_wan_default_async,
+return { routing_adapters, routing_plan, connection_plan, set_credentials, clear_credentials, current_key, current_peer, restore_peer, restore_connection, write_relay, bring_up, verify_handshake, netifd_hint, tunnel_hint, connect_one, connect_one_result, tunnel_fingerprint, wan_default_at_risk, prefer_current, keep_running, parse_nft_elements, nft_set_elements, commit_routing, APPLY_SOURCES, apply_source, apply_event, apply, apply_routing, disconnect, disable_all, create_instance, delete_instance, restore_wan_default, restore_wan_default_async,
 	write_apply_status, read_apply_status, apply_running, apply_status_report, run_job, run_apply, start_job, start_apply };

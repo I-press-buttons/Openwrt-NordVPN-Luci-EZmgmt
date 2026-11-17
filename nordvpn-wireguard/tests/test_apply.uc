@@ -596,6 +596,38 @@ const DEAD_PID = 1073741824;
 	ok('tunlink: adding it restarts the tunnel once', _apply.tunnel_fingerprint(cursor(), 'nv_x') != before);
 }
 
+// A server change restarts the tunnel without netifd's global reload, which
+// /sbin/ifup runs first and which also reloads every Wi-Fi interface.
+{
+	global.MOCK_UCI = { nordvpn: { main: { '.type': 'instance', interface: 'nv_x', enabled: '1' } },
+		network: { nv_x: { '.type': 'interface', proto: 'wireguard', vpn_type: 'nordvpn', mtu: '1420',
+				nordvpn_last_applied: 'then' },
+			peer0: { '.type': 'wireguard_nv_x', interface: 'nv_x', public_key: 'pk', endpoint_host: 'de1.nordvpn.com' } },
+		firewall: {}, dhcp: {} };
+	let p = _apply.connection_plan(cursor(), 'nv_x', function(d) {
+		d.set('network', 'peer0', 'endpoint_host', 'de2.nordvpn.com');
+		d.set('network', 'nv_x', 'nordvpn_last_applied', 'now');
+	}, true);
+	ok('bounce: a new server is brought up without a netifd reload',
+		p.activation.argv[0] == 'sh' && index(p.activation.argv[2], 'network.interface down') >= 0 &&
+		index(p.activation.argv[2], 'network reload') < 0 && p.activation.argv[4] == '{ "interface": "nv_x" }');
+	p = _apply.connection_plan(cursor(), 'nv_x', function(d) { d.set('network', 'nv_x', 'mtu', '1380'); }, true);
+	eq('bounce: an interface option netifd reads still goes through ifup', p.activation.argv, [ 'ifup', 'nv_x' ]);
+	delete global.MOCK_UCI.network.nv_x;
+	delete global.MOCK_UCI.network.peer0;
+	let base = _apply.routing_adapters.run;
+	_apply.routing_adapters.run = function(argv) {
+		let a = argv[0] == 'timeout' ? slice(argv, 2) : argv;
+		return a[0] == 'ubus' ? { code: 4, stdout: '' } : base(argv);
+	};
+	p = _apply.connection_plan(cursor(), 'nv_x', function(d) {
+		d.set('network', 'nv_x', 'interface'); d.set('network', 'nv_x', 'proto', 'wireguard');
+	}, true);
+	eq('bounce: a new interface still goes through ifup', p.activation.argv, [ 'ifup', 'nv_x' ]);
+	_apply.routing_adapters.run = base;
+	p = null;
+}
+
 unlink(APPLY_STATUS_FILE);
 printf('\n%s\n', fails ? ('FAILURES: ' + fails) : 'ALL APPLY TESTS PASSED');
 exit(fails ? 1 : 0);
