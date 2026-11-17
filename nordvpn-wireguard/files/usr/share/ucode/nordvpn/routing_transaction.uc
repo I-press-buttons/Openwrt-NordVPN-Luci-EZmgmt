@@ -219,9 +219,11 @@ function interface_state(iface) {
 	}
 	// netifd may not have loaded a newly created interface, or may already
 	// have removed a deleted one. A successful empty ubus listing proves
-	// absence; a missing/unavailable ubus executable never establishes it.
+	// absence, and so does ubus's NOT_FOUND status (exit 4), which is what
+	// OpenWrt 25.12 returns for an unknown object. Anything else (timeout
+	// 124, missing executable 127, ubusd down) never establishes it.
 	r = command([ 'ubus', 'list', 'network.interface.' + iface ], '1');
-	return r.code == 0 && trim(r.stdout || '') == '' ? { up: false, absent: true } : null;
+	return (r.code == 0 && trim(r.stdout || '') == '') || r.code == 4 ? { up: false, absent: true } : null;
 }
 
 function set_elements(sets) {
