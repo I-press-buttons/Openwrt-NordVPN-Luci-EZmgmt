@@ -1849,6 +1849,65 @@ write_cache(cache, cpath);
 	eq('legacy: dropped once no instance routes all LAN', rules('killswitch'), []);
 }
 
+// A network is steered by one tunnel only. Two `iif <network>` lookups at the
+// same priority leave the later tunnel "Connected" while carrying nothing.
+{
+	let mk = function() {
+		global.MOCK_UCI = {
+			nordvpn: {
+				main: { '.type': 'instance', interface: 'nordvpn', enabled: '1', auto_routing: '0',
+					routing_table: '100', source_network: [ 'lan', 'iot' ] },
+				untrust: { '.type': 'instance', interface: 'nv_untrust', enabled: '1', auto_routing: '1',
+					routing_table: '101' }
+			},
+			network: {
+				nordvpn: { '.type': 'interface', proto: 'wireguard', private_key: KEY, vpn_type: 'nordvpn' },
+				nv_untrust: { '.type': 'interface', proto: 'wireguard', private_key: KEY, vpn_type: 'nordvpn' },
+				lan: { '.type': 'interface', proto: 'static', ipaddr: '192.168.1.1/24' },
+				iot: { '.type': 'interface', proto: 'static', ipaddr: '192.168.3.1/24' }
+			},
+			firewall: {
+				zlan: { '.type': 'zone', name: 'lan', network: [ 'lan' ] },
+				ziot: { '.type': 'zone', name: 'iot', network: [ 'iot' ] },
+				zwan: { '.type': 'zone', name: 'wan', masq: '1', network: [ 'wan' ] }
+			}, dhcp: {}
+		};
+	};
+	let lookups = function(iface) {
+		let out = [];
+		for (let k, v in global.MOCK_UCI.network)
+			if (v.nordvpn_role == 'steer_lookup' && v.nordvpn_iface == iface)
+				push(out, v['in']);
+		return sort(out);
+	};
+	mk();
+	enforce_routing(cursor(), load_settings(cursor(), 'main'));
+	let ru = enforce_routing(cursor(), load_settings(cursor(), 'untrust'));
+	eq('overlap: main keeps its networks', lookups('nordvpn'), [ 'iot', 'lan' ]);
+	eq('overlap: the later all-LAN tunnel adds no duplicate lookup', lookups('nv_untrust'), []);
+	ok('overlap: ... and says why', index(join(' ', ru.notes), 'network lan is already steered by instance main') >= 0);
+	eq('overlap: the conflict is reported for the status page',
+		detect_routing(cursor(), load_settings(cursor(), 'untrust'), false).network_conflicts, { lan: 'main' });
+	eq('overlap: the owner reports none', detect_routing(cursor(), load_settings(cursor(), 'main'), false).network_conflicts, {});
+
+	// Disabling main frees the LAN for the other tunnel.
+	global.MOCK_UCI.nordvpn.main.enabled = '0';
+	enforce_routing(cursor(), load_settings(cursor(), 'main'));
+	enforce_routing(cursor(), load_settings(cursor(), 'untrust'));
+	eq('overlap: a disabled owner releases the network', lookups('nv_untrust'), [ 'lan' ]);
+	eq('overlap: a disabled instance reports no conflict',
+		detect_routing(cursor(), load_settings(cursor(), 'main'), false).network_conflicts, {});
+
+	// Two steered instances: only the shared network is held back.
+	mk();
+	global.MOCK_UCI.nordvpn.untrust.auto_routing = '0';
+	global.MOCK_UCI.nordvpn.untrust.source_network = [ 'iot' ];
+	global.MOCK_UCI.nordvpn.main.source_network = [ 'lan' ];
+	enforce_routing(cursor(), load_settings(cursor(), 'main'));
+	enforce_routing(cursor(), load_settings(cursor(), 'untrust'));
+	eq('overlap: disjoint networks both apply', [ lookups('nordvpn'), lookups('nv_untrust') ], [ [ 'lan' ], [ 'iot' ] ]);
+}
+
 // "Route all LAN traffic" from load_settings() always runs on the policy
 // table: only the LAN zone's networks are routed into the tunnel. A network
 // in another zone (a guest network) and the router itself keep the WAN, so a
