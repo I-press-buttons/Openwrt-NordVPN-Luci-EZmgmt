@@ -351,6 +351,34 @@ function instance_step(uci, inst, now, hm, s, runtime) {
 	}
 }
 
+// The WAN default route once vanished from the main table in live testing
+// (three tunnels up, minutes after a watchdog failover) with no operation of
+// ours running, so the self-heal after applies and rotations never saw it,
+// and it only runs when a tunnel's default shares the main table anyway.
+// Look on every tick: one `ip route` call. The repair (restore_wan_default:
+// re-adds netifd's gateway when the kernel lost it) runs in a child, since it
+// waits for netifd and takes the configuration lock.
+let wan_heal = 0;
+function wan_default_step(now) {
+	if (in_flight(wan_heal, now, PROBE_STUCK))
+		return;
+	let r = _common.run([ 'ip', '-4', 'route', 'show', 'default' ], true);
+	if (r.code != 0 || trim(r.stdout || '') != '')
+		return;
+	wan_heal = now;
+	tasks.start(
+		function() {
+			_common.drop_inherited_locks();
+			try {
+				return { ok: require('nordvpn.apply').restore_wan_default() };
+			} catch (e) {
+				return { ok: false, error: errmsg(e) };
+			}
+		},
+		function(res) { wan_heal = 0; }
+	);
+}
+
 // An exception escaping a uloop callback ends uloop.run() and with it the
 // daemon — procd stops respawning it after a few crashes an hour, which would
 // silently end rotation, the watchdog and the cache refresh for good. Every
@@ -374,6 +402,13 @@ function tick() {
 			try { push(settings, load_settings(uci, name)); }
 			catch (e) { log('scheduler: instance ' + name + ': ' + errmsg(e)); }
 		}
+		// Only while a tunnel is enabled: an idle scheduler runs no commands.
+		if (length(filter(settings, (s) => s.enabled)))
+			try {
+				wan_default_step(now);
+			} catch (e) {
+				log('scheduler: WAN default route check: ' + errmsg(e));
+			}
 		let snapshot = null;
 		let runtime = function() {
 			if (!snapshot) snapshot = _status.collect_runtime(settings, now);

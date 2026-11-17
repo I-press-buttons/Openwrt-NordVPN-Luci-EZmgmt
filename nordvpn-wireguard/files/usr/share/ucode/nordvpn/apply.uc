@@ -422,7 +422,10 @@ function restore_wan_default() {
 			if (!ifc.up || !ifc.l3_device)
 				continue;
 			for (let rt in (ifc.route || [])) {
-				if (rt.target == '0.0.0.0' && rt.mask == 0 && rt.nexthop && rt.nexthop != '0.0.0.0') {
+				// A gateway route of the main table only: a default kept in
+				// another table (a tunnel's ip4table) is not the WAN's.
+				if (rt.target == '0.0.0.0' && rt.mask == 0 && rt.nexthop && rt.nexthop != '0.0.0.0' &&
+				    (rt.table == null || rt.table == 'main' || rt.table == 254 || rt.table == '254')) {
 					let res;
 					try {
 						res = _mutation.configuration(function(fresh) {

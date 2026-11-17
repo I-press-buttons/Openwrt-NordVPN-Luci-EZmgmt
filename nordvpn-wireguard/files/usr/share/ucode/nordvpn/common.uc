@@ -823,7 +823,6 @@ function run(argv, quiet) {
 	return { code: code, stdout: out };
 }
 
-// CommonJS export (ucode on OpenWrt 24.10 does not support ES `export`).
 // Steering and exception entries of instance `name` that fail validation,
 // as 'value (option)' strings. load_settings() drops them silently; callers
 // that apply settings refuse them instead, so a typo is reported rather than
@@ -844,6 +843,7 @@ function invalid_steering(uci, name) {
 	return bad;
 }
 
+// CommonJS export (ucode on OpenWrt 24.10 does not support ES `export`).
 return {
 	VERSION, API_BASE, CREDS_URL, SERVERS_URL, IP_INSIGHTS_URL,
 	DEFAULT_INTERFACE, DEFAULT_PORT, DEFAULT_KEEPALIVE, FIXED_ADDRESS,
