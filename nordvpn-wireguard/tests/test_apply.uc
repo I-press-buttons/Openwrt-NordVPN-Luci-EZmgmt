@@ -293,6 +293,17 @@ const DEAD_PID = 1073741824;
 	eq('the interface is not re-stamped', global.MOCK_UCI.network.nv_media.nordvpn_last_applied, 'then');
 	ok('the apply lock is released', execution_available());
 
+	global.MOCK_UCI.nordvpn.main.steer_ip = [ '198.51.100.7', '999.1.1.1', '1.1.1.1/33', '0.0.0.0/0' ];
+	global.MOCK_UCI.nordvpn.main.steer_domain = [ '999.1.1.1' ];
+	res = _apply.apply_routing(cursor(), 'main');
+	ok('invalid steering entries are refused, each one named', res.ok === false && res.changed === false &&
+		index(res.error, '999.1.1.1 (steer_ip)') >= 0 && index(res.error, '1.1.1.1/33 (steer_ip)') >= 0 &&
+		index(res.error, '0.0.0.0/0 (steer_ip)') >= 0 && index(res.error, '999.1.1.1 (steer_domain)') >= 0 &&
+		index(res.error, '198.51.100.7') < 0);
+	eq('... and nothing is applied', length(count('firewall', 'ip_mark')), 0);
+	delete global.MOCK_UCI.nordvpn.main.steer_ip;
+	delete global.MOCK_UCI.nordvpn.main.steer_domain;
+
 	global.MOCK_UCI.nordvpn.main.bypass_device = [];
 	res = _apply.apply_routing(cursor(), 'main');
 	ok('removing the device drops its rule', res.ok == true && length(count('firewall', 'bypass_mark')) == 0);

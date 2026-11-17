@@ -270,6 +270,10 @@ function validate_domain(d) {
 		return null;
 	if (!full_match(d, /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?([.][a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$/))
 		return null;
+	// No top-level domain is all digits: '999.1.1.1' is a mistyped address.
+	let labels = split(d, '.');
+	if (full_match(labels[length(labels) - 1], /^[0-9]+$/))
+		return null;
 	return d;
 }
 
@@ -820,6 +824,26 @@ function run(argv, quiet) {
 }
 
 // CommonJS export (ucode on OpenWrt 24.10 does not support ES `export`).
+// Steering and exception entries of instance `name` that fail validation,
+// as 'value (option)' strings. load_settings() drops them silently; callers
+// that apply settings refuse them instead, so a typo is reported rather than
+// quietly ignored.
+const STEERING_OPTIONS = {
+	source_device: (x) => validate_mac(x), bypass_device: (x) => validate_mac(x),
+	steer_domain: (x) => validate_domain(x), bypass_domain: (x) => validate_domain(x),
+	steer_ip: (x) => validate_cidr4(x), bypass_ip: (x) => validate_cidr4(x)
+};
+function invalid_steering(uci, name) {
+	let bad = [];
+	for (let opt in sort(keys(STEERING_OPTIONS))) {
+		let v = uci.get('nordvpn', name, opt);
+		for (let x in ((type(v) == 'array') ? v : (v != null ? [ v ] : [])))
+			if (STEERING_OPTIONS[opt](x) == null)
+				push(bad, x + ' (' + opt + ')');
+	}
+	return bad;
+}
+
 return {
 	VERSION, API_BASE, CREDS_URL, SERVERS_URL, IP_INSIGHTS_URL,
 	DEFAULT_INTERFACE, DEFAULT_PORT, DEFAULT_KEEPALIVE, FIXED_ADDRESS,
@@ -833,7 +857,7 @@ return {
 	full_match, bounded_int, validate_interface, validate_token, validate_wg_key, validate_hostname, validate_nordvpn_host,
 	validate_port, validate_hop_mode, validate_dns_mode, relay_kind, validate_selection, validate_server_group, validate_rotation_mode, validate_interval, validate_time,
 	validate_country_code, validate_location_code, validate_instance, validate_routing_table, validate_dir,
-	validate_mac, validate_domain, validate_cidr4, clean_label, validate_ipv4,
+	validate_mac, validate_domain, validate_cidr4, invalid_steering, clean_label, validate_ipv4,
 	managed_interface, load_settings, list_instances, globals_section, cache_file_path, iso_ts, redact, log,
 	atomic_write, acquire_advisory, release_advisory, drop_inherited_locks, self_pid, lock_stale, acquire_lock, release_lock, tunnel_lock_path, rotation_max_runtime,
 	sh_quote, open_cmd, run

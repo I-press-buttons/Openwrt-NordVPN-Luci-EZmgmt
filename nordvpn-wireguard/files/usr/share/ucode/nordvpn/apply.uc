@@ -476,6 +476,9 @@ function apply_inner(uci, instance, source, lock_wait) {
 		let invalid = _mutation.validate_owner(uci, instance);
 		if (invalid)
 			return { state: 'failure', error: invalid };
+		let bad = _common.invalid_steering(uci, instance);
+		if (length(bad))
+			return { state: 'failure', error: 'invalid steering entries: ' + join(', ', bad) };
 		let s = load_settings(uci, instance);
 		s.mutation_wait = lock_wait;
 		let iface = validate_interface(s.interface);
@@ -701,6 +704,9 @@ function set_iface_table(uci, iface, table) {
 // { ok, routing_only: true } or { needs_reconnect: true, reason } when only a
 // full apply() can do it.
 function apply_routing_inner(uci, instance) {
+	let bad = _common.invalid_steering(uci, instance);
+	if (length(bad))
+		return { ok: false, changed: false, stage: 'validate', error: 'invalid steering entries: ' + join(', ', bad) };
 	let s = load_settings(uci, instance);
 	let iface = validate_interface(s.interface);
 	if (!iface)
